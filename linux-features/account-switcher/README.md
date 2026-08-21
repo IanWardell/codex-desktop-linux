@@ -25,6 +25,10 @@ profile already has an isolated catalog or project state, it is retained as an
 threads still require the selected account to be authorized by OpenAI; this
 client cannot grant cross-account access.
 
+The dialog renders saved login names and last-known usage values immediately.
+It refreshes usage for all profiles concurrently in the background and changes
+an on-screen value only when the live result differs from the cached value.
+
 Switching starts the replacement profile, terminates the old instance's Linux
 process tree, and force-exits its Electron main process after the handoff state
 is written. This prevents orphaned renderer, utility, and app-server processes

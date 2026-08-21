@@ -127,9 +127,12 @@ function codexLinuxAccountSwitcherUsage(accessToken,accountId){
     request.setTimeout(5000,()=>{request.destroy();resolve(null)});request.on("error",()=>resolve(null));request.end();
   })
 }
-async function codexLinuxAccountSwitcherDetails(profile){
+function codexLinuxAccountSwitcherCachedDetails(profile){
   const auth=codexLinuxAccountSwitcherReadAuth(profile),tokens=auth?.tokens||{},claims=codexLinuxAccountSwitcherDecodeJwtPayload(tokens.id_token),cachedEmail=typeof profile.email==="string"?profile.email:null,cachedUsage=Number.isFinite(profile.usagePercent)?profile.usagePercent:null;
-  const fallback={email:cachedEmail|| (typeof claims?.email==="string"?claims.email:null),usagePercent:cachedUsage,usageUpdatedAt:typeof profile.usageUpdatedAt==="string"?profile.usageUpdatedAt:null};
+  return{email:cachedEmail|| (typeof claims?.email==="string"?claims.email:null),usagePercent:cachedUsage,usageUpdatedAt:typeof profile.usageUpdatedAt==="string"?profile.usageUpdatedAt:null,tokens};
+}
+async function codexLinuxAccountSwitcherDetails(profile){
+  const fallback=codexLinuxAccountSwitcherCachedDetails(profile),tokens=fallback.tokens;
   const live=await codexLinuxAccountSwitcherUsage(tokens.access_token,tokens.account_id);
   if(live==null)return fallback;
   return{email:live.email||fallback.email,usagePercent:live.usagePercent==null?fallback.usagePercent:live.usagePercent,usageUpdatedAt:live.usagePercent==null?fallback.usageUpdatedAt:new Date().toISOString()}
@@ -182,6 +185,10 @@ l.ipcMain.handle(codexLinuxAccountSwitcherIpc,async(codexLinuxAccountSwitcherEve
   const registry=codexLinuxAccountSwitcherRead();
   codexLinuxAccountSwitcherDefault(registry);
   if(action==="list"){
+    const details=registry.profiles.map((profile)=>codexLinuxAccountSwitcherCachedDetails(profile));
+    return{profiles:registry.profiles.map((profile,index)=>codexLinuxAccountSwitcherPublic(profile,details[index])),activeProfileId:process.env.CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE||"default",keepLocalProjectsThreads:codexLinuxAccountSwitcherKeepLocalProjectsThreads(registry)}
+  }
+  if(action==="refresh"){
     const details=await Promise.all(registry.profiles.map((profile)=>codexLinuxAccountSwitcherDetails(profile))),now=new Date().toISOString();
     details.forEach((value,index)=>{const profile=registry.profiles[index];if(value.email&&profile.email!==value.email){profile.email=value.email}if(value.usagePercent!=null&&(profile.usagePercent!==value.usagePercent||profile.usageUpdatedAt==null)){profile.usagePercent=value.usagePercent;profile.usageUpdatedAt=value.usageUpdatedAt||now}});
     codexLinuxAccountSwitcherWrite(registry);return{profiles:registry.profiles.map((profile,index)=>codexLinuxAccountSwitcherPublic(profile,details[index])),activeProfileId:process.env.CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE||"default",keepLocalProjectsThreads:codexLinuxAccountSwitcherKeepLocalProjectsThreads(registry)}
@@ -229,7 +236,10 @@ window.codexLinuxOpenAccountSwitcher=()=>{
   const persistSharedState=async()=>{const requested=shared.checked;syncSharedState();try{await api.setLinuxAccountSwitcherSettings({keepLocalProjectsThreads:requested})}catch(errorValue){shared.checked=!requested;syncSharedState();error.textContent=errorValue?.message||String(errorValue)}};
   shared.onchange=persistSharedState;syncSharedState();
   list.replaceChildren();error.textContent="";
-  api.getLinuxAccountProfiles().then((state)=>{shared.checked=state.keepLocalProjectsThreads===true;syncSharedState();for(const profile of state.profiles){const button=document.createElement("button");button.type="button";button.className="als-account"+(profile.id===state.activeProfileId?" als-account-active":"");button.innerHTML="<span class=als-dot></span><span class=als-details><span class=als-name></span><span class=als-meta></span></span><span class=als-badge></span>";button.querySelector(".als-name").textContent=profile.login||profile.name||profile.id;button.querySelector(".als-meta").textContent=Number.isFinite(profile.usagePercent)?"Usage: "+profile.usagePercent+"% used":"Usage: unavailable";button.querySelector(".als-badge").textContent=profile.id===state.activeProfileId?"active":"switch";button.onclick=async()=>{if(profile.id===state.activeProfileId)return;button.disabled=true;try{await api.switchLinuxAccountProfile({id:profile.id,contextMode:shared.checked?"shared-local":"isolated",contextId:"default"})}catch(errorValue){button.disabled=false;error.textContent=errorValue?.message||String(errorValue)}};list.append(button)}}).catch((errorValue)=>{error.textContent=errorValue?.message||String(errorValue)});
+  const rows=new Map(),updateProfileRow=(button,profile)=>{const name=button.querySelector(".als-name"),meta=button.querySelector(".als-meta"),nextName=profile.login||profile.name||profile.id,nextMeta=Number.isFinite(profile.usagePercent)?"Usage: "+profile.usagePercent+"% used":"Usage: unavailable";if(name.textContent!==nextName)name.textContent=nextName;if(meta.textContent!==nextMeta)meta.textContent=nextMeta};
+  const cachedRequest=api.getLinuxAccountProfiles(),refreshRequest=api.refreshLinuxAccountProfiles?.();
+  cachedRequest.then((state)=>{if(!overlay.isConnected)return;shared.checked=state.keepLocalProjectsThreads===true;syncSharedState();for(const profile of state.profiles){const button=document.createElement("button");button.type="button";button.className="als-account"+(profile.id===state.activeProfileId?" als-account-active":"");button.innerHTML="<span class=als-dot></span><span class=als-details><span class=als-name></span><span class=als-meta></span></span><span class=als-badge></span>";updateProfileRow(button,profile);button.querySelector(".als-badge").textContent=profile.id===state.activeProfileId?"active":"switch";button.onclick=async()=>{if(profile.id===state.activeProfileId)return;button.disabled=true;try{await api.switchLinuxAccountProfile({id:profile.id,contextMode:shared.checked?"shared-local":"isolated",contextId:"default"})}catch(errorValue){button.disabled=false;error.textContent=errorValue?.message||String(errorValue)}};rows.set(profile.id,button);list.append(button)}}).catch((errorValue)=>{error.textContent=errorValue?.message||String(errorValue)});
+  if(refreshRequest)refreshRequest.then((state)=>cachedRequest.then(()=>{if(!overlay.isConnected)return;for(const profile of state.profiles){const button=rows.get(profile.id);if(button)updateProfileRow(button,profile)}})).catch(()=>{});
 };
 })();`;
 
@@ -255,7 +265,7 @@ function applyPreloadPatch(extractedDir) {
   const source = fs.readFileSync(target, "utf8");
   if (source.includes(PRELOAD_MARKER)) return { matched: 1, changed: 0 };
   const needle = "usesOwlAppShell:()=>E};";
-  const replacement = `usesOwlAppShell:()=>E,getLinuxAccountProfiles:()=>e.ipcRenderer.invoke("codex_linux_account_switcher",{action:"list"}),createLinuxAccountProfile:t=>e.ipcRenderer.invoke("codex_linux_account_switcher",{action:"create",...t}),setLinuxAccountSwitcherSettings:t=>e.ipcRenderer.invoke("codex_linux_account_switcher",{action:"set-settings",...t}),switchLinuxAccountProfile:t=>e.ipcRenderer.invoke("codex_linux_account_switcher",{action:"switch",...t})};/*${PRELOAD_MARKER}*/`;
+  const replacement = `usesOwlAppShell:()=>E,getLinuxAccountProfiles:()=>e.ipcRenderer.invoke("codex_linux_account_switcher",{action:"list"}),refreshLinuxAccountProfiles:()=>e.ipcRenderer.invoke("codex_linux_account_switcher",{action:"refresh"}),createLinuxAccountProfile:t=>e.ipcRenderer.invoke("codex_linux_account_switcher",{action:"create",...t}),setLinuxAccountSwitcherSettings:t=>e.ipcRenderer.invoke("codex_linux_account_switcher",{action:"set-settings",...t}),switchLinuxAccountProfile:t=>e.ipcRenderer.invoke("codex_linux_account_switcher",{action:"switch",...t})};/*${PRELOAD_MARKER}*/`;
   const patched = replaceOnce(source, needle, replacement, "Electron preload bridge anchor");
   if (patched !== source) fs.writeFileSync(target, patched, "utf8");
   return { matched: 1, changed: patched === source ? 0 : 1 };

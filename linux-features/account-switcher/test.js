@@ -70,6 +70,8 @@ test("preload bridge patch is idempotent and fails closed", () => {
     assert.equal(applyPreloadPatch(tempDir).changed, 1);
     const patched = fs.readFileSync(target, "utf8");
     assert.match(patched, new RegExp(PRELOAD_MARKER));
+    assert.match(patched, /refreshLinuxAccountProfiles/);
+    assert.match(patched, /action:"refresh"/);
     assert.match(patched, /setLinuxAccountSwitcherSettings/);
     assert.match(patched, /action:"set-settings"/);
     assert.equal(applyPreloadPatch(tempDir).changed, 0);
@@ -88,6 +90,10 @@ test("profile menu adds Switch account below Log out and appends runtime once", 
   assert.match(patched, /profile\.login/);
   assert.match(patched, /profile\.usagePercent/);
   assert.match(patched, /Usage: /);
+  assert.match(patched, /const cachedRequest=api\.getLinuxAccountProfiles\(\),refreshRequest=api\.refreshLinuxAccountProfiles\?\.\(\)/);
+  assert.match(patched, /if\(name\.textContent!==nextName\)name\.textContent=nextName/);
+  assert.match(patched, /if\(meta\.textContent!==nextMeta\)meta\.textContent=nextMeta/);
+  assert.match(patched, /refreshRequest\.then\(\(state\)=>cachedRequest\.then/);
   assert.match(patched, /als-switch/);
   assert.match(patched, /Keep local projects and threads/);
   assert.match(patched, /keepLocalProjectsThreads/);
@@ -108,6 +114,9 @@ test("account relaunch kills the old Electron process tree after spawning the re
   assert.match(patched, /codexLinuxAccountSwitcherPrepareIsolatedContext/);
   assert.match(patched, /codexLinuxAccountSwitcherRestoreIsolatedPath/);
   assert.match(patched, /codexLinuxAccountSwitcherKeepLocalProjectsThreads/);
+  assert.match(patched, /if\(action==="list"\)\{\s+const details=registry\.profiles\.map/);
+  assert.match(patched, /if\(action==="refresh"\)/);
+  assert.match(patched, /codexLinuxAccountSwitcherCachedDetails/);
   assert.match(patched, /action==="set-settings"/);
   assert.match(patched, /codex-global-state\.json/);
   assert.match(patched, /isolated-backup/);
