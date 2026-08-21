@@ -159,12 +159,26 @@ function codexLinuxAccountSwitcherDescendantPids(parentPid){
 function codexLinuxAccountSwitcherStopOldDescendants(pids){
   for(const signal of ["SIGTERM","SIGKILL"]){for(const pid of pids){try{process.kill(pid,signal)}catch{}}if(signal==="SIGTERM"&&pids.length){try{Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,150)}catch{}}}
 }
+function codexLinuxAccountSwitcherProcessOwnsProfile(userDataDir){
+  const argument="--user-data-dir="+userDataDir;
+  try{for(const entry of codexLinuxAccountSwitcherFs.readdirSync("/proc")){if(!/^\d+$/.test(entry))continue;try{if(codexLinuxAccountSwitcherFs.readFileSync("/proc/"+entry+"/cmdline","utf8").split("\0").includes(argument))return true}catch{}}}catch{}
+  return false;
+}
+function codexLinuxAccountSwitcherClearStaleSingletons(userDataDir){
+  const lock=codexLinuxAccountSwitcherPath.join(userDataDir,"SingletonLock"),socket=codexLinuxAccountSwitcherPath.join(userDataDir,"SingletonSocket");
+  try{if(!codexLinuxAccountSwitcherFs.lstatSync(lock).isSymbolicLink())return}catch{return}
+  if(codexLinuxAccountSwitcherProcessOwnsProfile(userDataDir))return;
+  try{const match=/^(.+)-(\d+)$/.exec(codexLinuxAccountSwitcherFs.readlinkSync(lock));if(match&&match[1]===codexLinuxAccountSwitcherOs.hostname()){try{process.kill(Number(match[2]),0);return}catch(errorValue){if(errorValue?.code!=="ESRCH")return}}}catch{return}
+  try{if(codexLinuxAccountSwitcherFs.lstatSync(socket).isSymbolicLink()){const link=codexLinuxAccountSwitcherFs.readlinkSync(socket),target=codexLinuxAccountSwitcherPath.resolve(userDataDir,link);if(codexLinuxAccountSwitcherFs.statSync(target).isSocket())return}}catch{}
+  for(const name of ["SingletonLock","SingletonSocket","SingletonCookie"]){const target=codexLinuxAccountSwitcherPath.join(userDataDir,name);try{if(codexLinuxAccountSwitcherFs.lstatSync(target).isSymbolicLink())codexLinuxAccountSwitcherFs.unlinkSync(target)}catch{}}
+}
 function codexLinuxAccountSwitcherRelaunch(profile){
   if(profile.contextMode==="shared-local")codexLinuxAccountSwitcherPrepareSharedContext(profile);else codexLinuxAccountSwitcherPrepareIsolatedContext(profile);
   codexLinuxAccountSwitcherWriteActive(profile);
   const args=[];
   for(let index=1;index<process.argv.length;index++){const argument=process.argv[index];if(argument==="--user-data-dir"){index++;continue}if(typeof argument==="string"&&argument.startsWith("--user-data-dir="))continue;args.push(argument)}
   const userDataDir=profile.id==="default"?codexLinuxAccountSwitcherBaseElectronUserDataPath:codexLinuxAccountSwitcherPath.join(codexLinuxAccountSwitcherProfilePath(profile.id),"electron");
+  codexLinuxAccountSwitcherClearStaleSingletons(userDataDir);
   args.push("--user-data-dir="+userDataDir);
   const oldDescendants=codexLinuxAccountSwitcherDescendantPids(process.pid);
   const child=codexLinuxAccountSwitcherChildProcess.spawn(process.execPath,args,{env:codexLinuxAccountSwitcherEnvironment(profile),detached:true,stdio:"ignore"});

@@ -125,6 +125,9 @@ test("account relaunch kills the old Electron process tree after spawning the re
   assert.match(patched, /args\.push\(\"--user-data-dir=\"\+userDataDir\)/);
   assert.match(patched, /codexLinuxAccountSwitcherDescendantPids\(process\.pid\)/);
   assert.match(patched, /codexLinuxAccountSwitcherStopOldDescendants\(oldDescendants\)/);
+  assert.match(patched, /codexLinuxAccountSwitcherClearStaleSingletons\(userDataDir\)/);
+  assert.match(patched, /codexLinuxAccountSwitcherProcessOwnsProfile/);
+  assert.match(patched, /\["SingletonLock","SingletonSocket","SingletonCookie"\]/);
   assert.match(patched, /process\.kill\(pid,signal\)/);
   assert.match(patched, /\[\"SIGTERM\",\"SIGKILL\"\]/);
   assert.match(patched, /l\.app\.exit\(0\)/);
@@ -176,6 +179,37 @@ test("launcher routes the active named profile", () => {
       "env CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT_ID=team",
       `electron-arg --user-data-dir=${path.join(home, ".local", "share", "codex-desktop", "account-profiles", "work", "electron")}`,
     ]);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("launcher removes stale Chromium singleton links but preserves a live lock", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-singletons-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const configDir = path.join(home, ".config", "codex-desktop");
+    const dataHome = path.join(home, ".local", "share");
+    const profileDir = path.join(dataHome, "codex-desktop", "account-profiles", "work", "electron");
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.mkdirSync(profileDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nisolated\ndefault\n", { mode: 0o600 });
+    for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
+      fs.symlinkSync(name === "SingletonLock" ? "retired-container-999999" : path.join(tempDir, `missing-${name}`), path.join(profileDir, name));
+    }
+    const script = path.join(__dirname, "launcher-hook.sh");
+    const env = { HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: dataHome };
+    const staleResult = spawnSync("bash", ["-c", `source ${JSON.stringify(script)}`], { env, encoding: "utf8" });
+    assert.equal(staleResult.status, 0, staleResult.stderr);
+    for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
+      assert.throws(() => fs.lstatSync(path.join(profileDir, name)), { code: "ENOENT" });
+    }
+
+    fs.symlinkSync(`${os.hostname()}-${process.pid}`, path.join(profileDir, "SingletonLock"));
+    fs.symlinkSync(path.join(tempDir, "missing-live-socket"), path.join(profileDir, "SingletonSocket"));
+    const liveResult = spawnSync("bash", ["-c", `source ${JSON.stringify(script)}`], { env, encoding: "utf8" });
+    assert.equal(liveResult.status, 0, liveResult.stderr);
+    assert.equal(fs.readlinkSync(path.join(profileDir, "SingletonLock")), `${os.hostname()}-${process.pid}`);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

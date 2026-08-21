@@ -34,6 +34,11 @@ process tree, and force-exits its Electron main process after the handoff state
 is written. This prevents orphaned renderer, utility, and app-server processes
 from accumulating during repeated switches.
 
+Before a profile is launched, the feature removes Chromium singleton symlinks
+only when no local process owns that exact profile, the recorded lock process
+is gone, and its singleton socket is unavailable. This recovers profiles left
+locked by a crashed app or a replaced container without disturbing a live app.
+
 Only profile names and context settings are stored in
 `${XDG_CONFIG_HOME:-~/.config}/codex-desktop/account-switcher.json`. The
 feature never copies or displays tokens, `auth.json`, keyring data, or database
