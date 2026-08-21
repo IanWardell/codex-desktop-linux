@@ -1,0 +1,21 @@
+{
+  "id": "account-switcher",
+  "title": "Rapid Account Switcher",
+  "description": "Opt-in per-account Codex profiles with isolated credentials and an experimental shared local thread catalog.",
+  "defaultEnabled": false,
+  "entrypoints": {
+    "patchDescriptors": "./patch.js"
+  },
+  "runtimeHooks": {
+    "launcher": {
+      "source": "launcher-hook.sh",
+      "name": "account-switcher-launcher.sh",
+      "mode": "0755"
+    },
+    "prelaunch": {
+      "source": "prelaunch-hook.sh",
+      "name": "account-switcher-prelaunch.sh",
+      "mode": "0755"
+    }
+  }
+}
