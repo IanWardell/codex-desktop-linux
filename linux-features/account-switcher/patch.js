@@ -55,9 +55,12 @@ function codexLinuxAccountSwitcherKeepLocalProjectsThreads(registry){
   return active?.contextMode==="shared-local";
 }
 function codexLinuxAccountSwitcherSetKeepLocalProjectsThreads(registry,enabled){
+  const wasEnabled=codexLinuxAccountSwitcherKeepLocalProjectsThreads(registry);
   registry.keepLocalProjectsThreads=enabled===true;
+  if(registry.keepLocalProjectsThreads&&!wasEnabled)registry.sharedContextId="shared-"+Date.now().toString(36);
   const activeId=process.env.CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE||"default",active=registry.profiles.find((entry)=>entry&&entry.id===activeId);
-  if(active){active.contextMode=registry.keepLocalProjectsThreads?"shared-local":"isolated";active.contextId="default"}
+  if(active){active.contextMode=registry.keepLocalProjectsThreads?"shared-local":"isolated";if(registry.keepLocalProjectsThreads)active.contextId=codexLinuxAccountSwitcherId(registry.sharedContextId)||"default"}
+  return active||null;
 }
 function codexLinuxAccountSwitcherDefault(registry){
   let profile=registry.profiles.find((entry)=>entry&&entry.id==="default");
@@ -75,7 +78,13 @@ function codexLinuxAccountSwitcherLinkSharedCatalog(target,shared){
   if(codexLinuxAccountSwitcherHasPath(target)){
     const stat=codexLinuxAccountSwitcherFs.lstatSync(target);
     if(stat.isSymbolicLink()){
-      if(codexLinuxAccountSwitcherFs.readlinkSync(target)!==shared)throw Error("Account catalog points to a different shared context");
+      const link=codexLinuxAccountSwitcherFs.readlinkSync(target);
+      if(link===shared)return;
+      const source=codexLinuxAccountSwitcherPath.resolve(codexLinuxAccountSwitcherPath.dirname(target),link),managedRoot=codexLinuxAccountSwitcherPath.join(codexLinuxAccountSwitcherDataHome,"codex-desktop","account-contexts");
+      if(source!==managedRoot&&!source.startsWith(managedRoot+codexLinuxAccountSwitcherPath.sep))throw Error("Account catalog points outside the managed shared contexts");
+      if(!codexLinuxAccountSwitcherHasPath(shared)&&codexLinuxAccountSwitcherHasPath(source)){const sourceStat=codexLinuxAccountSwitcherFs.statSync(source);if(sourceStat.isDirectory())codexLinuxAccountSwitcherFs.cpSync(source,shared,{recursive:true});else codexLinuxAccountSwitcherFs.copyFileSync(source,shared)}
+      codexLinuxAccountSwitcherFs.unlinkSync(target);
+      if(codexLinuxAccountSwitcherHasPath(shared))codexLinuxAccountSwitcherFs.symlinkSync(shared,target);
       return;
     }
     if(codexLinuxAccountSwitcherHasPath(shared))codexLinuxAccountSwitcherFs.renameSync(target,codexLinuxAccountSwitcherBackupPath(target));
@@ -89,6 +98,7 @@ function codexLinuxAccountSwitcherPrepareSharedContext(profile){
   codexLinuxAccountSwitcherFs.mkdirSync(sharedRoot,{recursive:true,mode:448});
   for(const catalogName of ["codex.db","codex-dev.db","codex-thread-summaries.db","codex-thread-summaries-dev.db"]){for(const suffix of ["","-wal","-shm"]){const shared=codexLinuxAccountSwitcherPath.join(sharedRoot,catalogName+suffix);codexLinuxAccountSwitcherLinkSharedCatalog(codexLinuxAccountSwitcherPath.join(activeHome,"sqlite",catalogName+suffix),shared);codexLinuxAccountSwitcherLinkSharedCatalog(codexLinuxAccountSwitcherPath.join(targetHome,"sqlite",catalogName+suffix),shared)}}
   for(const suffix of ["",".bak"]){const shared=codexLinuxAccountSwitcherPath.join(sharedRoot,"codex-global-state.json"+suffix);codexLinuxAccountSwitcherLinkSharedCatalog(codexLinuxAccountSwitcherPath.join(activeHome,".codex-global-state.json"+suffix),shared);codexLinuxAccountSwitcherLinkSharedCatalog(codexLinuxAccountSwitcherPath.join(targetHome,".codex-global-state.json"+suffix),shared)}
+  for(const name of ["sessions","session_index.jsonl","shell_snapshots"]){const shared=codexLinuxAccountSwitcherPath.join(sharedRoot,name);codexLinuxAccountSwitcherLinkSharedCatalog(codexLinuxAccountSwitcherPath.join(activeHome,name),shared);codexLinuxAccountSwitcherLinkSharedCatalog(codexLinuxAccountSwitcherPath.join(targetHome,name),shared)}
 }
 function codexLinuxAccountSwitcherRestoreIsolatedPath(target,shared){
   if(!codexLinuxAccountSwitcherHasPath(target))return;
@@ -98,12 +108,12 @@ function codexLinuxAccountSwitcherRestoreIsolatedPath(target,shared){
   let backup=target+".isolated-backup",index=0;
   while(!codexLinuxAccountSwitcherHasPath(backup)&&index<100){if(index>0)backup=target+".isolated-backup-"+index;index++}
   if(codexLinuxAccountSwitcherHasPath(backup))codexLinuxAccountSwitcherFs.renameSync(backup,target);
-  else if(codexLinuxAccountSwitcherHasPath(shared))codexLinuxAccountSwitcherFs.copyFileSync(shared,target);
 }
 function codexLinuxAccountSwitcherPrepareIsolatedContext(profile){
   const contextId=codexLinuxAccountSwitcherId(profile.contextId)||"default",sharedRoot=codexLinuxAccountSwitcherPath.join(codexLinuxAccountSwitcherDataHome,"codex-desktop","account-contexts",contextId),targetHome=codexLinuxAccountSwitcherProfileCodexHome(profile);
   for(const catalogName of ["codex.db","codex-dev.db","codex-thread-summaries.db","codex-thread-summaries-dev.db"]){for(const suffix of ["","-wal","-shm"]){codexLinuxAccountSwitcherRestoreIsolatedPath(codexLinuxAccountSwitcherPath.join(targetHome,"sqlite",catalogName+suffix),codexLinuxAccountSwitcherPath.join(sharedRoot,catalogName+suffix))}}
   for(const suffix of ["",".bak"]){codexLinuxAccountSwitcherRestoreIsolatedPath(codexLinuxAccountSwitcherPath.join(targetHome,".codex-global-state.json"+suffix),codexLinuxAccountSwitcherPath.join(sharedRoot,"codex-global-state.json"+suffix))}
+  for(const name of ["sessions","session_index.jsonl","shell_snapshots"]){codexLinuxAccountSwitcherRestoreIsolatedPath(codexLinuxAccountSwitcherPath.join(targetHome,name),codexLinuxAccountSwitcherPath.join(sharedRoot,name))}
 }
 function codexLinuxAccountSwitcherReadAuth(profile){
   try{return JSON.parse(codexLinuxAccountSwitcherFs.readFileSync(codexLinuxAccountSwitcherPath.join(codexLinuxAccountSwitcherProfileCodexHome(profile),"auth.json"),"utf8"))}catch{return null}
@@ -136,6 +146,16 @@ function codexLinuxAccountSwitcherEnvironment(profile){
   if(profile.id==="default"){environment.CODEX_HOME=codexLinuxAccountSwitcherBaseCodexHome;environment.CODEX_ELECTRON_USER_DATA_PATH=codexLinuxAccountSwitcherBaseElectronUserDataPath}else{const root=codexLinuxAccountSwitcherProfilePath(profile.id);codexLinuxAccountSwitcherFs.mkdirSync(root,{recursive:true,mode:448});environment.CODEX_HOME=codexLinuxAccountSwitcherPath.join(root,"codex");environment.CODEX_ELECTRON_USER_DATA_PATH=codexLinuxAccountSwitcherPath.join(root,"electron")}
   return environment;
 }
+function codexLinuxAccountSwitcherDescendantPids(parentPid){
+  const children=new Map();
+  try{for(const entry of codexLinuxAccountSwitcherFs.readdirSync("/proc")){if(!/^\d+$/.test(entry))continue;try{const status=codexLinuxAccountSwitcherFs.readFileSync("/proc/"+entry+"/status","utf8"),match=/^PPid:\s+(\d+)$/m.exec(status);if(!match)continue;const ppid=Number(match[1]),pid=Number(entry),list=children.get(ppid)||[];list.push(pid);children.set(ppid,list)}catch{}}}catch{return[]}
+  const descendants=[],pending=[parentPid];
+  while(pending.length){const parent=pending.pop();for(const pid of children.get(parent)||[]){descendants.push(pid);pending.push(pid)}}
+  return descendants.reverse();
+}
+function codexLinuxAccountSwitcherStopOldDescendants(pids){
+  for(const signal of ["SIGTERM","SIGKILL"]){for(const pid of pids){try{process.kill(pid,signal)}catch{}}if(signal==="SIGTERM"&&pids.length){try{Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,150)}catch{}}}
+}
 function codexLinuxAccountSwitcherRelaunch(profile){
   if(profile.contextMode==="shared-local")codexLinuxAccountSwitcherPrepareSharedContext(profile);else codexLinuxAccountSwitcherPrepareIsolatedContext(profile);
   codexLinuxAccountSwitcherWriteActive(profile);
@@ -143,6 +163,7 @@ function codexLinuxAccountSwitcherRelaunch(profile){
   for(let index=1;index<process.argv.length;index++){const argument=process.argv[index];if(argument==="--user-data-dir"){index++;continue}if(typeof argument==="string"&&argument.startsWith("--user-data-dir="))continue;args.push(argument)}
   const userDataDir=profile.id==="default"?codexLinuxAccountSwitcherBaseElectronUserDataPath:codexLinuxAccountSwitcherPath.join(codexLinuxAccountSwitcherProfilePath(profile.id),"electron");
   args.push("--user-data-dir="+userDataDir);
+  const oldDescendants=codexLinuxAccountSwitcherDescendantPids(process.pid);
   const child=codexLinuxAccountSwitcherChildProcess.spawn(process.execPath,args,{env:codexLinuxAccountSwitcherEnvironment(profile),detached:true,stdio:"ignore"});
   child.unref();
   // app.quit() is cooperative: upstream windows or before-quit handlers can
@@ -151,6 +172,7 @@ function codexLinuxAccountSwitcherRelaunch(profile){
   // instance owns a full renderer/app-server process tree. The registry and
   // active-profile state are synchronously persisted above, so force the old
   // instance out once the replacement process has been spawned.
+  codexLinuxAccountSwitcherStopOldDescendants(oldDescendants);
   try{l.app.exit(0)}catch{try{l.app.quit()}catch{}}
   return{ok:true,restarting:true,profile:codexLinuxAccountSwitcherPublic(profile)};
 }
@@ -165,8 +187,9 @@ l.ipcMain.handle(codexLinuxAccountSwitcherIpc,async(codexLinuxAccountSwitcherEve
     codexLinuxAccountSwitcherWrite(registry);return{profiles:registry.profiles.map((profile,index)=>codexLinuxAccountSwitcherPublic(profile,details[index])),activeProfileId:process.env.CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE||"default",keepLocalProjectsThreads:codexLinuxAccountSwitcherKeepLocalProjectsThreads(registry)}
   }
   if(action==="set-settings"){
-    codexLinuxAccountSwitcherSetKeepLocalProjectsThreads(registry,request.keepLocalProjectsThreads===true);
+    const active=codexLinuxAccountSwitcherSetKeepLocalProjectsThreads(registry,request.keepLocalProjectsThreads===true);
     codexLinuxAccountSwitcherWrite(registry);
+    if(active)codexLinuxAccountSwitcherWriteActive(active);
     return{ok:true,keepLocalProjectsThreads:codexLinuxAccountSwitcherKeepLocalProjectsThreads(registry)};
   }
   if(action==="create"){
@@ -180,7 +203,7 @@ l.ipcMain.handle(codexLinuxAccountSwitcherIpc,async(codexLinuxAccountSwitcherEve
   if(action==="switch"){
     const profile=codexLinuxAccountSwitcherFind(registry,codexLinuxAccountSwitcherId(request.id));
     if(request.contextMode!=null){if(request.contextMode!=="isolated"&&request.contextMode!=="shared-local")throw Error("Unknown account context mode");codexLinuxAccountSwitcherSetKeepLocalProjectsThreads(registry,request.contextMode==="shared-local")}
-    profile.contextMode=codexLinuxAccountSwitcherKeepLocalProjectsThreads(registry)?"shared-local":"isolated";profile.contextId="default";codexLinuxAccountSwitcherWrite(registry);
+    profile.contextMode=codexLinuxAccountSwitcherKeepLocalProjectsThreads(registry)?"shared-local":"isolated";if(profile.contextMode==="shared-local")profile.contextId=codexLinuxAccountSwitcherId(registry.sharedContextId)||"default";codexLinuxAccountSwitcherWrite(registry);
     return codexLinuxAccountSwitcherRelaunch(profile);
   }
   throw Error("Unknown account-switcher action");

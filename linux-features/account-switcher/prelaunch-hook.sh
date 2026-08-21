@@ -18,10 +18,17 @@ mkdir -p "$profile_home/sqlite" "$shared_root"
 link_catalog() {
     local target="$1" shared="$2"
     if [[ -L "$target" ]]; then
-        [[ "$(readlink "$target")" == "$shared" ]] || {
-            printf 'account-switcher: refusing to replace a different SQLite link: %s\n' "$target" >&2
-            exit 1
-        }
+        current_link="$(readlink -f -- "$target")"
+        managed_root="$data_home/codex-desktop/account-contexts"
+        if [[ "$current_link" != "$shared" ]]; then
+            [[ "$current_link" == "$managed_root"/* ]] || {
+                printf 'account-switcher: refusing to replace a link outside managed shared contexts: %s\n' "$target" >&2
+                exit 1
+            }
+            [[ -e "$shared" ]] || cp -aL -- "$target" "$shared"
+            unlink -- "$target"
+            [[ -e "$shared" ]] && ln -s -- "$shared" "$target"
+        fi
     elif [[ -e "$target" ]]; then
         if [[ -e "$shared" ]]; then
             backup="$target.isolated-backup"
@@ -45,4 +52,7 @@ for catalog_name in codex.db codex-dev.db codex-thread-summaries.db codex-thread
 done
 for suffix in "" .bak; do
     link_catalog "$profile_home/.codex-global-state.json$suffix" "$shared_root/codex-global-state.json$suffix"
+done
+for name in sessions session_index.jsonl shell_snapshots; do
+    link_catalog "$profile_home/$name" "$shared_root/$name"
 done

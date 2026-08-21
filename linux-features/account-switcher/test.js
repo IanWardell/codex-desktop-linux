@@ -98,7 +98,7 @@ test("profile menu adds Switch account below Log out and appends runtime once", 
   assert.equal(applyProfileMenuPatch("profile menu drift"), "profile menu drift");
 });
 
-test("account relaunch force-exits the old Electron instance after spawning the replacement", () => {
+test("account relaunch kills the old Electron process tree after spawning the replacement", () => {
   const fixture = "const child_process=require(\"node:child_process\");l.ipcMain.handle(\"codex_linux_account_switcher\",async()=>null);";
   const patched = applyMainBundlePatch(fixture.replace(
     "l.ipcMain.handle",
@@ -114,8 +114,23 @@ test("account relaunch force-exits the old Electron instance after spawning the 
   assert.match(patched, /codexLinuxAccountSwitcherChildProcess\.spawn/);
   assert.match(patched, /startsWith\(\"--user-data-dir=\"\)/);
   assert.match(patched, /args\.push\(\"--user-data-dir=\"\+userDataDir\)/);
+  assert.match(patched, /codexLinuxAccountSwitcherDescendantPids\(process\.pid\)/);
+  assert.match(patched, /codexLinuxAccountSwitcherStopOldDescendants\(oldDescendants\)/);
+  assert.match(patched, /process\.kill\(pid,signal\)/);
+  assert.match(patched, /\[\"SIGTERM\",\"SIGKILL\"\]/);
   assert.match(patched, /l\.app\.exit\(0\)/);
   assert.doesNotMatch(patched, /setTimeout\(\(\)=>l\.app\.quit\(\),25\)/);
+});
+
+test("shared mode includes rollout files and persists a fresh context generation", () => {
+  const fixture = "be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);";
+  const patched = applyMainBundlePatch(fixture);
+  assert.match(patched, /\[\"sessions\",\"session_index\.jsonl\",\"shell_snapshots\"\]/);
+  assert.match(patched, /registry\.sharedContextId=\"shared-\"\+Date\.now\(\)\.toString\(36\)/);
+  assert.match(patched, /codexLinuxAccountSwitcherWriteActive\(active\)/);
+  assert.match(patched, /source\.startsWith\(managedRoot\+codexLinuxAccountSwitcherPath\.sep\)/);
+  assert.match(patched, /codexLinuxAccountSwitcherFs\.cpSync\(source,shared,\{recursive:true\}\)/);
+  assert.doesNotMatch(patched, /copyFileSync\(shared,target\)/);
 });
 
 test("profile identity lookup keeps the base account home stable after relaunch", () => {
@@ -169,6 +184,9 @@ test("shared prelaunch preserves an existing profile catalog before linking the 
     const targetDev = path.join(profileHome, "sqlite", "codex-dev.db");
     const sharedState = path.join(dataHome, "codex-desktop", "account-contexts", "team", "codex-global-state.json");
     const targetState = path.join(profileHome, ".codex-global-state.json");
+    const sharedSessions = path.join(dataHome, "codex-desktop", "account-contexts", "team", "sessions");
+    const targetSessions = path.join(profileHome, "sessions");
+    const targetSessionIndex = path.join(profileHome, "session_index.jsonl");
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.mkdirSync(path.dirname(shared), { recursive: true });
     fs.writeFileSync(target, "profile catalog");
@@ -177,6 +195,9 @@ test("shared prelaunch preserves an existing profile catalog before linking the 
     fs.writeFileSync(sharedDev, "shared dev catalog");
     fs.writeFileSync(targetState, "profile project state");
     fs.writeFileSync(sharedState, "shared project state");
+    fs.mkdirSync(targetSessions, { recursive: true });
+    fs.writeFileSync(path.join(targetSessions, "rollout.jsonl"), "profile rollout");
+    fs.writeFileSync(targetSessionIndex, "profile session index");
     const result = spawnSync("bash", [path.join(__dirname, "prelaunch-hook.sh")], {
       env: {
         HOME: home,
@@ -197,6 +218,9 @@ test("shared prelaunch preserves an existing profile catalog before linking the 
     assert.equal(fs.readlinkSync(targetState), sharedState);
     assert.equal(fs.readFileSync(`${targetState}.isolated-backup`, "utf8"), "profile project state");
     assert.equal(fs.readFileSync(sharedState, "utf8"), "shared project state");
+    assert.equal(fs.readlinkSync(targetSessions), sharedSessions);
+    assert.equal(fs.readFileSync(path.join(sharedSessions, "rollout.jsonl"), "utf8"), "profile rollout");
+    assert.equal(fs.readlinkSync(targetSessionIndex), path.join(path.dirname(sharedSessions), "session_index.jsonl"));
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

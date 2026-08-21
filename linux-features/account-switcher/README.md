@@ -15,16 +15,20 @@ stays in effect across dialog openings, account switches, and app relaunches
 until the user changes it. When enabled, it links the SQLite catalogs into a
 private shared context. This covers
 `codex.db`, `codex-dev.db`, and the thread-summary catalogs used by current
-Codex builds, plus the local project metadata in `.codex-global-state.json`.
-It does not share credentials, Electron state, rollout files, or plugins. If a
+Codex builds, the local project metadata in `.codex-global-state.json`, and the
+local rollout/session files needed to resume those threads. Enabling sharing
+after it was disabled starts a fresh shared context seeded by the active
+profile, so an older shared catalog cannot replace work created immediately
+before a switch. It does not share credentials, Electron state, or plugins. If a
 profile already has an isolated catalog or project state, it is retained as an
 `.isolated-backup` file before the shared catalog is linked. Remote projects and
 threads still require the selected account to be authorized by OpenAI; this
 client cannot grant cross-account access.
 
-Switching starts the replacement profile and force-exits the old Electron
-instance after the handoff state is written. This prevents stale renderer and
-app-server process trees from accumulating during repeated switches.
+Switching starts the replacement profile, terminates the old instance's Linux
+process tree, and force-exits its Electron main process after the handoff state
+is written. This prevents orphaned renderer, utility, and app-server processes
+from accumulating during repeated switches.
 
 Only profile names and context settings are stored in
 `${XDG_CONFIG_HOME:-~/.config}/codex-desktop/account-switcher.json`. The
