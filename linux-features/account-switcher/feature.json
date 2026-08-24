@@ -11,6 +11,16 @@
       "source": "./shared-state.sh",
       "target": ".codex-linux/features/account-switcher/shared-state.sh",
       "mode": "0755"
+    },
+    {
+      "source": "./shared-state-json.js",
+      "target": ".codex-linux/features/account-switcher/shared-state-json.js",
+      "mode": "0755"
+    },
+    {
+      "source": "./shared-state-sqlite.js",
+      "target": ".codex-linux/features/account-switcher/shared-state-sqlite.js",
+      "mode": "0755"
     }
   ],
   "runtimeHooks": {

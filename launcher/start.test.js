@@ -23,7 +23,12 @@ function createApp(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const launcher = fs.readFileSync(templatePath, "utf8")
     .replaceAll("__CODEX_LINUX_APP_ID__", "codex-desktop")
-    .replaceAll("__CODEX_LINUX_APP_DISPLAY_NAME__", "ChatGPT Community");
+    .replaceAll("__CODEX_LINUX_APP_DISPLAY_NAME__", "ChatGPT Community")
+    .replace(
+      "report_daily_usage() {\n    (\n",
+      "report_daily_usage() {\n    (\n        trap '[ -z \"${CODEX_LINUX_TEST_USAGE_REPORT_DONE:-}\" ] || printf done > \"$CODEX_LINUX_TEST_USAGE_REPORT_DONE\"' EXIT\n",
+    );
+  assert.match(launcher, /CODEX_LINUX_TEST_USAGE_REPORT_DONE/);
   writeExecutable(path.join(root, "start.sh"), launcher);
   for (const relative of ["resources/app.asar", "resources/codex", "resources/rg", "resources/codex-code-mode-host"]) {
     const target = path.join(root, relative);
@@ -68,13 +73,14 @@ printf '<%s>\\n' "$@" >> "$TEST_ROOT/curl-arguments"
   };
 
   for (let launch = 0; launch < 2; launch += 1) {
+    const reportDonePath = path.join(root, `usage-report-done-${launch}`);
     const result = childProcess.spawnSync(path.join(root, "start.sh"), [], {
-      env,
+      env: { ...env, CODEX_LINUX_TEST_USAGE_REPORT_DONE: reportDonePath },
       encoding: "utf8",
     });
     assert.equal(result.status, 7);
     assert.equal(result.stderr, "");
-    if (launch === 0) waitForFile(callsPath);
+    waitForFile(reportDonePath);
   }
 
   assert.equal(fs.readFileSync(callsPath, "utf8"), "call\n");
@@ -92,6 +98,7 @@ printf '<%s>\\n' "$@" >> "$TEST_ROOT/curl-arguments"
 test("launcher usage reporting has one opt-out and suppresses curl failures", (t) => {
   const disabledRoot = createApp(t);
   const disabledBin = path.join(disabledRoot, "bin");
+  const disabledReportDone = path.join(disabledRoot, "usage-report-done");
   writeExecutable(
     path.join(disabledBin, "curl"),
     `#!/bin/bash
@@ -103,12 +110,14 @@ printf 'unexpected\\n' >> "$TEST_ROOT/curl-calls"
       ...process.env,
       CODEX_HOME: path.join(disabledRoot, "codex-home"),
       CODEX_LINUX_DISABLE_USAGE_REPORTING: "1",
+      CODEX_LINUX_TEST_USAGE_REPORT_DONE: disabledReportDone,
       PATH: `${disabledBin}:${process.env.PATH}`,
       TEST_ROOT: disabledRoot,
       XDG_STATE_HOME: path.join(disabledRoot, "state"),
     },
     encoding: "utf8",
   });
+  waitForFile(disabledReportDone);
   assert.equal(disabled.status, 7);
   assert.equal(disabled.stderr, "");
   assert.equal(fs.existsSync(path.join(disabledRoot, "curl-calls")), false);
@@ -116,6 +125,7 @@ printf 'unexpected\\n' >> "$TEST_ROOT/curl-calls"
 
   const missingRoot = createApp(t);
   const missingBin = path.join(missingRoot, "bin");
+  const missingReportDone = path.join(missingRoot, "usage-report-done");
   fs.mkdirSync(missingBin, { recursive: true });
   fs.symlinkSync("/usr/bin/dirname", path.join(missingBin, "dirname"));
   const missing = childProcess.spawnSync(path.join(missingRoot, "start.sh"), [], {
@@ -123,12 +133,14 @@ printf 'unexpected\\n' >> "$TEST_ROOT/curl-calls"
       ...process.env,
       CODEX_HOME: path.join(missingRoot, "codex-home"),
       CODEX_LINUX_DISABLE_USAGE_REPORTING: "0",
+      CODEX_LINUX_TEST_USAGE_REPORT_DONE: missingReportDone,
       PATH: missingBin,
       TEST_ROOT: missingRoot,
       XDG_STATE_HOME: path.join(missingRoot, "state"),
     },
     encoding: "utf8",
   });
+  waitForFile(missingReportDone);
   assert.equal(missing.status, 7);
   assert.equal(missing.stdout, "");
   assert.equal(missing.stderr, "");
@@ -136,6 +148,7 @@ printf 'unexpected\\n' >> "$TEST_ROOT/curl-calls"
 
   const failingRoot = createApp(t);
   const failingBin = path.join(failingRoot, "bin");
+  const failingReportDone = path.join(failingRoot, "usage-report-done");
   writeExecutable(
     path.join(failingBin, "curl"),
     `#!/bin/bash
@@ -148,12 +161,14 @@ exit 22
       ...process.env,
       CODEX_HOME: path.join(failingRoot, "codex-home"),
       CODEX_LINUX_DISABLE_USAGE_REPORTING: "0",
+      CODEX_LINUX_TEST_USAGE_REPORT_DONE: failingReportDone,
       PATH: `${failingBin}:${process.env.PATH}`,
       TEST_ROOT: failingRoot,
       XDG_STATE_HOME: path.join(failingRoot, "state"),
     },
     encoding: "utf8",
   });
+  waitForFile(failingReportDone);
   assert.equal(failing.status, 7);
   assert.equal(failing.stdout, "");
   assert.equal(failing.stderr, "");

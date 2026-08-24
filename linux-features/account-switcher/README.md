@@ -12,15 +12,29 @@ profile is the existing default account. New profile data is stored under
 The switch dialog offers an experimental **Keep the local projects/thread
 catalog** mode. Its On/Off choice is saved in the account-switcher registry and
 stays in effect across dialog openings, account switches, and app relaunches
-until the user changes it. When enabled, it links the SQLite catalogs into a
- private shared context. It links only the allowlisted SQLite catalogs:
+until the user changes it. When enabled, it migrates only the local-project
+catalog data into a private shared context. It migrates only the allowlisted
+SQLite catalogs:
 `codex.db`, `codex-dev.db`, and the thread-summary catalogs used by current
 Codex builds, including their SQLite `-wal` and `-shm` sidecars. Credentials,
-auth files, Electron state, plugins, shell snapshots, rollout/session files,
-and account-scoped metadata are never shared. Migration runs only while both
-profiles are offline, with a journal, rollback, and crash recovery. If a
-profile already has an isolated catalog, it is retained as an
-`.isolated-backup` file before the shared catalog is linked. Remote projects
+auth files, Electron state, plugins, shell snapshots, and account-scoped
+metadata are never shared. Offline session rollout files and the session index
+needed to resume shared local threads are merged into the private context. The
+active profile then receives regular session files and a regular SQLite index
+inside its own `CODEX_HOME`; shared files are hard-linked where possible, so
+the app-server never receives a rollout path outside the active profile.
+Existing `state_*.sqlite` thread rows are rewritten from the shared session
+root to that active profile root while SQLite is offline, with WAL/SHM backup
+and rollback. The local-project list, local
+thread-to-project assignments, descriptions, client bindings, and writable
+roots are copied through a private `local-project-state.json` sidecar; the
+rest of each profile's global state remains separate. Migration runs only while both
+profiles are offline. Per-context locks serialize concurrent launches, and
+uncommitted journals provide rollback and crash recovery. A handoff commits
+its migration only after the replacement signals readiness; if an unready
+replacement remains alive, rollback is deferred until the next offline launch.
+If a profile already has an isolated catalog, it is retained as an
+`.isolated-backup` file before the shared catalog is migrated. Remote projects
 and threads still require the selected account to be authorized by OpenAI;
 this client cannot grant cross-account access.
 
@@ -28,10 +42,11 @@ The dialog renders saved login names and last-known usage values immediately.
 It refreshes usage for all profiles concurrently in the background and changes
 an on-screen value only when the live result differs from the cached value.
 
-Switching records a handoff, exits through the normal launcher/AppRun
-lifecycle, waits for the replacement to signal readiness, and restores the
-previous selection if startup fails. It does not force-kill arbitrary
-renderer, utility, or app-server descendants.
+Switching records a handoff, exits through the normal launcher lifecycle,
+re-enters a packaged AppImage through its `APPIMAGE` executable (or `AppRun`
+for an extracted AppDir), waits for the replacement to signal readiness, and
+restores the previous selection if startup fails. It does not force-kill
+arbitrary renderer, utility, or app-server descendants.
 
 When the active profile logs out, the main process observes that profile's own
 auth file after a debounce. It hands off to the previously active
@@ -59,7 +74,8 @@ is gone, and its singleton socket is unavailable. This recovers profiles left
 locked by a crashed app or a replaced container without disturbing a live app.
 
 Profile names, context settings, cached login/usage metadata, timestamps, the
-previous profile ID, a temporary login-pending deadline, and the shared-context generation are stored in
+previous profile ID, a temporary login-pending deadline, and the shared-context
+generation are stored in
 `${XDG_CONFIG_HOME:-~/.config}/codex-desktop/account-switcher.json`. The
 feature never copies or displays tokens, `auth.json`, keyring data, or database
 credentials. Deleting a signed-out named profile removes all data beneath its

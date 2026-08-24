@@ -36,6 +36,13 @@ if account_switcher_is_deep_link "$@" && account_switcher_app_is_running; then
     exit 0
 fi
 
+# The after-exit handoff owns an uncommitted migration journal until the
+# replacement signals readiness. Re-running migration here would treat that
+# live journal as crash residue and undo the prepared filesystem state.
+if [[ "${CODEX_LINUX_ACCOUNT_SWITCHER_MIGRATION_PREPARED:-0}" == 1 ]]; then
+    exit 0
+fi
+
 config_home="${XDG_CONFIG_HOME:-${HOME:-}/.config}"
 state_file="$config_home/codex-desktop/account-switcher.active"
 profile_id="default"

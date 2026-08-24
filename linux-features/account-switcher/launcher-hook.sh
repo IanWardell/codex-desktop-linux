@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+feature_root="${CODEX_LINUX_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/.codex-linux/features/account-switcher"
+[[ -r "$feature_root/shared-state.sh" ]] || feature_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$feature_root/shared-state.sh"
+
 config_home="${XDG_CONFIG_HOME:-${HOME:-}/.config}"
 state_file="$config_home/codex-desktop/account-switcher.active"
 base_codex_home="${CODEX_LINUX_ACCOUNT_SWITCHER_BASE_CODEX_HOME:-${CODEX_HOME:-${HOME:-}/.codex}}"
@@ -16,6 +21,15 @@ profile_has_live_process() {
             [[ "$argument" == "--user-data-dir=$user_data_dir" ]] && return 0
         done < "$cmdline"
     done
+    return 1
+}
+
+singleton_socket_is_live() {
+    local socket_path="$1" line
+    [[ -r /proc/net/unix ]] || return 1
+    while IFS= read -r line; do
+        [[ "$line" == *" $socket_path" ]] && return 0
+    done < /proc/net/unix
     return 1
 }
 
@@ -36,7 +50,7 @@ clear_stale_singletons() {
     if [[ -L "$user_data_dir/SingletonSocket" ]]; then
         socket_target="$(readlink "$user_data_dir/SingletonSocket")"
         [[ "$socket_target" == /* ]] || socket_target="$user_data_dir/$socket_target"
-        [[ -S "$socket_target" ]] && return 0
+        [[ -S "$socket_target" ]] && singleton_socket_is_live "$socket_target" && return 0
     fi
     local name
     for name in SingletonLock SingletonSocket SingletonCookie; do
@@ -51,17 +65,11 @@ if [[ -z "$profile_id" && -r "$state_file" ]]; then
 fi
 
 profile_id="${profile_id//[$'\r\n']/}"
+profile_id="${profile_id:-default}"
 profile_mode="${profile_mode:-isolated}"
 context_id="${context_id:-default}"
 
-if [[ "$profile_id" == "default" || -z "$profile_id" ]]; then
-    # Preserve Electron's real upstream default profile path. We do not pass a
-    # replacement --user-data-dir for the default account, but still recover
-    # its exact stale singleton links after a crash or container cold restart.
-    clear_stale_singletons "${CODEX_ELECTRON_USER_DATA_PATH:-$config_home/Codex}"
-    exit 0
-fi
-if [[ ! "$profile_id" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
+if ! account_switcher_validate_id "$profile_id"; then
     printf 'account-switcher: refusing invalid profile id: %s\n' "$profile_id" >&2
     exit 1
 fi
@@ -69,9 +77,17 @@ if [[ "$profile_mode" != "isolated" && "$profile_mode" != "shared-local" ]]; the
     printf 'account-switcher: refusing invalid profile context: %s\n' "$profile_mode" >&2
     exit 1
 fi
-if [[ ! "$context_id" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
+if ! account_switcher_validate_id "$context_id"; then
     printf 'account-switcher: refusing invalid context id: %s\n' "$context_id" >&2
     exit 1
+fi
+
+if [[ "$profile_id" == default ]]; then
+    # Preserve Electron's real upstream default profile path. We do not pass a
+    # replacement --user-data-dir for the default account, but still recover
+    # its exact stale singleton links after a crash or container cold restart.
+    clear_stale_singletons "${CODEX_ELECTRON_USER_DATA_PATH:-$config_home/Codex}"
+    exit 0
 fi
 
 data_home="${XDG_DATA_HOME:-${HOME:-}/.local/share}"
