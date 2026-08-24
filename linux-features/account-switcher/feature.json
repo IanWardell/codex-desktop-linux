@@ -6,6 +6,13 @@
   "entrypoints": {
     "patchDescriptors": "./patch.js"
   },
+  "resources": [
+    {
+      "source": "./shared-state.sh",
+      "target": ".codex-linux/features/account-switcher/shared-state.sh",
+      "mode": "0755"
+    }
+  ],
   "runtimeHooks": {
     "launcher": {
       "source": "launcher-hook.sh",
@@ -15,6 +22,11 @@
     "prelaunch": {
       "source": "prelaunch-hook.sh",
       "name": "account-switcher-prelaunch.sh",
+      "mode": "0755"
+    },
+    "afterExit": {
+      "source": "after-exit-hook.sh",
+      "name": "account-switcher-after-exit.sh",
       "mode": "0755"
     }
   }

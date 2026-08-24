@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_menu xmlns="http://openbox.org/"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://openbox.org/ file:///usr/share/openbox/menu.xsd">
+  <menu id="root-menu" label="Docker desktop">
+    <item label="Open Codex">
+      <action name="Execute"><execute>/usr/bin/codex-desktop</execute></action>
+    </item>
+    <item label="Open Epiphany">
+      <action name="Execute"><execute>/usr/bin/epiphany</execute></action>
+    </item>
+    <separator />
+    <item label="Reconfigure desktop">
+      <action name="Reconfigure" />
+    </item>
+  </menu>
+</openbox_menu>

@@ -1,58 +1,65 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-[[ "${CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT:-isolated}" == "shared-local" ]] || exit 0
+feature_root="${CODEX_LINUX_APP_DIR:?}/.codex-linux/features/account-switcher"
+source "$feature_root/shared-state.sh"
 
-profile_home="${CODEX_HOME:-${HOME:-}/.codex}"
-context_id="${CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT_ID:-default}"
-if [[ ! "$context_id" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
-    printf 'account-switcher: refusing invalid shared context id: %s\n' "$context_id" >&2
-    exit 1
-fi
-
-data_home="${XDG_DATA_HOME:-${HOME:-}/.local/share}"
-shared_root="$data_home/codex-desktop/account-contexts/$context_id"
-umask 077
-mkdir -p "$profile_home/sqlite" "$shared_root"
-
-link_catalog() {
-    local target="$1" shared="$2"
-    if [[ -L "$target" ]]; then
-        current_link="$(readlink -f -- "$target")"
-        managed_root="$data_home/codex-desktop/account-contexts"
-        if [[ "$current_link" != "$shared" ]]; then
-            [[ "$current_link" == "$managed_root"/* ]] || {
-                printf 'account-switcher: refusing to replace a link outside managed shared contexts: %s\n' "$target" >&2
-                exit 1
-            }
-            [[ -e "$shared" ]] || cp -aL -- "$target" "$shared"
-            unlink -- "$target"
-            [[ -e "$shared" ]] && ln -s -- "$shared" "$target"
-        fi
-    elif [[ -e "$target" ]]; then
-        if [[ -e "$shared" ]]; then
-            backup="$target.isolated-backup"
-            [[ -e "$backup" || -L "$backup" ]] && backup="$backup.$$"
-            mv -- "$target" "$backup"
-            ln -s -- "$shared" "$target"
-        else
-            mv -- "$target" "$shared"
-            ln -s -- "$shared" "$target"
-        fi
-    elif [[ -e "$shared" ]]; then
-        ln -s -- "$shared" "$target"
-    fi
+account_switcher_is_deep_link() {
+    local argument
+    for argument in "$@"; do
+        [[ "$argument" == codex://* ]] && return 0
+    done
+    return 1
 }
 
-for catalog_name in codex.db codex-dev.db codex-thread-summaries.db codex-thread-summaries-dev.db; do
-    link_catalog "$profile_home/sqlite/$catalog_name" "$shared_root/$catalog_name"
-    for suffix in -wal -shm; do
-        link_catalog "$profile_home/sqlite/$catalog_name$suffix" "$shared_root/$catalog_name$suffix"
+account_switcher_app_is_running() {
+    local app_binary="$CODEX_LINUX_APP_DIR/ChatGPT" process exe cmdline argument
+    for process in /proc/[0-9]*; do
+        [[ -d "$process" ]] || continue
+        exe="$(readlink -f -- "$process/exe" 2>/dev/null || true)"
+        [[ "$exe" == "$app_binary" ]] && return 0
     done
-done
-for suffix in "" .bak; do
-    link_catalog "$profile_home/.codex-global-state.json$suffix" "$shared_root/codex-global-state.json$suffix"
-done
-for name in sessions session_index.jsonl shell_snapshots; do
-    link_catalog "$profile_home/$name" "$shared_root/$name"
-done
+    for cmdline in /proc/[0-9]*/cmdline; do
+        [[ -r "$cmdline" ]] || continue
+        while IFS= read -r -d '' argument; do
+            [[ "$argument" == "$app_binary" ]] && return 0
+        done < "$cmdline"
+    done
+    return 1
+}
+
+# A URI opened by the desktop handler is a second invocation whose only job is
+# to deliver the deep link to the already-running Electron instance. It must
+# not attempt the offline SQLite migration guard before Electron's
+# single-instance handoff receives the URI.
+if account_switcher_is_deep_link "$@" && account_switcher_app_is_running; then
+    exit 0
+fi
+
+config_home="${XDG_CONFIG_HOME:-${HOME:-}/.config}"
+state_file="$config_home/codex-desktop/account-switcher.active"
+profile_id="default"
+profile_mode="isolated"
+context_id="default"
+if [[ -r "$state_file" ]]; then
+    IFS= read -r profile_id < "$state_file" || true
+    IFS= read -r profile_mode < <(sed -n '2p' "$state_file") || true
+    IFS= read -r context_id < <(sed -n '3p' "$state_file") || true
+fi
+profile_mode="${profile_mode:-isolated}"
+context_id="${context_id:-default}"
+account_switcher_validate_id "$profile_id" || { printf 'account-switcher: refusing invalid persisted profile id: %s\n' "$profile_id" >&2; exit 1; }
+[[ "$profile_mode" == isolated || "$profile_mode" == shared-local ]] || { printf 'account-switcher: refusing invalid persisted context: %s\n' "$profile_mode" >&2; exit 1; }
+account_switcher_validate_id "$context_id" || { printf 'account-switcher: refusing invalid persisted context id: %s\n' "$context_id" >&2; exit 1; }
+
+data_home="${XDG_DATA_HOME:-${HOME:-}/.local/share}"
+if [[ "$profile_id" == default ]]; then
+    codex_home="${CODEX_LINUX_ACCOUNT_SWITCHER_BASE_CODEX_HOME:-${CODEX_HOME:-${HOME:-}/.codex}}"
+else
+    codex_home="$data_home/codex-desktop/account-profiles/$profile_id/codex"
+fi
+if [[ "$profile_mode" == shared-local ]]; then
+    account_switcher_migrate_shared "$codex_home" "$codex_home" "$context_id"
+else
+    account_switcher_detach_isolated "$codex_home" "$context_id"
+fi

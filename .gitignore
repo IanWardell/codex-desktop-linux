@@ -1,10 +1,6 @@
 *.dmg
 *.dmg.metadata
 node_modules/
-.env
-.env.*
-!.env.example
-.envs
 __pycache__/
 *.py[cod]
 codex-app/

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Docker-only sandbox adaptation. Production packages use the native launcher
+# and AppArmor policy and must never add --no-sandbox automatically.
+exec /opt/codex-source/start.sh --no-sandbox "$@"
