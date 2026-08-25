@@ -1,12 +1,83 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 ACCOUNT_SWITCHER_ID_RE='^[a-z0-9][a-z0-9._-]{0,63}$'
 ACCOUNT_SWITCHER_CATALOGS=(codex.db codex-dev.db codex-thread-summaries.db codex-thread-summaries-dev.db)
 ACCOUNT_SWITCHER_SESSION_PATHS=(sessions session_index.jsonl)
 
+account_switcher_boot_id() {
+    local boot_id
+    IFS= read -r boot_id < /proc/sys/kernel/random/boot_id || return 1
+    [[ "$boot_id" =~ ^[0-9a-f-]+$ ]] || return 1
+    printf '%s\n' "$boot_id"
+}
+
+account_switcher_process_start_time() {
+    local pid="$1" stat rest
+    local -a fields=()
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    IFS= read -r stat < "/proc/$pid/stat" || return 1
+    rest="${stat##*) }"
+    read -r -a fields <<< "$rest"
+    [[ "${fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${fields[19]}"
+}
+
+account_switcher_process_identity_matches() {
+    local pid="$1" expected_start="$2" expected_boot="$3" actual_start actual_boot
+    [[ "$expected_start" =~ ^[0-9]+$ && "$expected_boot" =~ ^[0-9a-f-]+$ ]] || return 1
+    actual_start="$(account_switcher_process_start_time "$pid")" || return 1
+    actual_boot="$(account_switcher_boot_id)" || return 1
+    [[ "$actual_start" == "$expected_start" && "$actual_boot" == "$expected_boot" ]]
+}
+
+account_switcher_recorded_process_live() {
+    local pid="$1" expected_start="$2" expected_boot="$3"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    if [[ -n "$expected_start" || -n "$expected_boot" ]]; then
+        account_switcher_process_identity_matches "$pid" "$expected_start" "$expected_boot"
+    else
+        kill -0 "$pid" 2>/dev/null
+    fi
+}
+
+account_switcher_write_process_identity() {
+    local file="$1" pid="${2:-$$}" start boot
+    start="$(account_switcher_process_start_time "$pid")" || return 1
+    boot="$(account_switcher_boot_id)" || return 1
+    printf '%s\n%s\n%s\n' "$pid" "$start" "$boot" > "$file"
+}
+
+account_switcher_read_process_identity() {
+    local file="$1"
+    ACCOUNT_SWITCHER_OWNER_PID=""
+    ACCOUNT_SWITCHER_OWNER_START=""
+    ACCOUNT_SWITCHER_OWNER_BOOT=""
+    [[ -r "$file" ]] || return 1
+    IFS= read -r ACCOUNT_SWITCHER_OWNER_PID < "$file" || true
+    IFS= read -r ACCOUNT_SWITCHER_OWNER_START < <(sed -n '2p' "$file") || true
+    IFS= read -r ACCOUNT_SWITCHER_OWNER_BOOT < <(sed -n '3p' "$file") || true
+}
+
 account_switcher_validate_id() {
     [[ "${1:-}" =~ $ACCOUNT_SWITCHER_ID_RE ]]
+}
+
+account_switcher_durable_replace() {
+    local temporary="$1" target="$2" parent
+    parent="$(dirname -- "$target")"
+    sync -d "$temporary"
+    mv -- "$temporary" "$target"
+    sync -d "$parent"
+}
+
+account_switcher_durable_remove() {
+    local target="$1" parent
+    parent="$(dirname -- "$target")"
+    [[ -e "$target" || -L "$target" ]] || return 0
+    rm -rf -- "$target"
+    sync -d "$parent"
 }
 
 account_switcher_profile_home() {
@@ -29,36 +100,91 @@ account_switcher_shared_root() {
 }
 
 account_switcher_context_lock_acquire() {
-    local shared_root="$1" lock="$1/.account-switcher.lock" deadline owner
+    local shared_root="$1" lock="$1/.account-switcher.lock" claim deadline owner reclaim_fd acquired
     mkdir -p -- "$shared_root"
+    chmod 0700 -- "$shared_root"
+    claim="$shared_root/.account-switcher.lock.claim.$$.$RANDOM"
+    account_switcher_write_process_identity "$claim"
+    chmod 0600 -- "$claim"
+    sync -d "$claim" 2>/dev/null || true
     deadline=$((SECONDS + 5))
-    while ! mkdir -m 0700 -- "$lock" 2>/dev/null; do
-        if [[ -r "$lock/pid" ]]; then
-            IFS= read -r owner < "$lock/pid" || true
-            if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
-                rm -rf -- "$lock"
+    while ! ln -T -- "$claim" "$lock" 2>/dev/null; do
+        owner=""
+        if [[ -f "$lock" && ! -L "$lock" ]]; then
+            account_switcher_read_process_identity "$lock" || true
+            owner="$ACCOUNT_SWITCHER_OWNER_PID"
+            if [[ "$owner" =~ ^[1-9][0-9]*$ ]] &&
+               ! account_switcher_recorded_process_live "$owner" "$ACCOUNT_SWITCHER_OWNER_START" "$ACCOUNT_SWITCHER_OWNER_BOOT"; then
+                acquired=0
+                exec {reclaim_fd}> "$lock.reclaim"
+                if flock -w 0.25 "$reclaim_fd"; then
+                    owner=""
+                    account_switcher_read_process_identity "$lock" || true
+                    owner="$ACCOUNT_SWITCHER_OWNER_PID"
+                    if [[ -f "$lock" && ! -L "$lock" && "$owner" =~ ^[1-9][0-9]*$ ]] &&
+                       ! account_switcher_recorded_process_live "$owner" "$ACCOUNT_SWITCHER_OWNER_START" "$ACCOUNT_SWITCHER_OWNER_BOOT"; then
+                        unlink -- "$lock"
+                        ln -T -- "$claim" "$lock" 2>/dev/null && acquired=1
+                    fi
+                    flock -u "$reclaim_fd" || true
+                fi
+                exec {reclaim_fd}>&-
+                if (( acquired == 1 )); then
+                    rm -f -- "$claim"
+                    printf '%s\n' "$lock"
+                    return 0
+                fi
+                continue
+            fi
+        elif [[ -d "$lock" && ! -L "$lock" ]]; then
+            account_switcher_read_process_identity "$lock/pid" || true
+            owner="$ACCOUNT_SWITCHER_OWNER_PID"
+            if [[ ! "$owner" =~ ^[1-9][0-9]*$ ]] ||
+               ! account_switcher_recorded_process_live "$owner" "$ACCOUNT_SWITCHER_OWNER_START" "$ACCOUNT_SWITCHER_OWNER_BOOT"; then
+                acquired=0
+                exec {reclaim_fd}> "$lock.reclaim"
+                if flock -w 0.25 "$reclaim_fd"; then
+                    owner=""
+                    account_switcher_read_process_identity "$lock/pid" || true
+                    owner="$ACCOUNT_SWITCHER_OWNER_PID"
+                    if [[ -d "$lock" && ! -L "$lock" ]] &&
+                       { [[ ! "$owner" =~ ^[1-9][0-9]*$ ]] ||
+                         ! account_switcher_recorded_process_live "$owner" "$ACCOUNT_SWITCHER_OWNER_START" "$ACCOUNT_SWITCHER_OWNER_BOOT"; }; then
+                        rm -rf -- "$lock"
+                        ln -T -- "$claim" "$lock" 2>/dev/null && acquired=1
+                    fi
+                    flock -u "$reclaim_fd" || true
+                fi
+                exec {reclaim_fd}>&-
+                if (( acquired == 1 )); then
+                    rm -f -- "$claim"
+                    printf '%s\n' "$lock"
+                    return 0
+                fi
                 continue
             fi
         fi
         if (( SECONDS >= deadline )); then
+            rm -f -- "$claim"
             printf 'account-switcher: shared context is busy: %s\n' "$shared_root" >&2
             return 1
         fi
         sleep 0.05
     done
-    printf '%s\n' "$$" > "$lock/pid"
+    rm -f -- "$claim"
     printf '%s\n' "$lock"
 }
 
 account_switcher_context_lock_release() {
     local lock="$1" owner=""
-    [[ -d "$lock" ]] || return 0
-    IFS= read -r owner < "$lock/pid" || true
+    [[ -f "$lock" && ! -L "$lock" ]] || return 0
+    account_switcher_read_process_identity "$lock" || true
+    owner="$ACCOUNT_SWITCHER_OWNER_PID"
     [[ "$owner" == "$$" ]] || {
         printf 'account-switcher: refusing to release another process lock: %s\n' "$lock" >&2
         return 1
     }
-    rm -rf -- "$lock"
+    unlink -- "$lock"
 }
 
 account_switcher_profile_owns_process() {
@@ -119,19 +245,39 @@ account_switcher_delete_profile() {
 }
 
 account_switcher_assert_offline() {
-    local codex_home="$1" user_data_dir="${2:-}" name suffix relative
+    local codex_home="$1" user_data_dir="${2:-}" name suffix relative database
     [[ -z "$user_data_dir" ]] || ! account_switcher_profile_owns_process "$user_data_dir" || {
         printf 'account-switcher: profile is still owned by a live Electron process: %s\n' "$user_data_dir" >&2
         return 1
     }
     for name in "${ACCOUNT_SWITCHER_CATALOGS[@]}"; do
-        for suffix in "" -wal -shm; do
+        if [[ -e "$codex_home/sqlite/$name-journal" || -L "$codex_home/sqlite/$name-journal" ]]; then
+            printf 'account-switcher: refusing migration while a SQLite rollback journal exists: %s\n' "$codex_home/sqlite/$name-journal" >&2
+            return 1
+        fi
+        for suffix in "" -wal -shm -journal; do
             if account_switcher_path_has_open_fd "$codex_home/sqlite/$name$suffix"; then
                 printf 'account-switcher: refusing migration while SQLite path is open: %s\n' "$codex_home/sqlite/$name$suffix" >&2
                 return 1
             fi
         done
     done
+    shopt -s nullglob
+    for database in "$codex_home"/state_*.sqlite; do
+        if [[ -e "$database-journal" || -L "$database-journal" ]]; then
+            printf 'account-switcher: refusing migration while a state SQLite rollback journal exists: %s\n' "$database-journal" >&2
+            shopt -u nullglob
+            return 1
+        fi
+        for suffix in "" -wal -shm -journal; do
+            if account_switcher_path_has_open_fd "$database$suffix"; then
+                printf 'account-switcher: refusing migration while state SQLite path is open: %s\n' "$database$suffix" >&2
+                shopt -u nullglob
+                return 1
+            fi
+        done
+    done
+    shopt -u nullglob
     for relative in "${ACCOUNT_SWITCHER_SESSION_PATHS[@]}"; do
         if [[ -d "$codex_home/$relative" ]]; then
             account_switcher_tree_has_open_fd "$codex_home/$relative" && {
@@ -145,15 +291,48 @@ account_switcher_assert_offline() {
     done
 }
 
+account_switcher_committed_journal_path() {
+    local journal="$1" parent base suffix
+    parent="$(dirname -- "$journal")"
+    base="$(basename -- "$journal")"
+    [[ "$base" == .account-switcher-migration-* && "$base" != */* ]] || return 1
+    suffix="${base#.account-switcher-migration-}"
+    printf '%s\n' "$parent/.account-switcher-committed-$suffix"
+}
+
+account_switcher_discard_committed_journal() {
+    local journal="$1" cleanup
+    cleanup="$(account_switcher_committed_journal_path "$journal")" || return 1
+    if [[ -d "$journal" ]]; then
+        [[ ! -e "$cleanup" && ! -L "$cleanup" ]] || return 1
+        mv -T -- "$journal" "$cleanup"
+        sync -d "$(dirname -- "$journal")" 2>/dev/null || true
+    fi
+    [[ ! -e "$cleanup" && ! -L "$cleanup" ]] || rm -rf -- "$cleanup"
+}
+
 account_switcher_restore_journal() {
-    local journal="$1" record target shared backup action
+    local journal="$1" record record_name target shared backup action temporary
+    local -a fields=()
+    local -a records=()
     [[ -d "$journal" ]] || return 0
     if [[ -f "$journal/committed" ]]; then
-        rm -rf -- "$journal"
+        account_switcher_discard_committed_journal "$journal"
         return 0
     fi
-    while IFS= read -r -d '' record; do
-        IFS=$'\t' read -r target shared backup action < "$record"
+    mapfile -d '' -t records < <(find "$journal" -maxdepth 1 -type f -name '[0-9]*' -printf '%f\0' | sort -zrn)
+    for record_name in "${records[@]}"; do
+        record="$journal/$record_name"
+        fields=()
+        mapfile -d '' -t fields < "$record"
+        (( ${#fields[@]} == 4 )) || {
+            printf 'account-switcher: refusing malformed migration record: %s\n' "$record" >&2
+            return 1
+        }
+        target="${fields[0]}"
+        shared="${fields[1]}"
+        backup="${fields[2]}"
+        action="${fields[3]}"
         case "$action" in
             backup)
                 [[ -L "$target" ]] && unlink -- "$target"
@@ -162,6 +341,17 @@ account_switcher_restore_journal() {
             move)
                 [[ -L "$target" ]] && unlink -- "$target"
                 [[ -e "$shared" || -L "$shared" ]] && mv -- "$shared" "$target"
+                ;;
+            promote)
+                [[ -L "$target" ]] && unlink -- "$target"
+                if [[ ! -e "$target" && ! -L "$target" && ( -e "$shared" || -L "$shared" ) ]]; then
+                    mv -- "$shared" "$target"
+                fi
+                [[ -e "$backup" || -L "$backup" ]] && mv -- "$backup" "$shared"
+                ;;
+            remove-shared)
+                [[ -L "$target" ]] && unlink -- "$target"
+                [[ -e "$backup" || -L "$backup" ]] && mv -- "$backup" "$shared"
                 ;;
             link) [[ -L "$target" ]] && unlink -- "$target" ;;
             detach)
@@ -172,9 +362,77 @@ account_switcher_restore_journal() {
                 fi
                 [[ -e "$shared" || -L "$shared" ]] && ln -s -- "$shared" "$target"
                 ;;
+            detach-copy)
+                if [[ -d "$target" && ! -L "$target" ]]; then
+                    rm -rf -- "$target"
+                elif [[ -e "$target" || -L "$target" ]]; then
+                    rm -f -- "$target"
+                fi
+                [[ -e "$shared" || -L "$shared" ]] && ln -s -- "$shared" "$target"
+                ;;
+            detach-empty)
+                if [[ -e "$target" || -L "$target" ]]; then rm -f -- "$target"; fi
+                [[ -e "$shared" || -L "$shared" ]] && ln -s -- "$shared" "$target"
+                ;;
+            detach-new)
+                if [[ -e "$target" || -L "$target" ]]; then rm -f -- "$target"; fi
+                ;;
+            restore-pending)
+                # The durable intent precedes the backup copy. If no complete
+                # backup exists, the original target has not been removed and
+                # rollback must leave it untouched. If the copy completed just
+                # before a crash, restore it using a same-filesystem rename.
+                if [[ -e "$backup" || -L "$backup" ]]; then
+                    temporary="$target.account-switcher-restore.$(basename -- "$journal").$record_name"
+                    if [[ -d "$temporary" && ! -L "$temporary" ]]; then
+                        rm -rf -- "$temporary"
+                    elif [[ -e "$temporary" || -L "$temporary" ]]; then
+                        rm -f -- "$temporary"
+                    fi
+                    mkdir -p -- "$(dirname -- "$target")"
+                    if ! cp -al -- "$backup" "$temporary" 2>/dev/null; then
+                        cp -a -- "$backup" "$temporary"
+                    fi
+                    sync -f "$temporary" 2>/dev/null || true
+                    if [[ -d "$target" && ! -L "$target" ]]; then
+                        rm -rf -- "$target"
+                    elif [[ -e "$target" || -L "$target" ]]; then
+                        rm -f -- "$target"
+                    fi
+                    mv -- "$temporary" "$target"
+                    sync -d "$(dirname -- "$target")" 2>/dev/null || true
+                fi
+                ;;
             restore)
-                [[ -e "$target" || -L "$target" ]] && rm -f -- "$target"
-                [[ -e "$backup" || -L "$backup" ]] && mv -- "$backup" "$target"
+                if [[ -e "$backup" || -L "$backup" ]]; then
+                    temporary="$target.account-switcher-restore.$(basename -- "$journal").$record_name"
+                    if [[ -d "$temporary" && ! -L "$temporary" ]]; then
+                        rm -rf -- "$temporary"
+                    elif [[ -e "$temporary" || -L "$temporary" ]]; then
+                        rm -f -- "$temporary"
+                    fi
+                    mkdir -p -- "$(dirname -- "$target")"
+                    if ! cp -al -- "$backup" "$temporary" 2>/dev/null; then
+                        cp -a -- "$backup" "$temporary"
+                    fi
+                    sync -f "$temporary" 2>/dev/null || true
+                    if [[ -d "$target" && ! -L "$target" ]]; then
+                        rm -rf -- "$target"
+                    elif [[ -e "$target" || -L "$target" ]]; then
+                        rm -f -- "$target"
+                    fi
+                    mv -- "$temporary" "$target"
+                    sync -d "$(dirname -- "$target")" 2>/dev/null || true
+                else
+                    # A completed backup record without a backup means the
+                    # original path did not exist, so remove anything created
+                    # later in the transaction.
+                    if [[ -d "$target" && ! -L "$target" ]]; then
+                        rm -rf -- "$target"
+                    elif [[ -e "$target" || -L "$target" ]]; then
+                        rm -f -- "$target"
+                    fi
+                fi
                 ;;
             session-move)
                 [[ -e "$shared" || -L "$shared" ]] && {
@@ -189,8 +447,17 @@ account_switcher_restore_journal() {
                 [[ -d "$target" && ! -L "$target" ]] && rmdir -- "$target" 2>/dev/null || true
                 ;;
         esac
-    done < <(find "$journal" -maxdepth 1 -type f -name '[0-9]*' -print0 | sort -zrn)
+    done
     rm -rf -- "$journal"
+}
+
+account_switcher_write_record() {
+    local journal="$1" index="$2" target="$3" shared="$4" backup="$5" action="$6" temporary
+    temporary="$journal/.record-$index.tmp.$$"
+    printf '%s\0%s\0%s\0%s\0' "$target" "$shared" "$backup" "$action" > "$temporary"
+    sync -d "$temporary" 2>/dev/null || true
+    mv -- "$temporary" "$journal/$index"
+    sync -d "$journal" 2>/dev/null || true
 }
 
 account_switcher_node_binary() {
@@ -203,11 +470,30 @@ account_switcher_node_binary() {
 }
 
 account_switcher_backup_file() {
-    local target="$1" journal="$2" index="$3" backup="$journal/state-$index.backup"
-    printf '%s\t\t%s\trestore\n' "$target" "$backup" > "$journal/$index"
-    sync -d "$journal/$index" 2>/dev/null || true
+    local target="$1" journal="$2" index="$3" backup temporary
+    backup="$journal/state-$index.backup"
+    temporary="$backup.pending"
+    account_switcher_write_record "$journal" "$index" "$target" "" "$backup" restore-pending
     if [[ -e "$target" || -L "$target" ]]; then
-        mv -- "$target" "$backup"
+        if [[ -d "$temporary" && ! -L "$temporary" ]]; then
+            rm -rf -- "$temporary"
+        elif [[ -e "$temporary" || -L "$temporary" ]]; then
+            rm -f -- "$temporary"
+        fi
+        if ! cp -al -- "$target" "$temporary" 2>/dev/null; then
+            cp -a -- "$target" "$temporary"
+        fi
+        sync -f "$temporary" 2>/dev/null || true
+        mv -- "$temporary" "$backup"
+        sync -d "$journal" 2>/dev/null || true
+    fi
+    # Only a completed record permits the original path to be removed. This
+    # makes both sides of the copy durable before rollback can replace data.
+    account_switcher_write_record "$journal" "$index" "$target" "" "$backup" restore
+    if [[ -d "$target" && ! -L "$target" ]]; then
+        rm -rf -- "$target"
+    elif [[ -e "$target" || -L "$target" ]]; then
+        rm -f -- "$target"
     fi
 }
 
@@ -217,7 +503,7 @@ account_switcher_prepare_local_state() {
     local target_state="$target_home/.codex-global-state.json"
     local shared_state="$shared_root/local-project-state.json"
     local source_snapshot="$journal/source-global-state.json"
-    local helper node
+    local helper node target_backup
 
     # The default profile is both source and target during its first shared
     # launch. Snapshot before backing up the target so the source remains
@@ -227,8 +513,9 @@ account_switcher_prepare_local_state() {
         source_state="$source_snapshot"
     fi
     account_switcher_backup_file "$target_state" "$journal" "$index"
-    if [[ "$source_state" == "$source_snapshot" && -f "$source_snapshot" ]]; then
-        cp -- "$source_snapshot" "$target_state"
+    target_backup="$journal/state-$index.backup"
+    if [[ -e "$target_backup" || -L "$target_backup" ]]; then
+        cp -p -- "$target_backup" "$target_state"
     fi
     account_switcher_backup_file "$shared_state" "$journal" "$((index + 1))"
     helper="$(dirname -- "${BASH_SOURCE[0]}")/shared-state-json.js"
@@ -237,21 +524,27 @@ account_switcher_prepare_local_state() {
 }
 
 account_switcher_recover_context() {
-    local shared_root="$1" journal owner
+    local shared_root="$1" journal owner cleanup
     [[ -d "$shared_root" ]] || return 0
+    # Committed journals are atomically moved out of the rollback namespace
+    # before deletion. A crash during cleanup can therefore only leave inert
+    # committed residue, which is safe to remove on the next recovery.
+    while IFS= read -r -d '' cleanup; do
+        rm -rf -- "$cleanup"
+    done < <(find "$shared_root" -maxdepth 1 -type d -name '.account-switcher-committed-*' -print0)
     while IFS= read -r -d '' journal; do
-        owner=""
-        [[ -r "$journal/pid" ]] && IFS= read -r owner < "$journal/pid" || true
-        [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null && continue
+        account_switcher_read_process_identity "$journal/pid" || true
+        owner="$ACCOUNT_SWITCHER_OWNER_PID"
+        account_switcher_recorded_process_live "$owner" "$ACCOUNT_SWITCHER_OWNER_START" "$ACCOUNT_SWITCHER_OWNER_BOOT" && continue
         account_switcher_restore_journal "$journal"
     done < <(find "$shared_root" -maxdepth 1 -type d -name '.account-switcher-migration-*' -print0)
 }
 
 account_switcher_link_catalog() {
-    local target="$1" shared="$2" journal="$3" index="$4" backup action link_root
+    local target="$1" shared="$2" journal="$3" index="$4" promote="${5:-0}" clear_missing="${6:-0}" backup action link_root
     mkdir -p -- "$(dirname "$target")" "$(dirname "$shared")"
     if [[ -L "$target" ]]; then
-        link_root="$(readlink -f -- "$target")"
+        link_root="$(readlink -m -- "$target")"
         [[ "$link_root" == "$shared" ]] && return 0
         case "$link_root" in
             "$(dirname "$shared")"/*) unlink -- "$target" ;;
@@ -260,31 +553,40 @@ account_switcher_link_catalog() {
     elif [[ -e "$target" ]]; then
         backup="$target.isolated-backup"
         [[ -e "$backup" || -L "$backup" ]] && backup="$backup.$$.${index}"
-        if [[ -e "$shared" || -L "$shared" ]]; then
+        if [[ -e "$shared" || -L "$shared" ]] && (( promote == 1 )); then
+            backup="$journal/catalog-$index.shared-backup"
+            action=promote
+            account_switcher_write_record "$journal" "$index" "$target" "$shared" "$backup" "$action"
+            mv -- "$shared" "$backup" || return 1
+            mv -- "$target" "$shared" || return 1
+        elif [[ -e "$shared" || -L "$shared" ]]; then
             action=backup
-            printf '%s\t%s\t%s\t%s\n' "$target" "$shared" "$backup" "$action" > "$journal/$index"
-            sync -d "$journal/$index" 2>/dev/null || true
+            account_switcher_write_record "$journal" "$index" "$target" "$shared" "$backup" "$action"
             mv -- "$target" "$backup"
         else
             action=move
-            printf '%s\t%s\t%s\t%s\n' "$target" "$shared" "$backup" "$action" > "$journal/$index"
-            sync -d "$journal/$index" 2>/dev/null || true
+            account_switcher_write_record "$journal" "$index" "$target" "$shared" "$backup" "$action"
             mv -- "$target" "$shared"
         fi
     else
-        action=link
-        printf '%s\t%s\t%s\t%s\n' "$target" "$shared" "" "$action" > "$journal/$index"
-        sync -d "$journal/$index" 2>/dev/null || true
+        if (( promote == 1 && clear_missing == 1 )) && [[ -e "$shared" || -L "$shared" ]]; then
+            backup="$journal/catalog-$index.shared-backup"
+            account_switcher_write_record "$journal" "$index" "$target" "$shared" "$backup" remove-shared
+            mv -- "$shared" "$backup" || return 1
+            return 0
+        fi
+        action="link"
+        account_switcher_write_record "$journal" "$index" "$target" "$shared" "" "$action"
     fi
     [[ -e "$shared" || -L "$shared" ]] || return 0
     ln -s -- "$shared" "$target"
 }
 
 account_switcher_merge_session_tree() {
-    local source="$1" shared="$2" journal="$3" index="$4" file relative target
+    local source="$1" shared="$2" journal="$3" index="$4" replace_existing="${5:-0}" file relative target source_inode target_inode
     ACCOUNT_SWITCHER_MERGE_INDEX="$index"
     if [[ -L "$source" ]]; then
-        [[ "$(readlink -f -- "$source")" == "$(readlink -f -- "$shared")" ]] && return 0
+        [[ "$(readlink -m -- "$source")" == "$(readlink -m -- "$shared")" ]] && return 0
         printf 'account-switcher: refusing unmanaged session tree symlink: %s\n' "$source" >&2
         return 1
     fi
@@ -302,15 +604,21 @@ account_switcher_merge_session_tree() {
         relative="${file#"$source"/}"
         target="$shared/$relative"
         if [[ -e "$target" || -L "$target" ]]; then
-            continue
+            (( replace_existing == 1 )) || continue
+            source_inode="$(stat -c '%d:%i' -- "$file" 2>/dev/null || true)"
+            target_inode="$(stat -c '%d:%i' -- "$target" 2>/dev/null || true)"
+            [[ -n "$source_inode" && "$source_inode" == "$target_inode" ]] && continue
+            cmp -s -- "$file" "$target" && continue
+            index=$((index + 1))
+            account_switcher_backup_file "$target" "$journal" "$index"
+        else
+            index=$((index + 1))
+            account_switcher_write_record "$journal" "$index" "$target" "" "" session-link
         fi
         mkdir -p -- "$(dirname -- "$target")"
-        index=$((index + 1))
         if ! ln -- "$file" "$target" 2>/dev/null; then
-            cp -p -- "$file" "$target"
+            cp -p -- "$file" "$target" || return 1
         fi
-        printf '%s\t\t\tsession-link\n' "$target" > "$journal/$index"
-        sync -d "$journal/$index" 2>/dev/null || true
     done < <(find "$source" -type f -print0)
     ACCOUNT_SWITCHER_MERGE_INDEX="$index"
 }
@@ -319,19 +627,18 @@ account_switcher_merge_session_index() {
     local source="$1" shared="$2" journal="$3" index="$4" temporary backup
     ACCOUNT_SWITCHER_MERGE_INDEX="$index"
     if [[ -L "$source" ]]; then
-        [[ "$(readlink -f -- "$source")" == "$(readlink -f -- "$shared")" ]] && return 0
+        [[ "$(readlink -m -- "$source")" == "$(readlink -m -- "$shared")" ]] && return 0
         printf 'account-switcher: refusing unmanaged session index symlink: %s\n' "$source" >&2
         return 1
     fi
     [[ -f "$source" ]] || return 0
     mkdir -p -- "$(dirname -- "$shared")"
     if [[ ! -e "$shared" ]]; then
-        if ! ln -- "$source" "$shared" 2>/dev/null; then
-            cp -p -- "$source" "$shared"
-        fi
         index=$((index + 1))
-        printf '%s\t\t\tsession-link\n' "$shared" > "$journal/$index"
-        sync -d "$journal/$index" 2>/dev/null || true
+        account_switcher_write_record "$journal" "$index" "$shared" "" "" session-link
+        if ! ln -- "$source" "$shared" 2>/dev/null; then
+            cp -p -- "$source" "$shared" || return 1
+        fi
         ACCOUNT_SWITCHER_MERGE_INDEX="$index"
         return 0
     fi
@@ -343,17 +650,23 @@ account_switcher_merge_session_index() {
     account_switcher_backup_file "$shared" "$journal" "$index"
     backup="$journal/state-$index.backup"
     temporary="$shared.tmp.$$.$index"
-    awk 'NF && !seen[$0]++ { print }' "$backup" "$source" > "$temporary"
-    mv -- "$temporary" "$shared"
+    if ! awk 'NF && !seen[$0]++ { print }' "$backup" "$source" > "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    if ! mv -- "$temporary" "$shared"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
     ACCOUNT_SWITCHER_MERGE_INDEX="$index"
 }
 
 account_switcher_materialize_session_tree() {
-    local target="$1" shared="$2" journal="$3" index="$4" file relative destination
+    local target="$1" shared="$2" journal="$3" index="$4" file relative destination target_inode shared_inode
     ACCOUNT_SWITCHER_MERGE_INDEX="$index"
     [[ -d "$shared" && ! -L "$shared" ]] || return 0
     if [[ -L "$target" ]]; then
-        [[ "$(readlink -f -- "$target")" == "$(readlink -f -- "$shared")" ]] || {
+        [[ "$(readlink -m -- "$target")" == "$(readlink -m -- "$shared")" ]] || {
             printf 'account-switcher: refusing unmanaged session tree symlink: %s\n' "$target" >&2
             return 1
         }
@@ -371,21 +684,26 @@ account_switcher_materialize_session_tree() {
         fi
     else
         index=$((index + 1))
-        printf '%s\t\t\tsession-dir\n' "$target" > "$journal/$index"
-        sync -d "$journal/$index" 2>/dev/null || true
+        account_switcher_write_record "$journal" "$index" "$target" "" "" session-dir
         mkdir -p -- "$target"
     fi
     while IFS= read -r -d '' file; do
         relative="${file#"$shared"/}"
         destination="$target/$relative"
-        [[ -e "$destination" || -L "$destination" ]] && continue
         mkdir -p -- "$(dirname -- "$destination")"
-        if ! ln -- "$file" "$destination" 2>/dev/null; then
-            cp -p -- "$file" "$destination"
+        if [[ -e "$destination" || -L "$destination" ]]; then
+            target_inode="$(stat -c '%d:%i' -- "$destination" 2>/dev/null || true)"
+            shared_inode="$(stat -c '%d:%i' -- "$file" 2>/dev/null || true)"
+            [[ -n "$target_inode" && "$target_inode" == "$shared_inode" ]] && continue
+            index=$((index + 1))
+            account_switcher_backup_file "$destination" "$journal" "$index"
+        else
+            index=$((index + 1))
+            account_switcher_write_record "$journal" "$index" "$destination" "" "" session-link
         fi
-        index=$((index + 1))
-        printf '%s\t\t\tsession-link\n' "$destination" > "$journal/$index"
-        sync -d "$journal/$index" 2>/dev/null || true
+        if ! ln -- "$file" "$destination" 2>/dev/null; then
+            cp -p -- "$file" "$destination" || return 1
+        fi
     done < <(find "$shared" -type f -print0)
     ACCOUNT_SWITCHER_MERGE_INDEX="$index"
 }
@@ -399,7 +717,7 @@ account_switcher_materialize_session_index() {
         shared_inode="$(stat -c '%d:%i' -- "$shared" 2>/dev/null || true)"
         [[ -n "$target_inode" && "$target_inode" == "$shared_inode" ]] && return 0
         if [[ -L "$target" ]]; then
-            [[ "$(readlink -f -- "$target")" == "$(readlink -f -- "$shared")" ]] || {
+            [[ "$(readlink -m -- "$target")" == "$(readlink -m -- "$shared")" ]] || {
                 printf 'account-switcher: refusing unmanaged session index symlink: %s\n' "$target" >&2
                 return 1
             }
@@ -408,20 +726,23 @@ account_switcher_materialize_session_index() {
         account_switcher_backup_file "$target" "$journal" "$index"
     else
         mkdir -p -- "$(dirname -- "$target")"
+        index=$((index + 1))
+        account_switcher_write_record "$journal" "$index" "$target" "" "" session-link
     fi
     if ! ln -- "$shared" "$target" 2>/dev/null; then
-        cp -p -- "$shared" "$target"
+        cp -p -- "$shared" "$target" || return 1
     fi
     ACCOUNT_SWITCHER_MERGE_INDEX="$index"
 }
 
 account_switcher_rewrite_state_rollout_paths() {
-    local target_home="$1" shared_root="$2" journal="$3" index="$4" database suffix backup helper node
+    local target_home="$1" shared_root="$2" journal="$3" index="$4" database suffix backup helper node found=0
     helper="$(dirname -- "${BASH_SOURCE[0]}")/shared-state-sqlite.js"
     node="$(account_switcher_node_binary)"
     shopt -s nullglob
     for database in "$target_home"/state_*.sqlite; do
         [[ -f "$database" && ! -L "$database" ]] || continue
+        found=1
         for suffix in "" -wal -shm; do
             [[ -e "$database$suffix" || -L "$database$suffix" ]] || continue
             index=$((index + 1))
@@ -429,8 +750,8 @@ account_switcher_rewrite_state_rollout_paths() {
             backup="$journal/state-$index.backup"
             cp -- "$backup" "$database$suffix"
         done
-        "$node" "$helper" rewrite-rollout-paths "$target_home" "$shared_root" || return 1
     done
+    (( found == 0 )) || "$node" "$helper" rewrite-rollout-paths "$target_home" "$shared_root" || return 1
     shopt -u nullglob
     ACCOUNT_SWITCHER_MERGE_INDEX="$index"
 }
@@ -440,7 +761,7 @@ account_switcher_detach_session_tree() {
     ACCOUNT_SWITCHER_MERGE_INDEX="$index"
     [[ -e "$target" || -L "$target" ]] || return 0
     if [[ -L "$target" ]]; then
-        [[ "$(readlink -f -- "$target")" == "$(readlink -f -- "$shared")" ]] || return 0
+        [[ "$(readlink -m -- "$target")" == "$(readlink -m -- "$shared")" ]] || return 0
         has_shared=1
     elif [[ -d "$target" && -d "$shared" ]]; then
         while IFS= read -r -d '' file; do
@@ -456,17 +777,24 @@ account_switcher_detach_session_tree() {
     backup="$target.isolated-backup"
     if [[ -e "$backup" || -L "$backup" ]]; then
         index=$((index + 1))
-        printf '%s\t%s\t%s\tdetach\n' "$target" "$shared" "$backup" > "$journal/$index"
-        sync -d "$journal/$index" 2>/dev/null || true
-        unlink -- "$target"
+        account_switcher_write_record "$journal" "$index" "$target" "$shared" "$backup" detach
+        if [[ -d "$target" && ! -L "$target" ]]; then
+            rm -rf -- "$target"
+        else
+            unlink -- "$target"
+        fi
         mv -- "$backup" "$target"
         ACCOUNT_SWITCHER_MERGE_INDEX="$index"
         return 0
     fi
     index=$((index + 1))
     account_switcher_backup_file "$target" "$journal" "$index"
-    if [[ -d "$shared" ]]; then
-        cp -a -- "$shared" "$target"
+    backup="$journal/state-$index.backup"
+    if [[ -d "$backup" ]]; then
+        # Keep profile-private rollout files while breaking hardlinks to the
+        # shared context. Copying the shared tree would silently discard files
+        # created only by this profile.
+        cp -a -- "$backup" "$target"
     else
         mkdir -p -- "$target"
     fi
@@ -488,8 +816,7 @@ account_switcher_detach_session_index() {
     backup="$target.isolated-backup"
     if [[ -e "$backup" || -L "$backup" ]]; then
         index=$((index + 1))
-        printf '%s\t%s\t%s\tdetach\n' "$target" "$shared" "$backup" > "$journal/$index"
-        sync -d "$journal/$index" 2>/dev/null || true
+        account_switcher_write_record "$journal" "$index" "$target" "$shared" "$backup" detach
         unlink -- "$target"
         mv -- "$backup" "$target"
         ACCOUNT_SWITCHER_MERGE_INDEX="$index"
@@ -508,16 +835,35 @@ account_switcher_validate_journal() {
 }
 
 account_switcher_commit_prepared() {
-    local context_id="$1" journal="$2" shared_root lock
+    local context_id="$1" journal="$2" shared_root lock cleanup
     account_switcher_validate_journal "$context_id" "$journal" || return 1
     shared_root="$(account_switcher_shared_root "$context_id")" || return 1
     lock="$(account_switcher_context_lock_acquire "$shared_root")" || return 1
-    if [[ ! -d "$journal" ]] || ! touch "$journal/committed"; then
+    # A prior commit attempt may have removed this journal before a later
+    # context failed. Treat that context as already committed so the durable
+    # handoff intent can be retried safely.
+    if [[ ! -d "$journal" ]]; then
+        cleanup="$(account_switcher_committed_journal_path "$journal")" || {
+            account_switcher_context_lock_release "$lock" || true
+            return 1
+        }
+        if [[ -e "$cleanup" || -L "$cleanup" ]] && ! rm -rf -- "$cleanup"; then
+            account_switcher_context_lock_release "$lock" || true
+            return 1
+        fi
+        account_switcher_context_lock_release "$lock"
+        return 0
+    fi
+    if ! touch "$journal/committed"; then
         account_switcher_context_lock_release "$lock" || true
         return 1
     fi
     sync -d "$journal/committed" 2>/dev/null || true
-    rm -rf -- "$journal"
+    sync -d "$journal" 2>/dev/null || true
+    if ! account_switcher_discard_committed_journal "$journal"; then
+        account_switcher_context_lock_release "$lock" || true
+        return 1
+    fi
     account_switcher_context_lock_release "$lock"
 }
 
@@ -531,7 +877,7 @@ account_switcher_rollback_prepared() {
 }
 
 account_switcher_prepare_shared() {
-    local source_home="$1" target_home="$2" context_id="$3" shared_root lock journal index name suffix relative
+    local source_home="$1" target_home="$2" context_id="$3" shared_root lock journal index name suffix relative target_promote=0 promote_family clear_missing
     shared_root="$(account_switcher_shared_root "$context_id")" || return 1
     lock="$(account_switcher_context_lock_acquire "$shared_root")" || return 1
     if ! account_switcher_assert_offline "$source_home" ||
@@ -548,13 +894,17 @@ account_switcher_prepare_shared() {
         account_switcher_context_lock_release "$lock" || true
         return 1
     fi
-    printf '%s\n' "$$" > "$journal/pid"
+    account_switcher_write_process_identity "$journal/pid"
     index=0
     if [[ "$source_home" != "$target_home" ]]; then
         for name in "${ACCOUNT_SWITCHER_CATALOGS[@]}"; do
+            promote_family=0
+            [[ -f "$source_home/sqlite/$name" && ! -L "$source_home/sqlite/$name" ]] && promote_family=1
             for suffix in "" -wal -shm; do
                 index=$((index + 1))
-                if ! account_switcher_link_catalog "$source_home/sqlite/$name$suffix" "$shared_root/$name$suffix" "$journal" "$index"; then
+                clear_missing=0
+                [[ -z "$suffix" || "$promote_family" == 0 ]] || clear_missing=1
+                if ! account_switcher_link_catalog "$source_home/sqlite/$name$suffix" "$shared_root/$name$suffix" "$journal" "$index" "$promote_family" "$clear_missing"; then
                     account_switcher_restore_journal "$journal" || true
                     account_switcher_context_lock_release "$lock" || true
                     return 1
@@ -562,10 +912,15 @@ account_switcher_prepare_shared() {
             done
         done
     fi
+    [[ "$source_home" != "$target_home" ]] || target_promote=1
     for name in "${ACCOUNT_SWITCHER_CATALOGS[@]}"; do
+        promote_family=0
+        [[ "$target_promote" == 0 || ! -f "$target_home/sqlite/$name" || -L "$target_home/sqlite/$name" ]] || promote_family=1
         for suffix in "" -wal -shm; do
             index=$((index + 1))
-            if ! account_switcher_link_catalog "$target_home/sqlite/$name$suffix" "$shared_root/$name$suffix" "$journal" "$index"; then
+            clear_missing=0
+            [[ -z "$suffix" || "$promote_family" == 0 ]] || clear_missing=1
+            if ! account_switcher_link_catalog "$target_home/sqlite/$name$suffix" "$shared_root/$name$suffix" "$journal" "$index" "$promote_family" "$clear_missing"; then
                 account_switcher_restore_journal "$journal" || true
                 account_switcher_context_lock_release "$lock" || true
                 return 1
@@ -578,7 +933,7 @@ account_switcher_prepare_shared() {
     # writes; newly-created files are merged on the next handoff.
     for relative in "${ACCOUNT_SWITCHER_SESSION_PATHS[@]}"; do
         if [[ "$relative" == sessions ]]; then
-            account_switcher_merge_session_tree "$source_home/$relative" "$shared_root/$relative" "$journal" "$index" || {
+            account_switcher_merge_session_tree "$source_home/$relative" "$shared_root/$relative" "$journal" "$index" 1 || {
                 account_switcher_restore_journal "$journal" || true
                 account_switcher_context_lock_release "$lock" || true
                 return 1
@@ -596,7 +951,7 @@ account_switcher_prepare_shared() {
     if [[ "$source_home" != "$target_home" ]]; then
         for relative in "${ACCOUNT_SWITCHER_SESSION_PATHS[@]}"; do
             if [[ "$relative" == sessions ]]; then
-                account_switcher_merge_session_tree "$target_home/$relative" "$shared_root/$relative" "$journal" "$index" || {
+                account_switcher_merge_session_tree "$target_home/$relative" "$shared_root/$relative" "$journal" "$index" 0 || {
                     account_switcher_restore_journal "$journal" || true
                     account_switcher_context_lock_release "$lock" || true
                     return 1
@@ -650,7 +1005,7 @@ account_switcher_migrate_shared() {
 }
 
 account_switcher_prepare_isolated() {
-    local codex_home="$1" context_id="$2" shared_root lock journal index name suffix relative target shared backup
+    local codex_home="$1" context_id="$2" shared_root lock journal index name suffix relative target shared backup base_target base_shared restore_family
     shared_root="$(account_switcher_shared_root "$context_id")" || return 1
     lock="$(account_switcher_context_lock_acquire "$shared_root")" || return 1
     if ! account_switcher_assert_offline "$codex_home"; then
@@ -666,19 +1021,82 @@ account_switcher_prepare_isolated() {
         account_switcher_context_lock_release "$lock" || true
         return 1
     fi
-    printf '%s\n' "$$" > "$journal/pid"
+    account_switcher_write_process_identity "$journal/pid"
     index=0
     for name in "${ACCOUNT_SWITCHER_CATALOGS[@]}"; do
+        base_target="$codex_home/sqlite/$name"
+        base_shared="$shared_root/$name"
+        [[ -L "$base_target" && "$(readlink -m -- "$base_target")" == "$(readlink -m -- "$base_shared")" ]] || continue
+        restore_family=0
+        [[ -e "$base_target.isolated-backup" || -L "$base_target.isolated-backup" ]] && restore_family=1
         for suffix in "" -wal -shm; do
             target="$codex_home/sqlite/$name$suffix"; shared="$shared_root/$name$suffix"; backup="$target.isolated-backup"
-            if [[ -L "$target" ]] && [[ "$(readlink -f -- "$target")" == "$(readlink -f -- "$shared")" ]]; then
-                index=$((index + 1))
-                printf '%s\t%s\t%s\tdetach\n' "$target" "$shared" "$backup" > "$journal/$index"
-                sync -d "$journal/$index" 2>/dev/null || true
-                if ! unlink -- "$target" || { [[ -e "$backup" || -L "$backup" ]] && ! mv -- "$backup" "$target"; }; then
-                    account_switcher_restore_journal "$journal" || true
-                    account_switcher_context_lock_release "$lock" || true
-                    return 1
+            index=$((index + 1))
+            if (( restore_family == 1 )); then
+                if [[ -e "$backup" || -L "$backup" ]]; then
+                    if [[ -L "$target" ]]; then
+                        [[ "$(readlink -m -- "$target")" == "$(readlink -m -- "$shared")" ]] || {
+                            account_switcher_restore_journal "$journal" || true
+                            account_switcher_context_lock_release "$lock" || true
+                            return 1
+                        }
+                    elif [[ -e "$target" ]]; then
+                        account_switcher_restore_journal "$journal" || true
+                        account_switcher_context_lock_release "$lock" || true
+                        return 1
+                    fi
+                    account_switcher_write_record "$journal" "$index" "$target" "$shared" "$backup" detach
+                    if { [[ ! -L "$target" ]] || unlink -- "$target"; } && mv -- "$backup" "$target"; then :; else
+                        account_switcher_restore_journal "$journal" || true
+                        account_switcher_context_lock_release "$lock" || true
+                        return 1
+                    fi
+                else
+                    if [[ -L "$target" ]]; then
+                        [[ "$(readlink -m -- "$target")" == "$(readlink -m -- "$shared")" ]] || {
+                            account_switcher_restore_journal "$journal" || true
+                            account_switcher_context_lock_release "$lock" || true
+                            return 1
+                        }
+                        account_switcher_write_record "$journal" "$index" "$target" "$shared" "" detach-empty
+                        if ! unlink -- "$target"; then
+                            account_switcher_restore_journal "$journal" || true
+                            account_switcher_context_lock_release "$lock" || true
+                            return 1
+                        fi
+                    elif [[ -e "$target" ]]; then
+                        if ! account_switcher_backup_file "$target" "$journal" "$index"; then
+                            account_switcher_restore_journal "$journal" || true
+                            account_switcher_context_lock_release "$lock" || true
+                            return 1
+                        fi
+                    fi
+                fi
+            else
+                if [[ -L "$target" ]]; then
+                    [[ "$(readlink -m -- "$target")" == "$(readlink -m -- "$shared")" ]] || {
+                        account_switcher_restore_journal "$journal" || true
+                        account_switcher_context_lock_release "$lock" || true
+                        return 1
+                    }
+                    account_switcher_write_record "$journal" "$index" "$target" "$shared" "" detach-copy
+                    if ! unlink -- "$target"; then
+                        account_switcher_restore_journal "$journal" || true
+                        account_switcher_context_lock_release "$lock" || true
+                        return 1
+                    fi
+                    if [[ -e "$shared" || -L "$shared" ]] && ! cp -p -- "$shared" "$target"; then
+                        account_switcher_restore_journal "$journal" || true
+                        account_switcher_context_lock_release "$lock" || true
+                        return 1
+                    fi
+                elif [[ ! -e "$target" && ( -e "$shared" || -L "$shared" ) ]]; then
+                    account_switcher_write_record "$journal" "$index" "$target" "$shared" "" detach-new
+                    if ! cp -p -- "$shared" "$target"; then
+                        account_switcher_restore_journal "$journal" || true
+                        account_switcher_context_lock_release "$lock" || true
+                        return 1
+                    fi
                 fi
             fi
         done

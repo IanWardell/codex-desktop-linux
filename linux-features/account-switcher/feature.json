@@ -34,9 +34,14 @@
       "name": "account-switcher-prelaunch.sh",
       "mode": "0755"
     },
-    "afterExit": {
+    "exitClaim": {
+      "source": "exit-claim-hook.sh",
+      "name": "account-switcher-exit-claim.sh",
+      "mode": "0755"
+    },
+    "finalExit": {
       "source": "after-exit-hook.sh",
-      "name": "account-switcher-after-exit.sh",
+      "name": "account-switcher-final-exit.sh",
       "mode": "0755"
     }
   }

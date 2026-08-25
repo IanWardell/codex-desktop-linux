@@ -39,6 +39,8 @@ for (const entry of entries) {
       if (contextId.includes("/") || !sessionRelative || sessionRelative.split("/").includes("..")) continue;
       update.run(`${targetPrefix}${sessionRelative}`, row.id);
     }
+    const backfillTable = db.prepare("select name from sqlite_master where type = 'table' and name = 'backfill_state'").get();
+    if (backfillTable) db.prepare("delete from backfill_state where id = 1").run();
     db.exec("commit");
   } catch (error) {
     try { db.exec("rollback"); } catch {}

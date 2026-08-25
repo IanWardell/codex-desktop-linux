@@ -24,11 +24,11 @@ const ATOM_PREFIXES = [
   "sidebar-project-expanded-v1-codex:",
 ];
 
-function readJson(file) {
+function readJson(file, missing = {}) {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch (error) {
-    if (error?.code === "ENOENT") return {};
+    if (error?.code === "ENOENT") return missing;
     throw new Error(`could not read ${file}: ${error.message}`);
   }
 }
@@ -82,7 +82,7 @@ function applyShared(globalState, sharedState) {
 }
 
 function prepare(sourceFile, targetFile, sharedFile) {
-  const source = readJson(sourceFile);
+  const source = readJson(sourceFile, null);
   const previousRaw = readJson(sharedFile);
   const previous = { version: 1, atom: {} };
   for (const key of TOP_LEVEL_KEYS) {
@@ -93,7 +93,7 @@ function prepare(sourceFile, targetFile, sharedFile) {
       if (isAtomKey(key)) previous.atom[key] = value;
     }
   }
-  const shared = { ...previous, ...extract(source) };
+  const shared = source == null ? previous : { ...previous, ...extract(source) };
   const target = readJson(targetFile);
   applyShared(target, shared);
   writeJson(sharedFile, shared);

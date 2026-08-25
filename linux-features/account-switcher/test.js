@@ -9,6 +9,23 @@ const { spawn, spawnSync } = require("node:child_process");
 const { DatabaseSync } = require("node:sqlite");
 const test = require("node:test");
 
+function processIdentity(pid = process.pid) {
+  const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+  const fields = raw.slice(raw.lastIndexOf(") ") + 2).trim().split(/\s+/);
+  return {
+    pid,
+    start: fields[19],
+    boot: fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(),
+  };
+}
+
+function directFinalExitHandoff(lines) {
+  const owner = processIdentity();
+  return lines
+    .replace("phase=requested", "phase=cleanup")
+    .replace("\nfrom_id=", `\nowner_pid=${owner.pid}\nowner_start=${owner.start}\nowner_boot=${owner.boot}\nfrom_id=`);
+}
+
 const {
   MAIN_MARKER,
   PRELOAD_MARKER,
@@ -18,7 +35,7 @@ const {
   applyPreloadPatch,
   applyProfileMenuPatch,
 } = require("./patch.js");
-const { loadLinuxFeaturePatchDescriptors } = require("../../scripts/lib/linux-features.js");
+const { loadLinuxFeaturePatchDescriptors, stageEnabledLinuxFeatureInstall } = require("../../scripts/lib/linux-features.js");
 const { patchExtractedApp } = require("../../scripts/patches/runner.js");
 const { createPatchReport, enabledFeatureFailuresFromReport } = require("../../scripts/lib/patch-report.js");
 
@@ -42,6 +59,14 @@ function stageSharedStateHelper(appDir) {
   fs.copyFileSync(path.join(__dirname, "shared-state.sh"), path.join(target, "shared-state.sh"));
   fs.copyFileSync(path.join(__dirname, "shared-state-json.js"), path.join(target, "shared-state-json.js"));
   fs.copyFileSync(path.join(__dirname, "shared-state-sqlite.js"), path.join(target, "shared-state-sqlite.js"));
+}
+
+function waitForFile(filePath, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(filePath) && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+  assert.equal(fs.existsSync(filePath), true, `timed out waiting for ${filePath}`);
 }
 
 test("Docker desktop supervisor survives Codex exits and account handoffs", () => {
@@ -271,13 +296,17 @@ test("account handoff quits through the launcher and waits for readiness", () =>
   assert.match(patched, /Sign out before removing this account profile/);
   assert.match(patched, /Sign in to another account before removing the active profile/);
   assert.match(patched, /codexLinuxAccountSwitcherDeleteProfile\(profile\)/);
-  assert.match(patched, /codexLinuxAccountSwitcherRelaunch\(target,profile,profile\.id\)/);
+  assert.match(patched, /codexLinuxAccountSwitcherRelaunch\(outcome\.relaunch\.target,outcome\.relaunch\.source,outcome\.relaunch\.removeId\)/);
   assert.match(patched, /codexLinuxAccountSwitcherFinalizeRemoval/);
   assert.match(patched, /latest\.profiles=latest\.profiles\.filter\(\(entry\)=>entry\.id!==profile\.id\)/);
   assert.match(patched, /codexLinuxAccountSwitcherWriteHandoff/);
+  assert.match(patched, /codexLinuxAccountSwitcherProcessIdentity\(process\.ppid\)/);
   assert.match(patched, /l\.app\.quit\(\)/);
-  assert.doesNotMatch(patched, /node:child_process/);
+  const relaunchStart = patched.indexOf("function codexLinuxAccountSwitcherRelaunch");
+  assert.ok(patched.indexOf("codexLinuxAccountSwitcherWriteHandoff", relaunchStart) < patched.indexOf("codexLinuxAccountSwitcherWriteActive(profile)", relaunchStart));
+  assert.match(patched, /const outcome=await codexLinuxAccountSwitcherWithLock[\s\S]*return codexLinuxAccountSwitcherRelaunch\(outcome\.profile/);
   assert.doesNotMatch(patched, /SIGTERM|SIGKILL|codexLinuxAccountSwitcherDescendantPids/);
+  assert.match(patched, /l\.app\.quit\(\)/);
 });
 
 test("usage refresh returns the percentage persisted on the profile", () => {
@@ -302,7 +331,7 @@ test("usage refresh returns the percentage persisted on the profile", () => {
 const fs=require("node:fs");
 const V={isTrustedIpcSender:()=>true};
 let handler=null;
-const l={app:{whenReady:()=>new Promise(()=>{}),once:()=>{}},ipcMain:{handle:(name,value)=>{if(name==="codex_linux_account_switcher")handler=value}}};
+const l={app:{whenReady:()=>new Promise(()=>{}),once:()=>{},quit:()=>{}},ipcMain:{handle:(name,value)=>{if(name==="codex_linux_account_switcher")handler=value}}};
 let be;be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);
 setImmediate(async()=>{try{const result=await handler({sender:{}},{action:"refresh"});fs.writeFileSync(${JSON.stringify(outputPath)},JSON.stringify(result));process.exit(0)}catch(error){console.error(error);process.exit(1)}});
 `;
@@ -345,7 +374,7 @@ const https=require("node:https");
 https.request=(url,options,callback)=>{const request=new EventEmitter();request.setTimeout=()=>{};request.destroy=()=>{};request.end=()=>setTimeout(()=>{const response=new EventEmitter();response.statusCode=200;response.setEncoding=()=>{};callback(response);response.emit("data",JSON.stringify({email:"late@example.com",rate_limit:{primary_window:{used_percent:61}}}));response.emit("end")},100);return request};
 const V={isTrustedIpcSender:()=>true};
 let handler=null;
-const l={app:{whenReady:()=>new Promise(()=>{}),once:()=>{}},ipcMain:{handle:(name,value)=>{if(name==="codex_linux_account_switcher")handler=value}}};
+const l={app:{whenReady:()=>new Promise(()=>{}),once:()=>{},quit:()=>{}},ipcMain:{handle:(name,value)=>{if(name==="codex_linux_account_switcher")handler=value}}};
 let be;be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);
 setImmediate(async()=>{try{const refresh=handler({sender:{}},{action:"refresh"});await new Promise(resolve=>setTimeout(resolve,20));await handler({sender:{}},{action:"set-settings",keepLocalProjectsThreads:true});const result=await refresh;fs.writeFileSync(${JSON.stringify(outputPath)},JSON.stringify(result));process.exit(0)}catch(error){console.error(error);process.exit(1)}});
 `;
@@ -506,20 +535,195 @@ test("the first registry mutation creates its parent before acquiring the lock",
   const patched = applyMainBundlePatch("be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);");
   const functionStart = patched.indexOf("function codexLinuxAccountSwitcherWithLock");
   const parentCreate = patched.indexOf("mkdirSync(codexLinuxAccountSwitcherConfigDir", functionStart);
-  const lockCreate = patched.indexOf("mkdirSync(lock", functionStart);
+  const lockCreate = patched.indexOf("openSync(lock", functionStart);
   assert.ok(functionStart >= 0);
   assert.ok(parentCreate > functionStart);
   assert.ok(lockCreate > parentCreate);
-  assert.match(patched, /if\(error\?\.code!=="EEXIST"\)throw error/);
+  assert.match(patched, /spawn\(flock,\["-x","-w","5","\/proc\/self\/fd\/3"/);
+});
+
+test("registry mutation uses a crash-releasing advisory lock", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-stale-registry-lock-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const configHome = path.join(home, ".config");
+    const configDir = path.join(configHome, "codex-desktop");
+    const lock = path.join(configDir, "account-switcher.json.lock");
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(lock, "99999999", { mode: 0o600 });
+    fs.writeFileSync(path.join(configDir, "account-switcher.json"), `${JSON.stringify({ version: 1, profiles: [{ id: "default", contextMode: "isolated", contextId: "default" }] })}\n`);
+    const fixture = `
+const V={isTrustedIpcSender:()=>true};let handler;
+const l={app:{whenReady:()=>new Promise(()=>{}),once:()=>{},quit:()=>{}},ipcMain:{handle:(name,value)=>{handler=value}}};
+let be;be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);
+setImmediate(async()=>{await handler({sender:{}},{action:"set-settings",keepLocalProjectsThreads:true});process.exit(0)});
+`;
+    const result = spawnSync(process.execPath, ["-e", applyMainBundlePatch(fixture)], {
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: configHome, CODEX_HOME: path.join(home, ".codex") },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    assert.equal(fs.existsSync(lock), true);
+    assert.equal(fs.readFileSync(lock, "utf8"), "99999999");
+    assert.match(applyMainBundlePatch("be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);"), /codexLinuxAccountSwitcherResolveExecutable\("flock"\)/);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("shared mode uses a generated context and never includes credential-bearing state", () => {
   const fixture = "be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);";
   const patched = applyMainBundlePatch(fixture);
   assert.match(patched, /registry\.sharedContextId=\"shared-\"\+Date\.now\(\)\.toString\(36\)/);
-  assert.match(patched, /codexLinuxAccountSwitcherWriteActive\(active\)/);
+  assert.match(patched, /codexLinuxAccountSwitcherWriteActive\(outcome\.active\)/);
   assert.match(patched, /codexLinuxAccountSwitcherWithLock/);
   assert.doesNotMatch(patched, /shell_snapshots|session_index|codex-global-state/);
+});
+
+test("first-run shared settings seed and route the default profile under the registry lock", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-first-settings-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const configHome = path.join(home, ".config");
+    const configDir = path.join(configHome, "codex-desktop");
+    const fixture = `
+const V={isTrustedIpcSender:()=>true};let handler;
+const l={app:{whenReady:()=>new Promise(()=>{}),once:()=>{},quit:()=>{}},ipcMain:{handle:(name,value)=>{handler=value}}};
+let be;be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);
+setImmediate(async()=>{await handler({sender:{}},{action:"set-settings",keepLocalProjectsThreads:true});process.exit(0)});
+`;
+    const result = spawnSync(process.execPath, ["-e", applyMainBundlePatch(fixture)], {
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: configHome, CODEX_HOME: path.join(home, ".codex") },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    const registry = JSON.parse(fs.readFileSync(path.join(configDir, "account-switcher.json"), "utf8"));
+    assert.equal(registry.profiles.length, 1);
+    assert.equal(registry.profiles[0].id, "default");
+    assert.equal(registry.profiles[0].contextMode, "shared-local");
+    assert.equal(registry.profiles[0].contextId, registry.sharedContextId);
+    assert.equal(fs.readFileSync(path.join(configDir, "account-switcher.active"), "utf8"), `default\nshared-local\n${registry.sharedContextId}\n`);
+    assert.match(fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8"), /^from_mode=isolated$/m);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("synchronous quit observes the durable registry after the mutation lock is released", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-durable-before-quit-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const configHome = path.join(home, ".config");
+    const configDir = path.join(configHome, "codex-desktop");
+    const registryPath = path.join(configDir, "account-switcher.json");
+    const outputPath = path.join(tempDir, "quit-observation.json");
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(registryPath, JSON.stringify({
+      version: 1,
+      profiles: [
+        { id: "default", contextMode: "isolated", contextId: "default" },
+        { id: "work", contextMode: "isolated", contextId: "default" },
+      ],
+    }));
+    const fixture = `
+const fs=require("node:fs"),cp=require("node:child_process");
+const V={isTrustedIpcSender:()=>true};let handler;
+const registryPath=${JSON.stringify(registryPath)},outputPath=${JSON.stringify(outputPath)};
+const l={app:{whenReady:()=>new Promise(()=>{}),once:()=>{},quit:()=>{const registry=JSON.parse(fs.readFileSync(registryPath,"utf8"));const lockAvailable=cp.spawnSync("flock",["-n",registryPath+".lock","true"]).status===0;fs.writeFileSync(outputPath,JSON.stringify({registry,lockAvailable,handoff:fs.existsSync(${JSON.stringify(path.join(configDir, "account-switcher.handoff"))})}));process.exit(0)}},ipcMain:{handle:(name,value)=>{handler=value}}};
+let be;be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);
+setImmediate(()=>handler({sender:{}},{action:"switch",id:"work"}).catch((error)=>{console.error(error);process.exit(1)}));
+`;
+    const result = spawnSync(process.execPath, ["-e", applyMainBundlePatch(fixture)], {
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: configHome, CODEX_HOME: path.join(home, ".codex") },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    const observed = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    assert.equal(observed.registry.previousProfileId, "default");
+    assert.equal(typeof observed.registry.profiles.find((profile) => profile.id === "work").loginPendingUntil, "string");
+    assert.equal(observed.lockAvailable, true);
+    assert.equal(observed.handoff, true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("disabling shared mode relaunches with the retained context as detachment input", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-disable-shared-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const configHome = path.join(home, ".config");
+    const configDir = path.join(configHome, "codex-desktop");
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, "account-switcher.json"), `${JSON.stringify({
+      version: 1,
+      keepLocalProjectsThreads: true,
+      sharedContextId: "shared-old",
+      profiles: [{ id: "default", name: "Default", contextMode: "shared-local", contextId: "shared-old" }],
+    })}\n`);
+    const fixture = `
+const V={isTrustedIpcSender:()=>true};let handler;
+const l={app:{whenReady:()=>new Promise(()=>{}),once:()=>{},quit:()=>{}},ipcMain:{handle:(name,value)=>{handler=value}}};
+let be;be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);
+setImmediate(async()=>{await handler({sender:{}},{action:"set-settings",keepLocalProjectsThreads:false});process.exit(0)});
+`;
+    const result = spawnSync(process.execPath, ["-e", applyMainBundlePatch(fixture)], {
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: configHome, CODEX_HOME: path.join(home, ".codex") },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    const handoff = fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8");
+    assert.match(handoff, /^from_mode=shared-local$/m);
+    assert.match(handoff, /^from_context=shared-old$/m);
+    assert.match(handoff, /^target_mode=isolated$/m);
+    assert.match(handoff, /^target_context=default$/m);
+    assert.match(handoff, /^target_previous_context=shared-old$/m);
+    assert.equal(fs.readFileSync(path.join(configDir, "account-switcher.active"), "utf8"), "default\nisolated\ndefault\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("disabling and re-enabling shared mode retains its managed context until detachment", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-context-toggle-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const configHome = path.join(home, ".config");
+    const configDir = path.join(configHome, "codex-desktop");
+    const outputPath = path.join(tempDir, "result.json");
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, "account-switcher.json"), `${JSON.stringify({
+      version: 1,
+      keepLocalProjectsThreads: true,
+      sharedContextId: "shared-old",
+      profiles: [{ id: "default", name: "Default", contextMode: "shared-local", contextId: "shared-old" }],
+    })}\n`);
+    const fixture = `
+const fs=require("node:fs");
+const V={isTrustedIpcSender:()=>true};
+let handler=null;
+const l={app:{whenReady:()=>new Promise(()=>{}),once:()=>{},quit:()=>{}},ipcMain:{handle:(name,value)=>{if(name==="codex_linux_account_switcher")handler=value}}};
+let be;be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);
+setImmediate(async()=>{await handler({sender:{}},{action:"set-settings",keepLocalProjectsThreads:false});await handler({sender:{}},{action:"set-settings",keepLocalProjectsThreads:true});fs.writeFileSync(${JSON.stringify(outputPath)},fs.readFileSync(${JSON.stringify(path.join(configDir, "account-switcher.json"))},"utf8"));process.exit(0)});
+`;
+    const result = spawnSync(process.execPath, ["-e", applyMainBundlePatch(fixture)], {
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: configHome, CODEX_HOME: path.join(home, ".codex") },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    const registry = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    assert.equal(registry.sharedContextId, "shared-old");
+    assert.equal(registry.profiles[0].contextMode, "shared-local");
+    assert.equal(registry.profiles[0].contextId, "shared-old");
+    assert.equal(fs.readFileSync(path.join(configDir, "account-switcher.active"), "utf8"), "default\nshared-local\nshared-old\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("profile identity lookup keeps the base account home stable after relaunch", () => {
@@ -547,6 +751,7 @@ test("launcher routes the active named profile", () => {
     });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(result.stdout.trim().split("\n"), [
+      "env CODEX_LINUX_ACCOUNT_SWITCHER_LAUNCH_GUARD=1",
       `env CODEX_LINUX_ACCOUNT_SWITCHER_BASE_CODEX_HOME=${path.join(home, ".codex")}`,
       `env CODEX_HOME=${path.join(home, ".local", "share", "codex-desktop", "account-profiles", "work", "codex")}`,
       `env CODEX_ELECTRON_USER_DATA_PATH=${path.join(home, ".local", "share", "codex-desktop", "account-profiles", "work", "electron")}`,
@@ -555,6 +760,44 @@ test("launcher routes the active named profile", () => {
       "env CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT_ID=team",
       `electron-arg --user-data-dir=${path.join(home, ".local", "share", "codex-desktop", "account-profiles", "work", "electron")}`,
     ]);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("launcher rejects a caller user-data override for a managed profile", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-user-data-override-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const configDir = path.join(home, ".config", "codex-desktop");
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nisolated\ndefault\n", { mode: 0o600 });
+    const result = spawnSync("bash", [path.join(__dirname, "launcher-hook.sh"), "--user-data-dir=/tmp/unmanaged"], {
+      env: { HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: path.join(home, ".local", "share") },
+      encoding: "utf8",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /refusing caller-supplied --user-data-dir/);
+    assert.equal(result.stdout, "");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("default profile rejects a caller user-data override", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-default-user-data-override-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const configDir = path.join(home, ".config", "codex-desktop");
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "default\nisolated\ndefault\n", { mode: 0o600 });
+    const result = spawnSync("bash", [path.join(__dirname, "launcher-hook.sh"), "--user-data-dir", "/tmp/unmanaged"], {
+      env: { HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: path.join(home, ".local", "share") },
+      encoding: "utf8",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /refusing caller-supplied --user-data-dir for profile default/);
+    assert.equal(result.stdout, "");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -646,7 +889,14 @@ test("launcher recovers the real upstream default Electron profile after a cold 
     const env = { HOME: home, XDG_CONFIG_HOME: configHome, XDG_DATA_HOME: path.join(home, ".local", "share") };
     const result = spawnSync("bash", ["-c", `source ${JSON.stringify(script)}`], { env, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout, "");
+    assert.equal(result.stdout, [
+      "unset-env CODEX_ELECTRON_USER_DATA_PATH",
+      "env CODEX_LINUX_ACCOUNT_SWITCHER_LAUNCH_GUARD=1",
+      "env CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE=default",
+      "env CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT=isolated",
+      "env CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT_ID=default",
+      "",
+    ].join("\n"));
     for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
       assert.throws(() => fs.lstatSync(path.join(profileDir, name)), { code: "ENOENT" });
     }
@@ -655,7 +905,43 @@ test("launcher recovers the real upstream default Electron profile after a cold 
   }
 });
 
-test("shared prelaunch preserves an existing profile catalog before linking the shared catalog", () => {
+test("prelaunch honors the launcher-selected handoff source over the persisted target", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-selected-source-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const appDir = path.join(tempDir, "app");
+    const configDir = path.join(home, ".config", "codex-desktop");
+    const targetHome = path.join(dataHome, "codex-desktop", "account-profiles", "work", "codex");
+    const targetJournal = path.join(targetHome, "sqlite", "codex.db-journal");
+    stageSharedStateHelper(appDir);
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.mkdirSync(path.dirname(targetJournal), { recursive: true });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nshared-local\nteam\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(targetHome, "sqlite", "codex.db"), "target catalog");
+    fs.writeFileSync(targetJournal, "target hot journal");
+    const result = spawnSync("bash", [path.join(__dirname, "prelaunch-hook.sh")], {
+      env: {
+        ...process.env,
+        HOME: home,
+        XDG_CONFIG_HOME: path.join(home, ".config"),
+        XDG_DATA_HOME: dataHome,
+        CODEX_HOME: path.join(home, ".codex"),
+        CODEX_LINUX_APP_DIR: appDir,
+        CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE: "default",
+        CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT: "isolated",
+        CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT_ID: "default",
+      },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(targetJournal, "utf8"), "target hot journal");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("shared prelaunch promotes the newer isolated catalog before relinking", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-shared-hook-"));
   try {
     const home = path.join(tempDir, "home");
@@ -663,6 +949,8 @@ test("shared prelaunch preserves an existing profile catalog before linking the 
     const profileHome = path.join(dataHome, "codex-desktop", "account-profiles", "work", "codex");
     const shared = path.join(dataHome, "codex-desktop", "account-contexts", "team", "codex.db");
     const target = path.join(profileHome, "sqlite", "codex.db");
+    const sharedWal = `${shared}-wal`;
+    const targetWal = `${target}-wal`;
     const sharedDev = path.join(dataHome, "codex-desktop", "account-contexts", "team", "codex-dev.db");
     const targetDev = path.join(profileHome, "sqlite", "codex-dev.db");
     const appDir = path.join(tempDir, "app");
@@ -673,6 +961,7 @@ test("shared prelaunch preserves an existing profile catalog before linking the 
     fs.writeFileSync(path.join(home, ".config", "codex-desktop", "account-switcher.active"), "work\nshared-local\nteam\n", { mode: 0o600 });
     fs.writeFileSync(target, "profile catalog");
     fs.writeFileSync(shared, "shared catalog");
+    fs.writeFileSync(sharedWal, "stale shared wal");
     fs.writeFileSync(targetDev, "profile dev catalog");
     fs.writeFileSync(sharedDev, "shared dev catalog");
     fs.writeFileSync(path.join(profileHome, ".codex-global-state.json"), JSON.stringify({ unrelated: "profile project state" }));
@@ -696,11 +985,13 @@ test("shared prelaunch preserves an existing profile catalog before linking the 
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(fs.readlinkSync(target), shared);
-    assert.equal(fs.readFileSync(`${target}.isolated-backup`, "utf8"), "profile catalog");
-    assert.equal(fs.readFileSync(shared, "utf8"), "shared catalog");
+    assert.equal(fs.existsSync(`${target}.isolated-backup`), false);
+    assert.equal(fs.readFileSync(shared, "utf8"), "profile catalog");
+    assert.equal(fs.existsSync(sharedWal), false);
+    assert.equal(fs.existsSync(targetWal), false);
     assert.equal(fs.readlinkSync(targetDev), sharedDev);
-    assert.equal(fs.readFileSync(`${targetDev}.isolated-backup`, "utf8"), "profile dev catalog");
-    assert.equal(fs.readFileSync(sharedDev, "utf8"), "shared dev catalog");
+    assert.equal(fs.existsSync(`${targetDev}.isolated-backup`), false);
+    assert.equal(fs.readFileSync(sharedDev, "utf8"), "profile dev catalog");
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(profileHome, ".codex-global-state.json"), "utf8")), { unrelated: "profile project state", "electron-persisted-atom-state": {} });
     assert.equal(fs.lstatSync(path.join(profileHome, "sessions")).isSymbolicLink(), false);
     assert.equal(fs.readFileSync(path.join(sharedRoot, "sessions", "rollout.jsonl"), "utf8"), "profile rollout");
@@ -711,6 +1002,97 @@ test("shared prelaunch preserves an existing profile catalog before linking the 
     assert.match(fs.readFileSync(path.join(sharedRoot, "session_index.jsonl"), "utf8"), /existing shared session index/);
     assert.match(fs.readFileSync(path.join(sharedRoot, "session_index.jsonl"), "utf8"), /profile session index/);
   } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("rejoining-catalog promotion rolls back to both offline copies", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-catalog-promotion-rollback-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const codexHome = path.join(home, ".codex");
+    const target = path.join(codexHome, "sqlite", "codex.db");
+    const sharedRoot = path.join(dataHome, "codex-desktop", "account-contexts", "team");
+    const shared = path.join(sharedRoot, "codex.db");
+    const sharedWal = `${shared}-wal`;
+    const targetWal = `${target}-wal`;
+    const helper = path.join(__dirname, "shared-state.sh");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.mkdirSync(sharedRoot, { recursive: true });
+    fs.writeFileSync(target, "new isolated catalog");
+    fs.writeFileSync(shared, "older retained catalog");
+    fs.writeFileSync(sharedWal, "older retained wal");
+    const prepared = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_prepare_shared ${JSON.stringify(codexHome)} ${JSON.stringify(codexHome)} team`], {
+      env: { ...process.env, HOME: home, XDG_DATA_HOME: dataHome },
+      encoding: "utf8",
+    });
+    assert.equal(prepared.status, 0, prepared.stderr);
+    const journal = prepared.stdout.trim();
+    assert.equal(fs.readlinkSync(target), shared);
+    assert.equal(fs.readFileSync(shared, "utf8"), "new isolated catalog");
+    assert.equal(fs.existsSync(sharedWal), false);
+    assert.equal(fs.existsSync(targetWal), false);
+    const rolledBack = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_rollback_prepared team ${JSON.stringify(journal)}`], {
+      env: { ...process.env, HOME: home, XDG_DATA_HOME: dataHome },
+      encoding: "utf8",
+    });
+    assert.equal(rolledBack.status, 0, rolledBack.stderr);
+    assert.equal(fs.lstatSync(target).isSymbolicLink(), false);
+    assert.equal(fs.readFileSync(target, "utf8"), "new isolated catalog");
+    assert.equal(fs.readFileSync(shared, "utf8"), "older retained catalog");
+    assert.equal(fs.readFileSync(sharedWal, "utf8"), "older retained wal");
+    assert.equal(fs.existsSync(targetWal), false);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("launch guard serializes simultaneous cold prelaunch migrations until Electron appears", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-cold-launch-guard-"));
+  let appProcess;
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const configHome = path.join(home, ".config");
+    const configDir = path.join(configHome, "codex-desktop");
+    const appDir = path.join(tempDir, "app");
+    const codexHome = path.join(home, ".codex");
+    const database = path.join(codexHome, "sqlite", "codex.db");
+    stageSharedStateHelper(appDir);
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.mkdirSync(path.dirname(database), { recursive: true });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "default\nshared-local\nteam\n", { mode: 0o600 });
+    fs.writeFileSync(database, "catalog");
+    const env = {
+      ...process.env,
+      HOME: home,
+      XDG_CONFIG_HOME: configHome,
+      XDG_DATA_HOME: dataHome,
+      CODEX_HOME: codexHome,
+      CODEX_LINUX_APP_DIR: appDir,
+      CODEX_LINUX_ACCOUNT_SWITCHER_LAUNCH_GUARD: "1",
+    };
+    const runHook = () => spawn("bash", [path.join(__dirname, "prelaunch-hook.sh")], { env });
+    const waitChild = (child) => new Promise((resolve) => {
+      let stderr = "";
+      child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      child.on("close", (status) => resolve({ status, stderr }));
+    });
+    const first = await waitChild(runHook());
+    assert.equal(first.status, 0, first.stderr);
+    const secondChild = runHook();
+    let secondClosed = false;
+    const secondPromise = waitChild(secondChild).then((result) => { secondClosed = true; return result; });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(secondClosed, false, "second cold launch must wait for the first Electron startup");
+    const appPath = path.join(appDir, "ChatGPT");
+    appProcess = spawn("bash", ["-c", `exec -a ${JSON.stringify(appPath)} sleep 5`]);
+    const second = await secondPromise;
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(fs.readlinkSync(database), path.join(dataHome, "codex-desktop", "account-contexts", "team", "codex.db"));
+  } finally {
+    appProcess?.kill();
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
@@ -759,6 +1141,34 @@ test("shared mode carries local project metadata without copying account-scoped 
   }
 });
 
+test("a profile without global state preserves existing shared project metadata", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-missing-local-state-"));
+  try {
+    const source = path.join(tempDir, "new-profile", ".codex-global-state.json");
+    const target = path.join(tempDir, "target", ".codex-global-state.json");
+    const shared = path.join(tempDir, "shared", "local-project-state.json");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.mkdirSync(path.dirname(shared), { recursive: true });
+    fs.writeFileSync(target, JSON.stringify({ unrelated: "keep" }));
+    fs.writeFileSync(shared, JSON.stringify({
+      version: 1,
+      "local-projects": { existing: { id: "existing" } },
+      atom: { "thread-descriptions-v1": { thread: "Existing thread" } },
+    }));
+    const result = spawnSync(process.execPath, [path.join(__dirname, "shared-state-json.js"), "prepare", source, target, shared], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const sharedState = JSON.parse(fs.readFileSync(shared, "utf8"));
+    const targetState = JSON.parse(fs.readFileSync(target, "utf8"));
+    assert.deepEqual(sharedState["local-projects"], { existing: { id: "existing" } });
+    assert.deepEqual(sharedState.atom["thread-descriptions-v1"], { thread: "Existing thread" });
+    assert.deepEqual(targetState["local-projects"], { existing: { id: "existing" } });
+    assert.deepEqual(targetState["electron-persisted-atom-state"]["thread-descriptions-v1"], { thread: "Existing thread" });
+    assert.equal(targetState.unrelated, "keep");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("after-exit handoff uses the launcher readiness protocol and rolls back failures", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-handoff-"));
   try {
@@ -768,15 +1178,16 @@ test("after-exit handoff uses the launcher readiness protocol and rolls back fai
     stageSharedStateHelper(appDir);
     fs.mkdirSync(configDir, { recursive: true });
     const launcher = path.join(appDir, "start.sh");
-    fs.writeFileSync(launcher, "#!/bin/sh\nprintf '%s' \"$CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE\" > \"$HOME/started-profile\"\n: > \"$CODEX_LINUX_ACCOUNT_SWITCHER_READY_FILE\"\n", { mode: 0o755 });
+    fs.writeFileSync(launcher, "#!/bin/sh\nprintf '%s' \"$CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE\" > \"$HOME/started-profile\"\nprintf '%s' \"$#\" > \"$HOME/started-arg-count\"\n: > \"$CODEX_LINUX_ACCOUNT_SWITCHER_READY_FILE\"\n", { mode: 0o755 });
     const hook = path.join(__dirname, "after-exit-hook.sh");
-    const handoff = ["version=1", "phase=requested", "from_id=default", "from_mode=isolated", "from_context=default", "target_id=work", "target_mode=isolated", "target_context=default", "nonce=test"].join("\n") + "\n";
+    const handoff = directFinalExitHandoff(["version=1", "phase=requested", "from_id=default", "from_mode=isolated", "from_context=default", "target_id=work", "target_mode=isolated", "target_context=default", "nonce=test"].join("\n") + "\n");
     fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), handoff, { mode: 0o600 });
     fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nisolated\ndefault\n", { mode: 0o600 });
     const env = { HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: path.join(home, ".local", "share"), CODEX_HOME: path.join(home, ".codex"), CODEX_LINUX_APP_DIR: appDir };
-    const success = spawnSync("bash", [hook], { env, encoding: "utf8", timeout: 10000 });
+    const success = spawnSync("bash", [hook, "codex://thread/from-original-launch", "--new-window"], { env, encoding: "utf8", timeout: 10000 });
     assert.equal(success.status, 0, `${success.stderr}\n${success.stdout}`);
     assert.equal(fs.readFileSync(path.join(home, "started-profile"), "utf8"), "work");
+    assert.equal(fs.readFileSync(path.join(home, "started-arg-count"), "utf8"), "0");
     assert.equal(fs.existsSync(path.join(configDir, "account-switcher.handoff")), false);
 
     fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), handoff, { mode: 0o600 });
@@ -784,6 +1195,125 @@ test("after-exit handoff uses the launcher readiness protocol and rolls back fai
     const failed = spawnSync("bash", [hook], { env, encoding: "utf8", timeout: 10000 });
     assert.equal(failed.status, 1);
     assert.equal(fs.readFileSync(path.join(configDir, "account-switcher.active"), "utf8"), "default\nisolated\ndefault\n");
+    assert.match(fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8"), /phase=failed/);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("an unready live default replacement retains ownership and blocks WAL rollback", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-live-default-failure-"));
+  let ownerPid;
+  let activeDb;
+  try {
+    const home = path.join(tempDir, "home");
+    const appDir = path.join(tempDir, "app");
+    const fakeBin = path.join(tempDir, "bin");
+    const configDir = path.join(home, ".config", "codex-desktop");
+    const database = path.join(home, ".codex", "state_5.sqlite");
+    const holder = path.join(tempDir, "holder.js");
+    stageSharedStateHelper(appDir);
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.mkdirSync(path.dirname(database), { recursive: true });
+    fs.mkdirSync(fakeBin, { recursive: true });
+    fs.writeFileSync(path.join(fakeBin, "sleep"), "#!/bin/sh\nexec /bin/sleep 0.001\n", { mode: 0o755 });
+    activeDb = new DatabaseSync(database);
+    activeDb.exec("pragma journal_mode=WAL;create table if not exists held(value text);begin immediate;insert into held values ('live')");
+    assert.equal(fs.existsSync(`${database}-wal`), true);
+    fs.writeFileSync(holder, "setInterval(()=>{},1000);\n");
+    fs.writeFileSync(path.join(appDir, "start.sh"), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(holder)} >/dev/null 2>&1\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), directFinalExitHandoff([
+      "version=1", "phase=requested", "from_id=work", "from_mode=isolated", "from_context=default",
+      "target_id=default", "target_mode=isolated", "target_context=default", "target_previous_mode=isolated",
+      "target_previous_context=default", "nonce=test",
+    ].join("\n") + "\n"), { mode: 0o600 });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "default\nisolated\ndefault\n", { mode: 0o600 });
+    const env = {
+      ...process.env,
+      HOME: home,
+      XDG_CONFIG_HOME: path.join(home, ".config"),
+      XDG_DATA_HOME: path.join(home, ".local", "share"),
+      CODEX_HOME: path.join(home, ".codex"),
+      CODEX_LINUX_APP_DIR: appDir,
+      PATH: `${fakeBin}:${process.env.PATH}`,
+    };
+    const failed = spawnSync("bash", [path.join(__dirname, "after-exit-hook.sh")], { env, encoding: "utf8", timeout: 10000 });
+    assert.equal(failed.status, 1, `${failed.stderr}\n${failed.stdout}`);
+    assert.match(failed.stderr, /deferred catalog rollback until it exits/);
+    const pending = fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8");
+    assert.match(pending, /^phase=failed$/m);
+    ownerPid = Number(pending.match(/^owner_pid=([0-9]+)$/m)?.[1]);
+    assert.equal(Number.isInteger(ownerPid) && ownerPid > 1, true);
+    process.kill(ownerPid, 0);
+
+    const cold = spawnSync("bash", [path.join(__dirname, "launcher-hook.sh")], { env, encoding: "utf8" });
+    assert.notEqual(cold.status, 0);
+    assert.match(cold.stderr, /account handoff is still active under pid/);
+    assert.equal(fs.existsSync(`${database}-wal`), true);
+  } finally {
+    if (activeDb) {
+      try { activeDb.exec("rollback"); } catch {}
+      try { activeDb.close(); } catch {}
+    }
+    if (ownerPid) {
+      try { process.kill(ownerPid); } catch {}
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("a post-readiness commit failure preserves intent for cold-start recovery", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-commit-recovery-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const sourceHome = path.join(home, ".codex");
+    const targetHome = path.join(dataHome, "codex-desktop", "account-profiles", "work", "codex");
+    const appDir = path.join(tempDir, "app");
+    const configDir = path.join(home, ".config", "codex-desktop");
+    stageSharedStateHelper(appDir);
+    fs.appendFileSync(
+      path.join(appDir, ".codex-linux", "features", "account-switcher", "shared-state.sh"),
+      "\naccount_switcher_commit_prepared() { return 1; }\n",
+    );
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.mkdirSync(path.join(sourceHome, "sqlite"), { recursive: true });
+    fs.mkdirSync(path.join(targetHome, "sqlite"), { recursive: true });
+    fs.writeFileSync(path.join(sourceHome, "sqlite", "codex.db"), "source catalog");
+    fs.writeFileSync(path.join(targetHome, "sqlite", "codex.db"), "target catalog");
+    fs.writeFileSync(path.join(appDir, "start.sh"), "#!/bin/bash\nprintf '%s\\n' \"$$\" > \"$CODEX_LINUX_ACCOUNT_SWITCHER_READY_FILE\"\nsleep 0.2\n", { mode: 0o755 });
+    fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), directFinalExitHandoff([
+      "version=1", "phase=requested", "from_id=default", "from_mode=isolated", "from_context=default",
+      "target_id=work", "target_mode=shared-local", "target_context=team", "target_previous_mode=isolated",
+      "target_previous_context=default", "nonce=test",
+    ].join("\n") + "\n"), { mode: 0o600 });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nshared-local\nteam\n", { mode: 0o600 });
+    const env = {
+      ...process.env,
+      HOME: home,
+      XDG_CONFIG_HOME: path.join(home, ".config"),
+      XDG_DATA_HOME: dataHome,
+      CODEX_HOME: sourceHome,
+      CODEX_LINUX_APP_DIR: appDir,
+    };
+    const failed = spawnSync("bash", [path.join(__dirname, "after-exit-hook.sh")], { env, encoding: "utf8", timeout: 10000 });
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /preserved commit-pending recovery metadata/);
+    const pending = fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8");
+    assert.match(pending, /^phase=commit-pending$/m);
+    assert.match(pending, /^migration_count=1$/m);
+    const journalName = pending.match(/^migration_0_journal=(.+)$/m)?.[1];
+    assert.ok(journalName);
+    const journal = path.join(dataHome, "codex-desktop", "account-contexts", "team", journalName);
+    assert.equal(fs.statSync(journal).isDirectory(), true);
+
+    stageSharedStateHelper(appDir);
+    const recovered = spawnSync("bash", [path.join(__dirname, "launcher-hook.sh")], { env, encoding: "utf8", timeout: 10000 });
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.match(recovered.stdout, /env CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE=work/);
+    assert.equal(fs.existsSync(journal), false);
+    assert.equal(fs.existsSync(path.join(configDir, "account-switcher.handoff")), false);
+    assert.equal(fs.readFileSync(path.join(configDir, "account-switcher.active"), "utf8"), "work\nshared-local\nteam\n");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -810,18 +1340,22 @@ test("shared handoff merges source and target rollout files into an existing con
     fs.writeFileSync(path.join(sourceHome, "session_index.jsonl"), "source index\n");
     fs.writeFileSync(path.join(targetHome, "session_index.jsonl"), "target index\n");
     fs.writeFileSync(path.join(sharedRoot, "session_index.jsonl"), "existing index\n");
+    fs.writeFileSync(path.join(sourceHome, ".codex-global-state.json"), JSON.stringify({ "local-projects": { shared: true }, "source-account-only": true }));
+    fs.writeFileSync(path.join(targetHome, ".codex-global-state.json"), JSON.stringify({ unrelated: "preserve-target", "electron-persisted-atom-state": { "target-account-only": true } }));
     const staleSharedRoot = path.join(dataHome, "codex-desktop", "account-contexts", "old-team");
     const stateDb = new DatabaseSync(path.join(targetHome, "state_5.sqlite"));
     stateDb.exec("create table threads (id text primary key, rollout_path text not null)");
+    stateDb.exec("create table backfill_state (id integer primary key, status text not null)");
+    stateDb.prepare("insert into backfill_state (id, status) values (?, ?)").run(1, "complete");
     stateDb.prepare("insert into threads (id, rollout_path) values (?, ?)").run("thread-path", `${sharedRoot}/sessions/source-rollout.jsonl`);
     stateDb.prepare("insert into threads (id, rollout_path) values (?, ?)").run("stale-thread-path", `${staleSharedRoot}/sessions/stale-rollout.jsonl`);
     stateDb.close();
     fs.writeFileSync(path.join(appDir, "start.sh"), "#!/bin/sh\n: > \"$CODEX_LINUX_ACCOUNT_SWITCHER_READY_FILE\"\n", { mode: 0o755 });
-    fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), [
+    fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), directFinalExitHandoff([
       "version=1", "phase=requested", "from_id=default", "from_mode=isolated", "from_context=default",
       "target_id=work", "target_mode=shared-local", "target_context=team", "target_previous_mode=isolated",
       "target_previous_context=default", "nonce=test",
-    ].join("\n") + "\n", { mode: 0o600 });
+    ].join("\n") + "\n"), { mode: 0o600 });
     fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nshared-local\nteam\n", { mode: 0o600 });
     const result = spawnSync("bash", [path.join(__dirname, "after-exit-hook.sh")], {
       env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: dataHome, CODEX_HOME: sourceHome, CODEX_LINUX_APP_DIR: appDir },
@@ -840,14 +1374,19 @@ test("shared handoff merges source and target rollout files into an existing con
     const rewrittenDb = new DatabaseSync(path.join(targetHome, "state_5.sqlite"));
     assert.equal(rewrittenDb.prepare("select rollout_path from threads where id = ?").get("thread-path").rollout_path, `${targetHome}/sessions/source-rollout.jsonl`);
     assert.equal(rewrittenDb.prepare("select rollout_path from threads where id = ?").get("stale-thread-path").rollout_path, `${targetHome}/sessions/stale-rollout.jsonl`);
+    assert.equal(rewrittenDb.prepare("select id from backfill_state where id = 1").get(), undefined);
     rewrittenDb.close();
+    const targetGlobal = JSON.parse(fs.readFileSync(path.join(targetHome, ".codex-global-state.json"), "utf8"));
+    assert.equal(targetGlobal.unrelated, "preserve-target");
+    assert.equal(targetGlobal["electron-persisted-atom-state"]["target-account-only"], true);
+    assert.deepEqual(targetGlobal["local-projects"], { shared: true });
     assert.equal(fs.existsSync(path.join(configDir, "account-switcher.handoff")), false);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
 
-test("failed migration restores the source selection and clears the handoff", () => {
+test("failed migration restores the source selection and records the failed handoff", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-migration-failure-"));
   let fd;
   try {
@@ -862,7 +1401,7 @@ test("failed migration restores the source selection and clears the handoff", ()
     fd = fs.openSync(wal, "r");
     fs.writeFileSync(
       path.join(configDir, "account-switcher.handoff"),
-      ["version=1", "phase=requested", "from_id=default", "from_mode=isolated", "from_context=default", "target_id=work", "target_mode=shared-local", "target_context=team", "target_previous_mode=isolated", "target_previous_context=default", "nonce=test"].join("\n") + "\n",
+      directFinalExitHandoff(["version=1", "phase=requested", "from_id=default", "from_mode=isolated", "from_context=default", "target_id=work", "target_mode=shared-local", "target_context=team", "target_previous_mode=isolated", "target_previous_context=default", "nonce=test"].join("\n") + "\n"),
       { mode: 0o600 },
     );
     fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nshared-local\nteam\n", { mode: 0o600 });
@@ -874,14 +1413,14 @@ test("failed migration restores the source selection and clears the handoff", ()
     assert.equal(result.status, 1);
     assert.match(result.stderr, /shared catalog migration failed; restored default/);
     assert.equal(fs.readFileSync(path.join(configDir, "account-switcher.active"), "utf8"), "default\nisolated\ndefault\n");
-    assert.equal(fs.existsSync(path.join(configDir, "account-switcher.handoff")), false);
+    assert.match(fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8"), /phase=failed/);
   } finally {
     if (fd != null) fs.closeSync(fd);
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
 
-test("failed shared handoff rolls back its prepared SQLite migration", () => {
+test("failed shared handoff rolls back migration and restores target registry context", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-handoff-migration-rollback-"));
   try {
     const home = path.join(tempDir, "home");
@@ -897,10 +1436,17 @@ test("failed shared handoff rolls back its prepared SQLite migration", () => {
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(source, "source catalog");
     fs.writeFileSync(target, "target catalog");
+    fs.writeFileSync(path.join(configDir, "account-switcher.json"), `${JSON.stringify({
+      version: 1,
+      profiles: [
+        { id: "default", contextMode: "isolated", contextId: "default" },
+        { id: "work", contextMode: "shared-local", contextId: "team" },
+      ],
+    })}\n`);
     fs.writeFileSync(path.join(appDir, "start.sh"), "#!/bin/bash\nexit 17\n", { mode: 0o755 });
     fs.writeFileSync(
       path.join(configDir, "account-switcher.handoff"),
-      ["version=1", "phase=requested", "from_id=default", "from_mode=isolated", "from_context=default", "target_id=work", "target_mode=shared-local", "target_context=team", "target_previous_mode=isolated", "target_previous_context=default", "nonce=test"].join("\n") + "\n",
+      directFinalExitHandoff(["version=1", "phase=requested", "from_id=default", "from_mode=isolated", "from_context=default", "target_id=work", "target_mode=shared-local", "target_context=team", "target_previous_mode=isolated", "target_previous_context=default", "nonce=test"].join("\n") + "\n"),
       { mode: 0o600 },
     );
     fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nshared-local\nteam\n", { mode: 0o600 });
@@ -916,6 +1462,20 @@ test("failed shared handoff rolls back its prepared SQLite migration", () => {
     assert.equal(fs.lstatSync(target).isSymbolicLink(), false);
     assert.equal(fs.existsSync(shared), false);
     assert.equal(fs.readFileSync(path.join(configDir, "account-switcher.active"), "utf8"), "default\nisolated\ndefault\n");
+    assert.match(fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8"), /phase=failed/);
+
+    const fixture = `
+const V={isTrustedIpcSender:()=>true};let handler;const l={app:{whenReady:()=>new Promise(()=>{}),once:()=>{}},ipcMain:{handle:(name,value)=>{handler=value}}};let be;be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);setImmediate(async()=>{await handler({sender:{}},{action:"list"});process.exit(0)});
+`;
+    const recovered = spawnSync(process.execPath, ["-e", applyMainBundlePatch(fixture)], {
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: dataHome, CODEX_HOME: path.join(home, ".codex") },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(recovered.status, 0, `${recovered.stderr}\n${recovered.stdout}`);
+    const registry = JSON.parse(fs.readFileSync(path.join(configDir, "account-switcher.json"), "utf8"));
+    assert.deepEqual(registry.profiles.find((profile) => profile.id === "work"), { id: "work", contextMode: "isolated", contextId: "default" });
+    assert.equal(fs.existsSync(path.join(configDir, "account-switcher.handoff")), false);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -931,12 +1491,14 @@ test("isolated handoff detaches source and target from their previous shared con
     const shared = path.join(dataHome, "codex-desktop", "account-contexts", "team", "codex.db");
     const source = path.join(home, ".codex", "sqlite", "codex.db");
     const target = path.join(dataHome, "codex-desktop", "account-profiles", "work", "codex", "sqlite", "codex.db");
+    const sharedWal = `${shared}-wal`;
     stageSharedStateHelper(appDir);
     fs.mkdirSync(configDir, { recursive: true });
     fs.mkdirSync(path.dirname(shared), { recursive: true });
     fs.mkdirSync(path.dirname(source), { recursive: true });
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(shared, "shared catalog");
+    fs.writeFileSync(sharedWal, "shared wal from a different generation");
     const sharedRoot = path.dirname(shared);
     fs.mkdirSync(path.join(sharedRoot, "sessions"), { recursive: true });
     fs.writeFileSync(path.join(sharedRoot, "sessions", "rollout.jsonl"), "shared rollout");
@@ -945,6 +1507,8 @@ test("isolated handoff detaches source and target from their previous shared con
     fs.writeFileSync(`${target}.isolated-backup`, "target catalog");
     fs.symlinkSync(shared, source);
     fs.symlinkSync(shared, target);
+    fs.symlinkSync(sharedWal, `${source}-wal`);
+    fs.symlinkSync(sharedWal, `${target}-wal`);
     fs.mkdirSync(path.join(home, ".codex", "sessions.isolated-backup"), { recursive: true });
     fs.writeFileSync(path.join(home, ".codex", "sessions.isolated-backup", "source.txt"), "source sessions");
     fs.mkdirSync(path.join(dataHome, "codex-desktop", "account-profiles", "work", "codex", "sessions.isolated-backup"), { recursive: true });
@@ -958,7 +1522,7 @@ test("isolated handoff detaches source and target from their previous shared con
     fs.writeFileSync(path.join(appDir, "start.sh"), "#!/bin/bash\n: > \"$CODEX_LINUX_ACCOUNT_SWITCHER_READY_FILE\"\n", { mode: 0o755 });
     fs.writeFileSync(
       path.join(configDir, "account-switcher.handoff"),
-      ["version=1", "phase=requested", "from_id=default", "from_mode=isolated", "from_context=team", "target_id=work", "target_mode=isolated", "target_context=default", "target_previous_mode=shared-local", "target_previous_context=team", "nonce=test"].join("\n") + "\n",
+      directFinalExitHandoff(["version=1", "phase=requested", "from_id=default", "from_mode=isolated", "from_context=team", "target_id=work", "target_mode=isolated", "target_context=default", "target_previous_mode=shared-local", "target_previous_context=team", "nonce=test"].join("\n") + "\n"),
       { mode: 0o600 },
     );
     fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nisolated\ndefault\n", { mode: 0o600 });
@@ -970,8 +1534,10 @@ test("isolated handoff detaches source and target from their previous shared con
     assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
     assert.equal(fs.lstatSync(source).isSymbolicLink(), false);
     assert.equal(fs.readFileSync(source, "utf8"), "source catalog");
+    assert.equal(fs.existsSync(`${source}-wal`), false);
     assert.equal(fs.lstatSync(target).isSymbolicLink(), false);
     assert.equal(fs.readFileSync(target, "utf8"), "target catalog");
+    assert.equal(fs.existsSync(`${target}-wal`), false);
     assert.equal(fs.lstatSync(path.join(home, ".codex", "sessions")).isSymbolicLink(), false);
     assert.equal(fs.readFileSync(path.join(home, ".codex", "sessions", "source.txt"), "utf8"), "source sessions");
     assert.equal(fs.lstatSync(path.join(dataHome, "codex-desktop", "account-profiles", "work", "codex", "sessions")).isSymbolicLink(), false);
@@ -983,49 +1549,91 @@ test("isolated handoff detaches source and target from their previous shared con
   }
 });
 
-test("AppImage handoff composes through AppRun and waits for readiness", () => {
+test("stage-only AppImage composes account-switcher hooks and readiness through AppRun", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-appimage-handoff-"));
   try {
     const home = path.join(tempDir, "home");
-    const appDirRoot = path.join(tempDir, "appimage.AppDir");
+    const sourceApp = path.join(tempDir, "source-app");
+    const appDirRoot = path.join(tempDir, "staged.AppDir");
     const appDir = path.join(appDirRoot, "opt", "codex-desktop");
     const configDir = path.join(home, ".config", "codex-desktop");
-    const appImage = path.join(tempDir, "codex-desktop.AppImage");
-    stageSharedStateHelper(appDir);
-    fs.mkdirSync(configDir, { recursive: true });
-    const appRun = fs.readFileSync(path.join(__dirname, "..", "..", "packaging", "appimage", "AppRun"), "utf8")
-      .replaceAll("__PACKAGE_NAME__", "codex-desktop");
-    fs.writeFileSync(path.join(appDirRoot, "AppRun"), appRun, { mode: 0o755 });
-    fs.writeFileSync(appImage, "#!/bin/bash\nprintf invoked > \"$HOME/appimage-runtime\"\nexec \"$APPDIR/AppRun\" \"$@\"\n", { mode: 0o755 });
-    fs.writeFileSync(
-      path.join(appDir, "start.sh"),
-      "#!/bin/bash\nprintf '%s\\n' \"$APPDIR\" > \"$HOME/appimage-launcher\"\n: > \"$CODEX_LINUX_ACCOUNT_SWITCHER_READY_FILE\"\n",
-      { mode: 0o755 },
-    );
-    fs.writeFileSync(
-      path.join(configDir, "account-switcher.handoff"),
-      ["version=1", "phase=requested", "from_id=default", "from_mode=isolated", "from_context=default", "target_id=work", "target_mode=isolated", "target_context=default", "nonce=test"].join("\n") + "\n",
-      { mode: 0o600 },
-    );
-    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nisolated\ndefault\n", { mode: 0o600 });
-    const result = spawnSync("bash", [path.join(__dirname, "after-exit-hook.sh")], {
+    const configPath = path.join(tempDir, "features.json");
+    const icon = path.join(tempDir, "icon.png");
+    fs.mkdirSync(path.join(sourceApp, "resources"), { recursive: true });
+    const launcher = fs.readFileSync(path.join(__dirname, "..", "..", "launcher", "start.sh.template"), "utf8")
+      .replaceAll("__CODEX_LINUX_APP_ID__", "codex-desktop")
+      .replaceAll("__CODEX_LINUX_APP_DISPLAY_NAME__", "ChatGPT Community");
+    fs.writeFileSync(path.join(sourceApp, "start.sh"), launcher, { mode: 0o755 });
+    fs.writeFileSync(path.join(sourceApp, "resources", "app.asar"), "fixture");
+    fs.writeFileSync(path.join(sourceApp, "resources", "codex"), "#!/bin/sh\n", { mode: 0o755 });
+    fs.writeFileSync(icon, "fixture icon");
+    fs.writeFileSync(configPath, JSON.stringify({ enabled: ["account-switcher"] }));
+    fs.writeFileSync(path.join(sourceApp, "ChatGPT"), `#!/bin/bash
+set -eu
+if [ -n "\${CODEX_LINUX_ACCOUNT_SWITCHER_READY_FILE:-}" ]; then
+    printf 'replacement\n' >> "\$HOME/lifecycle-order"
+    printf '%s\n' "\$\$" > "\$CODEX_LINUX_ACCOUNT_SWITCHER_READY_FILE"
+    sleep 0.2
+    exit 0
+fi
+rest="\$(sed 's/^.*) //' "/proc/\$PPID/stat")"
+set -- \$rest
+owner_start="\${20}"
+owner_boot="\$(cat /proc/sys/kernel/random/boot_id)"
+mkdir -p "\$XDG_CONFIG_HOME/codex-desktop"
+printf '%s\n' version=1 phase=requested "owner_pid=\$PPID" "owner_start=\$owner_start" "owner_boot=\$owner_boot" from_id=default from_mode=isolated from_context=default target_id=work target_mode=isolated target_context=default target_previous_mode=isolated target_previous_context=default nonce=test > "\$XDG_CONFIG_HOME/codex-desktop/account-switcher.handoff"
+printf 'work\nisolated\ndefault\n' > "\$XDG_CONFIG_HOME/codex-desktop/account-switcher.active"
+printf 'initial\n' >> "\$HOME/lifecycle-order"
+`, { mode: 0o755 });
+    stageEnabledLinuxFeatureInstall(sourceApp, {
+      featuresRoot: path.join(__dirname, ".."),
+      featuresConfigPath: configPath,
+    });
+    const upstreamMetadata = path.join(sourceApp, ".codex-linux", "upstream-package");
+    fs.mkdirSync(upstreamMetadata, { recursive: true });
+    fs.writeFileSync(path.join(upstreamMetadata, "control"), "Package: chatgpt\nVersion: 1.0.0\nArchitecture: amd64\n");
+    const cleanupHook = path.join(sourceApp, ".codex-linux", "after-exit.d", "zz-test-cleanup");
+    fs.mkdirSync(path.dirname(cleanupHook), { recursive: true });
+    fs.writeFileSync(cleanupHook, "#!/bin/sh\nprintf 'cleanup\\n' >> \"$HOME/lifecycle-order\"\n", { mode: 0o755 });
+    const build = spawnSync("bash", [path.join(__dirname, "..", "..", "scripts", "build-appimage.sh")], {
       env: {
         ...process.env,
-        APPDIR: appDirRoot,
-        APPIMAGE: appImage,
+        APP_DIR_OVERRIDE: sourceApp,
+        APPIMAGE_APPDIR_OVERRIDE: appDirRoot,
+        APPIMAGE_STAGE_ONLY: "1",
+        DIST_DIR_OVERRIDE: path.join(tempDir, "dist"),
+        PACKAGE_ICON_SOURCE: icon,
+      },
+      encoding: "utf8",
+      timeout: 20000,
+    });
+    assert.equal(build.status, 0, `${build.stderr}\n${build.stdout}`);
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "default\nisolated\ndefault\n", { mode: 0o600 });
+    const result = spawnSync(path.join(appDirRoot, "AppRun"), [], {
+      env: {
+        ...process.env,
         HOME: home,
         XDG_CONFIG_HOME: path.join(home, ".config"),
         XDG_DATA_HOME: path.join(home, ".local", "share"),
         CODEX_HOME: path.join(home, ".codex"),
-        CODEX_LINUX_APP_DIR: appDir,
+        CODEX_LINUX_DISABLE_USAGE_REPORTING: "1",
       },
       encoding: "utf8",
-      timeout: 10000,
+      timeout: 20000,
     });
     assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
-    assert.equal(fs.readFileSync(path.join(home, "appimage-runtime"), "utf8"), "invoked");
-    assert.equal(fs.readFileSync(path.join(home, "appimage-launcher"), "utf8"), `${appDirRoot}\n`);
+    assert.deepEqual(fs.readFileSync(path.join(home, "lifecycle-order"), "utf8").trim().split("\n").slice(0, 3), ["initial", "cleanup", "replacement"]);
     assert.equal(fs.existsSync(path.join(configDir, "account-switcher.handoff")), false);
+    for (const relative of [
+      ".codex-linux/launcher.d/account-switcher-account-switcher-launcher.sh",
+      ".codex-linux/prelaunch.d/account-switcher-account-switcher-prelaunch.sh",
+      ".codex-linux/exit-claim.d/account-switcher-account-switcher-exit-claim.sh",
+      ".codex-linux/final-exit.d/account-switcher-account-switcher-final-exit.sh",
+      ".codex-linux/features/account-switcher/shared-state.sh",
+      ".codex-linux/codex-packaged-runtime.sh",
+    ]) assert.equal(fs.existsSync(path.join(appDir, relative)), true, relative);
+    assert.equal(fs.statSync(path.join(appDir, ".codex-linux", "final-exit.d", "account-switcher-account-switcher-final-exit.sh")).mode & 0o111, 0o111);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -1042,7 +1650,7 @@ test("active profile removal waits for replacement readiness and preserves rollb
     fs.mkdirSync(configDir, { recursive: true });
     const launcher = path.join(appDir, "start.sh");
     const hook = path.join(__dirname, "after-exit-hook.sh");
-    const handoff = ["version=1", "phase=requested", "from_id=work", "from_mode=isolated", "from_context=default", "target_id=default", "target_mode=isolated", "target_context=default", "remove_id=work", "nonce=test"].join("\n") + "\n";
+    const handoff = directFinalExitHandoff(["version=1", "phase=requested", "from_id=work", "from_mode=isolated", "from_context=default", "target_id=default", "target_mode=isolated", "target_context=default", "remove_id=work", "nonce=test"].join("\n") + "\n");
     const env = { HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: path.join(home, ".local", "share"), CODEX_HOME: path.join(home, ".codex"), CODEX_LINUX_APP_DIR: appDir };
 
     fs.mkdirSync(profileRoot, { recursive: true });
@@ -1068,7 +1676,7 @@ test("active profile removal waits for replacement readiness and preserves rollb
   }
 });
 
-test("shared migration refuses an active SQLite WAL handle", () => {
+test("shared migration refuses an active state SQLite WAL handle", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-wal-"));
   let fd;
   try {
@@ -1079,8 +1687,9 @@ test("shared migration refuses an active SQLite WAL handle", () => {
     const configDir = path.join(home, ".config", "codex-desktop");
     fs.mkdirSync(configDir, { recursive: true });
     fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nshared-local\nteam\n", { mode: 0o600 });
-    const db = path.join(dataHome, "codex-desktop", "account-profiles", "work", "codex", "sqlite", "codex.db-wal");
+    const db = path.join(dataHome, "codex-desktop", "account-profiles", "work", "codex", "state_5.sqlite-wal");
     fs.mkdirSync(path.dirname(db), { recursive: true });
+    fs.writeFileSync(db.slice(0, -4), "database");
     fs.writeFileSync(db, "wal");
     fd = fs.openSync(db, "r");
     const result = spawnSync("bash", [path.join(__dirname, "prelaunch-hook.sh")], {
@@ -1088,9 +1697,315 @@ test("shared migration refuses an active SQLite WAL handle", () => {
       encoding: "utf8",
     });
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /SQLite path is open/);
+    assert.match(result.stderr, /state SQLite path is open/);
   } finally {
     if (fd != null) fs.closeSync(fd);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("shared migration refuses a closed hot rollback journal", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-rollback-journal-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const codexHome = path.join(home, ".codex");
+    const journal = path.join(codexHome, "sqlite", "codex.db-journal");
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "sqlite", "codex.db"), "database");
+    fs.writeFileSync(journal, "hot journal");
+    const helper = path.join(__dirname, "shared-state.sh");
+    const result = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_assert_offline ${JSON.stringify(codexHome)}`], {
+      env: { ...process.env, HOME: home },
+      encoding: "utf8",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /SQLite rollback journal exists/);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("untouched isolated startup leaves a rollback journal for SQLite recovery", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-isolated-journal-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const codexHome = path.join(home, ".codex");
+    const appDir = path.join(tempDir, "app");
+    const configDir = path.join(home, ".config", "codex-desktop");
+    const journal = path.join(codexHome, "sqlite", "codex.db-journal");
+    stageSharedStateHelper(appDir);
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "default\nisolated\ndefault\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(codexHome, "sqlite", "codex.db"), "database");
+    fs.writeFileSync(journal, "hot journal");
+    const result = spawnSync("bash", [path.join(__dirname, "prelaunch-hook.sh")], {
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), CODEX_HOME: codexHome, CODEX_LINUX_APP_DIR: appDir },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(journal, "utf8"), "hot journal");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("isolated prelaunch flushes profile-local shared updates before detaching", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-flush-before-detach-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const codexHome = path.join(home, ".codex");
+    const sharedRoot = path.join(dataHome, "codex-desktop", "account-contexts", "team");
+    const appDir = path.join(tempDir, "app");
+    stageSharedStateHelper(appDir);
+    fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
+    fs.mkdirSync(path.join(sharedRoot, "sessions"), { recursive: true });
+    fs.mkdirSync(path.join(codexHome, "sqlite"), { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "sessions", "new.jsonl"), "new rollout");
+    fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify({ "local-projects": { newProject: true } }));
+    fs.writeFileSync(path.join(sharedRoot, "codex.db"), "shared catalog");
+    fs.symlinkSync(path.join(sharedRoot, "codex.db"), path.join(codexHome, "sqlite", "codex.db"));
+    const configDir = path.join(home, ".config", "codex-desktop");
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "default\nisolated\nteam\n", { mode: 0o600 });
+    const result = spawnSync("bash", [path.join(__dirname, "prelaunch-hook.sh")], {
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: dataHome, CODEX_HOME: codexHome, CODEX_LINUX_APP_DIR: appDir },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(path.join(sharedRoot, "sessions", "new.jsonl"), "utf8"), "new rollout");
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sharedRoot, "local-project-state.json"), "utf8"))["local-projects"], { newProject: true });
+    assert.equal(fs.lstatSync(path.join(codexHome, "sqlite", "codex.db")).isSymbolicLink(), false);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("isolated preparation preserves private sessions and rollback restores shared hardlinks", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-session-detach-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const codexHome = path.join(home, ".codex");
+    const sharedRoot = path.join(dataHome, "codex-desktop", "account-contexts", "team");
+    const sharedFile = path.join(sharedRoot, "sessions", "shared.jsonl");
+    const targetShared = path.join(codexHome, "sessions", "shared.jsonl");
+    const privateFile = path.join(codexHome, "sessions", "private.jsonl");
+    fs.mkdirSync(path.dirname(sharedFile), { recursive: true });
+    fs.mkdirSync(path.dirname(privateFile), { recursive: true });
+    fs.writeFileSync(sharedFile, "shared");
+    fs.linkSync(sharedFile, targetShared);
+    fs.writeFileSync(privateFile, "private");
+    const helper = path.join(__dirname, "shared-state.sh");
+    const env = { ...process.env, HOME: home, XDG_DATA_HOME: dataHome };
+    const prepared = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_prepare_isolated ${JSON.stringify(codexHome)} team`], { env, encoding: "utf8" });
+    assert.equal(prepared.status, 0, prepared.stderr);
+    const journal = prepared.stdout.trim();
+    assert.equal(fs.readFileSync(privateFile, "utf8"), "private");
+    assert.notEqual(fs.statSync(targetShared).ino, fs.statSync(sharedFile).ino);
+
+    const rolledBack = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_rollback_prepared team ${JSON.stringify(journal)}`], { env, encoding: "utf8" });
+    assert.equal(rolledBack.status, 0, rolledBack.stderr);
+    assert.equal(fs.readFileSync(privateFile, "utf8"), "private");
+    assert.equal(fs.statSync(targetShared).ino, fs.statSync(sharedFile).ino);
+    assert.equal(fs.existsSync(journal), false);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("leaving a freshly seeded shared context materializes its catalog", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-catalog-detach-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const codexHome = path.join(home, ".codex");
+    const shared = path.join(dataHome, "codex-desktop", "account-contexts", "team", "codex.db");
+    const target = path.join(codexHome, "sqlite", "codex.db");
+    fs.mkdirSync(path.dirname(shared), { recursive: true });
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(shared, "seed catalog");
+    fs.symlinkSync(shared, target);
+    const helper = path.join(__dirname, "shared-state.sh");
+    const result = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_detach_isolated ${JSON.stringify(codexHome)} team`], {
+      env: { ...process.env, HOME: home, XDG_DATA_HOME: dataHome },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.lstatSync(target).isSymbolicLink(), false);
+    assert.equal(fs.readFileSync(target, "utf8"), "seed catalog");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("copied rollouts reconcile active updates back into the shared context", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-rollout-copy-"));
+  try {
+    const source = path.join(tempDir, "source");
+    const shared = path.join(tempDir, "shared");
+    const journal = path.join(tempDir, "journal");
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(shared, { recursive: true });
+    fs.mkdirSync(journal, { recursive: true });
+    fs.writeFileSync(path.join(source, "rollout.jsonl"), "new active content");
+    fs.writeFileSync(path.join(shared, "rollout.jsonl"), "stale shared content");
+    const helper = path.join(__dirname, "shared-state.sh");
+    const result = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_merge_session_tree ${JSON.stringify(source)} ${JSON.stringify(shared)} ${JSON.stringify(journal)} 0 1`], {
+      env: { ...process.env, HOME: path.join(tempDir, "home") },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(path.join(shared, "rollout.jsonl"), "utf8"), "new active content");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("materialization replaces stale copied rollouts and rolls them back transactionally", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-rollout-materialize-"));
+  try {
+    const target = path.join(tempDir, "target");
+    const shared = path.join(tempDir, "shared");
+    const journal = path.join(tempDir, "journal");
+    fs.mkdirSync(target, { recursive: true });
+    fs.mkdirSync(shared, { recursive: true });
+    fs.mkdirSync(journal, { recursive: true });
+    fs.writeFileSync(path.join(target, "rollout.jsonl"), "stale target content");
+    fs.writeFileSync(path.join(shared, "rollout.jsonl"), "selected shared content");
+    const helper = path.join(__dirname, "shared-state.sh");
+    const prepared = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_materialize_session_tree ${JSON.stringify(target)} ${JSON.stringify(shared)} ${JSON.stringify(journal)} 0`], {
+      env: { ...process.env, HOME: path.join(tempDir, "home") },
+      encoding: "utf8",
+    });
+    assert.equal(prepared.status, 0, prepared.stderr);
+    assert.equal(fs.readFileSync(path.join(target, "rollout.jsonl"), "utf8"), "selected shared content");
+    assert.equal(fs.statSync(path.join(target, "rollout.jsonl")).ino, fs.statSync(path.join(shared, "rollout.jsonl")).ino);
+    const rolledBack = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_restore_journal ${JSON.stringify(journal)}`], {
+      env: { ...process.env, HOME: path.join(tempDir, "home") },
+      encoding: "utf8",
+    });
+    assert.equal(rolledBack.status, 0, rolledBack.stderr);
+    assert.equal(fs.readFileSync(path.join(target, "rollout.jsonl"), "utf8"), "stale target content");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("rollback distinguishes an interrupted backup from a completed backup", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-backup-crash-"));
+  try {
+    const helper = path.join(__dirname, "shared-state.sh");
+    const target = path.join(tempDir, "state.json");
+
+    fs.writeFileSync(target, "original before pending record");
+    let journal = path.join(tempDir, "pending-before-copy");
+    fs.mkdirSync(journal);
+    let result = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_write_record ${JSON.stringify(journal)} 1 ${JSON.stringify(target)} '' ${JSON.stringify(path.join(journal, "state-1.backup"))} restore-pending; account_switcher_restore_journal ${JSON.stringify(journal)}`], {
+      env: { ...process.env, HOME: path.join(tempDir, "home") },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(target, "utf8"), "original before pending record");
+
+    journal = path.join(tempDir, "pending-after-copy");
+    fs.mkdirSync(journal);
+    const backup = path.join(journal, "state-1.backup");
+    fs.writeFileSync(backup, "durable original backup");
+    fs.rmSync(target);
+    result = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_write_record ${JSON.stringify(journal)} 1 ${JSON.stringify(target)} '' ${JSON.stringify(backup)} restore-pending; account_switcher_restore_journal ${JSON.stringify(journal)}`], {
+      env: { ...process.env, HOME: path.join(tempDir, "home") },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(target, "utf8"), "durable original backup");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("interrupted committed-journal cleanup cannot re-enter rollback", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-commit-cleanup-crash-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const sharedRoot = path.join(dataHome, "codex-desktop", "account-contexts", "team");
+    const journal = path.join(sharedRoot, ".account-switcher-migration-fixture");
+    const target = path.join(home, ".codex", "session_index.jsonl");
+    const helper = path.join(__dirname, "shared-state.sh");
+    fs.mkdirSync(journal, { recursive: true });
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, "committed state must survive");
+    const interrupted = spawnSync("bash", ["-c", `
+source ${JSON.stringify(helper)}
+account_switcher_write_record ${JSON.stringify(journal)} 1 ${JSON.stringify(target)} '' '' session-link
+rm() { for argument in "$@"; do [[ "$argument" == *account-switcher-committed-* ]] && return 88; done; command rm "$@"; }
+account_switcher_commit_prepared team ${JSON.stringify(journal)} && exit 7
+exit 0
+`], {
+      env: { ...process.env, HOME: home, XDG_DATA_HOME: dataHome },
+      encoding: "utf8",
+    });
+    assert.equal(interrupted.status, 0, interrupted.stderr);
+    assert.equal(fs.existsSync(journal), false);
+    assert.equal(fs.readdirSync(sharedRoot).some((name) => name.startsWith(".account-switcher-committed-")), true);
+    assert.equal(fs.readFileSync(target, "utf8"), "committed state must survive");
+
+    const recovered = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; lock=$(account_switcher_context_lock_acquire ${JSON.stringify(sharedRoot)}); account_switcher_recover_context ${JSON.stringify(sharedRoot)}; account_switcher_context_lock_release "$lock"`], {
+      env: { ...process.env, HOME: home, XDG_DATA_HOME: dataHome },
+      encoding: "utf8",
+    });
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.equal(fs.readdirSync(sharedRoot).some((name) => name.startsWith(".account-switcher-committed-")), false);
+    assert.equal(fs.readFileSync(target, "utf8"), "committed state must survive");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("session-index merge I/O failure aborts and restores the transaction", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-index-merge-failure-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const codexHome = path.join(home, ".codex");
+    const sharedRoot = path.join(dataHome, "codex-desktop", "account-contexts", "team");
+    const fakeBin = path.join(tempDir, "bin");
+    const helper = path.join(__dirname, "shared-state.sh");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.mkdirSync(sharedRoot, { recursive: true });
+    fs.mkdirSync(fakeBin, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "session_index.jsonl"), "source index\n");
+    fs.writeFileSync(path.join(sharedRoot, "session_index.jsonl"), "shared index\n");
+    fs.writeFileSync(path.join(fakeBin, "awk"), "#!/bin/sh\nprintf 'partial output\\n'\nexit 28\n", { mode: 0o755 });
+    const result = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_prepare_shared ${JSON.stringify(codexHome)} ${JSON.stringify(codexHome)} team`], {
+      env: { ...process.env, HOME: home, XDG_DATA_HOME: dataHome, PATH: `${fakeBin}:${process.env.PATH}` },
+      encoding: "utf8",
+    });
+    assert.notEqual(result.status, 0);
+    assert.equal(fs.readFileSync(path.join(codexHome, "session_index.jsonl"), "utf8"), "source index\n");
+    assert.equal(fs.readFileSync(path.join(sharedRoot, "session_index.jsonl"), "utf8"), "shared index\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("shared contexts are private even with a permissive caller umask", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-private-context-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const codexHome = path.join(home, ".codex");
+    const sharedRoot = path.join(dataHome, "codex-desktop", "account-contexts", "team");
+    const helper = path.join(__dirname, "shared-state.sh");
+    const result = spawnSync("bash", ["-c", `umask 022; source ${JSON.stringify(helper)}; account_switcher_migrate_shared ${JSON.stringify(codexHome)} ${JSON.stringify(codexHome)} team`], {
+      env: { ...process.env, HOME: home, XDG_DATA_HOME: dataHome },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.statSync(sharedRoot).mode & 0o777, 0o700);
+  } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
@@ -1120,6 +2035,52 @@ test("shared-context lock serializes migration recovery", async () => {
     assert.equal(fs.existsSync(path.join(sharedRoot, ".account-switcher.lock")), false);
   } finally {
     holder?.kill();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("shared-context lock reclaims a legacy ownerless lock atomically", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-ownerless-context-lock-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const sharedRoot = path.join(dataHome, "codex-desktop", "account-contexts", "team");
+    const lock = path.join(sharedRoot, ".account-switcher.lock");
+    fs.mkdirSync(lock, { recursive: true });
+    const helper = path.join(__dirname, "shared-state.sh");
+    const result = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; acquired=$(account_switcher_context_lock_acquire ${JSON.stringify(sharedRoot)}); account_switcher_context_lock_release "$acquired"`], {
+      env: { ...process.env, HOME: home, XDG_DATA_HOME: dataHome },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(lock), false);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent stale-lock recovery never admits two context owners", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-stale-context-lock-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const sharedRoot = path.join(dataHome, "codex-desktop", "account-contexts", "team");
+    const critical = path.join(tempDir, "critical");
+    const lock = path.join(sharedRoot, ".account-switcher.lock");
+    const helper = path.join(__dirname, "shared-state.sh");
+    fs.mkdirSync(sharedRoot, { recursive: true });
+    fs.writeFileSync(lock, "99999999\n", { mode: 0o600 });
+    const script = `source ${JSON.stringify(helper)}; acquired=$(account_switcher_context_lock_acquire ${JSON.stringify(sharedRoot)}); mkdir ${JSON.stringify(critical)}; sleep 0.15; rmdir ${JSON.stringify(critical)}; account_switcher_context_lock_release "$acquired"`;
+    const env = { ...process.env, HOME: home, XDG_DATA_HOME: dataHome };
+    const children = [spawn("bash", ["-c", script], { env }), spawn("bash", ["-c", script], { env })];
+    const results = await Promise.all(children.map((child) => new Promise((resolve) => {
+      let stderr = "";
+      child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      child.on("close", (status) => resolve({ status, stderr }));
+    })));
+    for (const result of results) assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(lock), false);
+  } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
@@ -1160,26 +2121,151 @@ test("an abandoned migration journal is rolled back after a crash", () => {
   }
 });
 
-test("desktop deep-link handoff bypasses migration while the app is running", () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-deep-link-"));
-  let appProcess;
+test("cold launcher recovery rolls back an interrupted handoff before profile selection", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-handoff-crash-"));
   try {
     const home = path.join(tempDir, "home");
     const dataHome = path.join(home, ".local", "share");
+    const configDir = path.join(home, ".config", "codex-desktop");
     const appDir = path.join(tempDir, "app");
+    const sourceHome = path.join(home, ".codex");
+    const targetHome = path.join(dataHome, "codex-desktop", "account-profiles", "work", "codex");
+    const source = path.join(sourceHome, "sqlite", "codex.db");
+    const target = path.join(targetHome, "sqlite", "codex.db");
+    const helper = path.join(__dirname, "shared-state.sh");
+    stageSharedStateHelper(appDir);
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(source, "source before interrupted handoff");
+    fs.writeFileSync(target, "target before interrupted handoff");
+    const crashed = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_prepare_shared ${JSON.stringify(sourceHome)} ${JSON.stringify(targetHome)} team >/dev/null; exit 99`], {
+      env: { ...process.env, HOME: home, XDG_DATA_HOME: dataHome },
+      encoding: "utf8",
+    });
+    assert.equal(crashed.status, 99);
+    const sharedRoot = path.join(dataHome, "codex-desktop", "account-contexts", "team");
+    const journalsBefore = fs.readdirSync(sharedRoot).filter((name) => name.startsWith(".account-switcher-migration-"));
+    assert.equal(journalsBefore.length, 1);
+    const abandonedOwner = fs.readFileSync(path.join(sharedRoot, journalsBefore[0], "pid"), "utf8").trim();
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nshared-local\nteam\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), [
+      "version=1", "phase=launching", "owner_pid=99999999", "from_id=default", "from_mode=isolated", "from_context=default",
+      "target_id=work", "target_mode=shared-local", "target_context=team", "target_previous_mode=isolated", "target_previous_context=default",
+    ].join("\n") + "\n", { mode: 0o600 });
+    const recovered = spawnSync("bash", [path.join(__dirname, "launcher-hook.sh")], {
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: dataHome, CODEX_HOME: sourceHome, CODEX_LINUX_APP_DIR: appDir },
+      encoding: "utf8",
+    });
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.equal(recovered.stdout, [
+      "unset-env CODEX_ELECTRON_USER_DATA_PATH",
+      "env CODEX_LINUX_ACCOUNT_SWITCHER_LAUNCH_GUARD=1",
+      "env CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE=default",
+      "env CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT=isolated",
+      "env CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT_ID=default",
+      "",
+    ].join("\n"));
+    assert.equal(fs.readFileSync(path.join(configDir, "account-switcher.active"), "utf8"), "default\nisolated\ndefault\n");
+    assert.match(fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8"), /phase=failed/);
+    const journalsAfter = fs.readdirSync(sharedRoot).filter((name) => name.startsWith(".account-switcher-migration-"));
+    assert.equal(fs.lstatSync(source).isSymbolicLink(), false, `owner=${abandonedOwner} journals=${JSON.stringify(journalsAfter)}\n${recovered.stderr}`);
+    assert.equal(fs.readFileSync(source, "utf8"), "source before interrupted handoff");
+    assert.equal(fs.readFileSync(target, "utf8"), "target before interrupted handoff");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("launcher routes a concurrent invocation to the live handoff source", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-live-requested-handoff-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const configDir = path.join(home, ".config", "codex-desktop");
+    const appDir = path.join(tempDir, "app");
+    stageSharedStateHelper(appDir);
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "default\nisolated\ndefault\n", { mode: 0o600 });
+    const owner = processIdentity();
+    fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), [
+      "version=1", "phase=requested", `owner_pid=${owner.pid}`, `owner_start=${owner.start}`, `owner_boot=${owner.boot}`, "from_id=work", "from_mode=isolated", "from_context=default",
+      "target_id=default", "target_mode=isolated", "target_context=default", "target_previous_mode=isolated", "target_previous_context=default",
+    ].join("\n") + "\n", { mode: 0o600 });
+    const result = spawnSync("bash", [path.join(__dirname, "launcher-hook.sh")], {
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: dataHome, CODEX_HOME: path.join(home, ".codex"), CODEX_LINUX_APP_DIR: appDir },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /env CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE=work/);
+    assert.match(result.stdout, /electron-arg --user-data-dir=.*account-profiles\/work\/electron/);
+    assert.match(fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8"), /phase=requested/);
+    assert.equal(fs.readFileSync(path.join(configDir, "account-switcher.active"), "utf8"), "default\nisolated\ndefault\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("launcher rejects a requested handoff whose PID identity was reused", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-reused-handoff-pid-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const configDir = path.join(home, ".config", "codex-desktop");
+    const appDir = path.join(tempDir, "app");
+    const owner = processIdentity();
+    stageSharedStateHelper(appDir);
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "default\nisolated\ndefault\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), [
+      "version=1", "phase=requested", `owner_pid=${owner.pid}`, `owner_start=${Number(owner.start) + 1}`, `owner_boot=${owner.boot}`,
+      "from_id=work", "from_mode=isolated", "from_context=default", "target_id=default", "target_mode=isolated", "target_context=default",
+    ].join("\n") + "\n", { mode: 0o600 });
+    const result = spawnSync("bash", [path.join(__dirname, "launcher-hook.sh")], {
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: dataHome, CODEX_HOME: path.join(home, ".codex"), CODEX_LINUX_APP_DIR: appDir },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /env CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE=work/);
+    assert.match(fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8"), /phase=failed/);
+    assert.equal(fs.readFileSync(path.join(configDir, "account-switcher.active"), "utf8"), "work\nisolated\ndefault\n");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("every live AppImage invocation bypasses migration across remounts for upstream handoff", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-deep-link-"));
+  let appProcess;
+  let fd;
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const appDir = path.join(tempDir, ".mount-new", "opt", "codex-desktop");
     stageSharedStateHelper(appDir);
     const configDir = path.join(home, ".config", "codex-desktop");
     fs.mkdirSync(configDir, { recursive: true });
-    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "default\nisolated\ndefault\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "default\nshared-local\nteam\n", { mode: 0o600 });
     const db = path.join(home, ".codex", "sqlite", "codex.db");
     fs.mkdirSync(path.dirname(db), { recursive: true });
     fs.writeFileSync(db, "open");
-    const appPath = path.join(appDir, "ChatGPT");
-    appProcess = spawn("bash", ["-c", `exec -a ${JSON.stringify(appPath)} sleep 30`]);
-    const env = { HOME: home, XDG_DATA_HOME: dataHome, CODEX_LINUX_APP_DIR: appDir, CODEX_HOME: path.join(home, ".codex") };
-    const result = spawnSync("bash", [path.join(__dirname, "prelaunch-hook.sh"), "codex://auth/callback"], { env, encoding: "utf8" });
+    const appPath = path.join(tempDir, ".mount-old", "opt", "codex-desktop", "ChatGPT");
+    const appImage = path.join(tempDir, "codex-desktop.AppImage");
+    fs.mkdirSync(path.dirname(appPath), { recursive: true });
+    fs.copyFileSync("/bin/sleep", appPath);
+    fs.chmodSync(appPath, 0o755);
+    appProcess = spawn(appPath, ["30"], { argv0: "ChatGPT", env: { ...process.env, APPIMAGE: appImage } });
+    await new Promise((resolve, reject) => {
+      appProcess.once("spawn", resolve);
+      appProcess.once("error", reject);
+    });
+    fs.unlinkSync(appPath);
+    fd = fs.openSync(db, "r");
+    const env = { HOME: home, XDG_DATA_HOME: dataHome, CODEX_LINUX_APP_DIR: appDir, CODEX_HOME: path.join(home, ".codex"), APPIMAGE: appImage };
+    const result = spawnSync("bash", [path.join(__dirname, "prelaunch-hook.sh")], { env, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
   } finally {
+    if (fd != null) fs.closeSync(fd);
     appProcess?.kill();
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
