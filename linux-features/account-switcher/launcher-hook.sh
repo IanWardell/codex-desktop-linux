@@ -67,7 +67,6 @@ recover_interrupted_handoff() {
     local -a recovery_modes=()
     local -a recovery_contexts=()
     [[ "${CODEX_LINUX_ACCOUNT_SWITCHER_MIGRATION_PREPARED:-0}" != 1 ]] || return 0
-    [[ -z "${CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE:-}" ]] || return 0
     [[ -r "$handoff_file" ]] || return 0
     while IFS='=' read -r key value; do
         [[ "$key" =~ ^[a-z_][a-z0-9_]*$ ]] || continue

@@ -72,7 +72,7 @@ exec runuser -u "$test_user" -- \
         xdg-mime default codex-desktop.desktop x-scheme-handler/codex
 
         env CODEX_LINUX_DISABLE_USAGE_REPORTING=1 \
-            /opt/codex-source/start.sh --no-sandbox &
+            /usr/bin/codex-desktop &
         launcher_pid=$!
 
         # start.sh intentionally returns after a successful account handoff;

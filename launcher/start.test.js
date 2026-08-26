@@ -9,6 +9,16 @@ const test = require("node:test");
 
 const templatePath = path.join(__dirname, "start.sh.template");
 
+// Keep launcher tests independent of the environment of the app or agent
+// running the suite. Individual tests set any account-switcher state they need.
+for (const name of Object.keys(process.env)) {
+  if (name.startsWith("CODEX_LINUX_ACCOUNT_SWITCHER_") ||
+      name === "CODEX_ELECTRON_USER_DATA_PATH" ||
+      name === "CODEX_HOME") {
+    delete process.env[name];
+  }
+}
+
 // Launcher tests must never contact the production usage counter. Individual
 // reporting tests opt back in with an isolated fake curl executable.
 process.env.CODEX_LINUX_DISABLE_USAGE_REPORTING = "1";
@@ -312,6 +322,11 @@ exit 0
     XDG_CONFIG_HOME: configHome,
     XDG_DATA_HOME: path.join(home, ".local", "share"),
     TEST_ROOT: root,
+    // The handoff record, not a stale inherited internal environment, owns
+    // concurrent-launch routing while the original launcher is cleaning up.
+    CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE: "work",
+    CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT: "shared-local",
+    CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT_ID: "stale-context",
   };
   const first = childProcess.spawn(path.join(root, "start.sh"), [], { env });
   waitForFile(path.join(root, "cleanup-entered"));

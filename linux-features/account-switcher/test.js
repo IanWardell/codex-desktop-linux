@@ -9,6 +9,16 @@ const { spawn, spawnSync } = require("node:child_process");
 const { DatabaseSync } = require("node:sqlite");
 const test = require("node:test");
 
+// Keep feature tests independent of the environment of the app or agent
+// running the suite. Individual tests set any account-switcher state they need.
+for (const name of Object.keys(process.env)) {
+  if (name.startsWith("CODEX_LINUX_ACCOUNT_SWITCHER_") ||
+      name === "CODEX_ELECTRON_USER_DATA_PATH" ||
+      name === "CODEX_HOME") {
+    delete process.env[name];
+  }
+}
+
 function processIdentity(pid = process.pid) {
   const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
   const fields = raw.slice(raw.lastIndexOf(") ") + 2).trim().split(/\s+/);
@@ -71,9 +81,12 @@ function waitForFile(filePath, timeoutMs = 5000) {
 
 test("Docker desktop supervisor survives Codex exits and account handoffs", () => {
   const entrypoint = fs.readFileSync(path.join(__dirname, "docker-test", "entrypoint.sh"), "utf8");
+  const wrapper = fs.readFileSync(path.join(__dirname, "docker-test", "codex-desktop"), "utf8");
   const menu = fs.readFileSync(path.join(__dirname, "docker-test", "openbox-menu.xml"), "utf8");
   assert.doesNotMatch(entrypoint, /exec env CODEX_LINUX_DISABLE_USAGE_REPORTING/);
-  assert.match(entrypoint, /\/opt\/codex-source\/start\.sh --no-sandbox &/);
+  assert.match(entrypoint, /\/usr\/bin\/codex-desktop &/);
+  assert.match(wrapper, /export APPIMAGE="\$\{BASH_SOURCE\[0\]\}"/);
+  assert.match(wrapper, /\/opt\/codex-source\/start\.sh --no-sandbox "\$@"/);
   assert.match(entrypoint, /desktop_pids=\("\$xvfb_pid" "\$openbox_pid" "\$x11vnc_pid" "\$websockify_pid"\)/);
   assert.match(entrypoint, /while true; do[\s\S]*kill -0 "\$desktop_pid"/);
   assert.match(entrypoint, /Codex launcher exited with status .*desktop remains available/);

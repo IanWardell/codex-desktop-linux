@@ -3,4 +3,5 @@ set -Eeuo pipefail
 
 # Docker-only sandbox adaptation. Production packages use the native launcher
 # and AppArmor policy and must never add --no-sandbox automatically.
+export APPIMAGE="${BASH_SOURCE[0]}"
 exec /opt/codex-source/start.sh --no-sandbox "$@"
