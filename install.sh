@@ -133,6 +133,7 @@ build_from_upstream_package() {
         cp "$CODEX_PATCH_REPORT_RESOLVED" "$INSTALL_DIR/.codex-linux/patch-report.json"
     fi
     write_build_info "$UPSTREAM_DEB_PATH" "$metadata_path"
+    normalize_install_tree_permissions "$INSTALL_DIR"
 }
 
 main() {

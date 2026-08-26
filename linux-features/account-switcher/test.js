@@ -79,21 +79,6 @@ function waitForFile(filePath, timeoutMs = 5000) {
   assert.equal(fs.existsSync(filePath), true, `timed out waiting for ${filePath}`);
 }
 
-test("Docker desktop supervisor survives Codex exits and account handoffs", () => {
-  const entrypoint = fs.readFileSync(path.join(__dirname, "docker-test", "entrypoint.sh"), "utf8");
-  const wrapper = fs.readFileSync(path.join(__dirname, "docker-test", "codex-desktop"), "utf8");
-  const menu = fs.readFileSync(path.join(__dirname, "docker-test", "openbox-menu.xml"), "utf8");
-  assert.doesNotMatch(entrypoint, /exec env CODEX_LINUX_DISABLE_USAGE_REPORTING/);
-  assert.match(entrypoint, /\/usr\/bin\/codex-desktop &/);
-  assert.match(wrapper, /export APPIMAGE="\$\{BASH_SOURCE\[0\]\}"/);
-  assert.match(wrapper, /\/opt\/codex-source\/start\.sh --no-sandbox "\$@"/);
-  assert.match(entrypoint, /desktop_pids=\("\$xvfb_pid" "\$openbox_pid" "\$x11vnc_pid" "\$websockify_pid"\)/);
-  assert.match(entrypoint, /while true; do[\s\S]*kill -0 "\$desktop_pid"/);
-  assert.match(entrypoint, /Codex launcher exited with status .*desktop remains available/);
-  assert.match(menu, /<execute>\/usr\/bin\/codex-desktop<\/execute>/);
-  assert.match(menu, /<execute>\/usr\/bin\/epiphany<\/execute>/);
-});
-
 function runLogoutMonitorScenario({ activeAuth, fallbackAuth, loginPendingMs = null, removeActiveAuth = false, expectIdle = false }) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-logout-"));
   const home = path.join(tempDir, "home");

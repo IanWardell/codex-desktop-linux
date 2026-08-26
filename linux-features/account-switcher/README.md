@@ -125,15 +125,3 @@ Then rebuild the app and run the focused tests:
 ```bash
 node --test linux-features/account-switcher/test.js
 ```
-
-For an isolated browser/login lifecycle test, build the repository Docker
-harness and mount the generated app read-only:
-
-```bash
-docker build -t codex-account-switcher-gui:test \
-  -f linux-features/account-switcher/docker-test/Dockerfile .
-```
-
-The harness uses the production desktop entry and launcher for `codex://`
-callbacks. Its `--no-sandbox` wrapper and WebKitGTK sandbox escape hatch are
-strictly Docker-test-only and are not installed by native packages.
