@@ -183,6 +183,9 @@ test("main patch is idempotent and fails closed on anchor drift", () => {
   const patched = applyMainBundlePatch(fixture);
   assert.match(patched, new RegExp(MAIN_MARKER));
   assert.equal(applyMainBundlePatch(patched), patched);
+  const currentAlias = applyMainBundlePatch("trusted=e=>H.isTrustedIpcSender(e.sender,e.senderFrame??null);");
+  assert.match(currentAlias, new RegExp(MAIN_MARKER));
+  assert.match(currentAlias, /if\(!trusted\(codexLinuxAccountSwitcherEvent\)\)/);
   const missing = fixture.replace("be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);", "");
   assert.equal(applyMainBundlePatch(missing), missing);
   assert.equal(applyMainBundlePatch(fixture + fixture), fixture + fixture);

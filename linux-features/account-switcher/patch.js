@@ -230,8 +230,18 @@ function replaceOnce(source, needle, replacement, description) {
 
 function applyMainBundlePatch(source) {
   if (source.includes(MAIN_MARKER)) return source;
-  const needle = "be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);";
-  return replaceOnce(source, needle, needle + MAIN_RUNTIME, "trusted Electron IPC anchor");
+  const anchorPattern = /([A-Za-z_$][\w$]*)=e=>[A-Za-z_$][\w$]*\.isTrustedIpcSender\(e\.sender,e\.senderFrame\?\?null\);/g;
+  const matches = [...source.matchAll(anchorPattern)];
+  if (matches.length !== 1) {
+    console.warn(`WARN: Expected one trusted Electron IPC anchor, found ${matches.length} - skipping account-switcher patch`);
+    return source;
+  }
+  const [needle, trustedPredicate] = matches[0];
+  const runtime = trustedPredicate === "be"
+    ? MAIN_RUNTIME
+    : MAIN_RUNTIME.replace(/\bbe\(/g, `${trustedPredicate}(`);
+  const offset = matches[0].index + needle.length;
+  return source.slice(0, offset) + runtime + source.slice(offset);
 }
 
 function applyPreloadPatch(extractedDir) {
