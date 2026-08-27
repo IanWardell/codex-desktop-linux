@@ -31,7 +31,7 @@ const codexLinuxAccountSwitcherRemoveCompletePath=codexLinuxAccountSwitcherPath.
 const codexLinuxAccountSwitcherBaseCodexHome=process.env.CODEX_LINUX_ACCOUNT_SWITCHER_BASE_CODEX_HOME||process.env.CODEX_HOME||codexLinuxAccountSwitcherPath.join(codexLinuxAccountSwitcherHome,".codex");
 const codexLinuxAccountSwitcherIdPattern=/^[a-z0-9][a-z0-9._-]{0,63}$/;
 function codexLinuxAccountSwitcherId(value){
-  return typeof value==="string"&&codexLinuxAccountSwitcherIdPattern.test(value)?value:null;
+  return typeof value==="string"&&value!=="."&&value!==".."&&codexLinuxAccountSwitcherIdPattern.test(value)?value:null;
 }
 function codexLinuxAccountSwitcherNewId(value){const id=typeof value==="string"?value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g,"-").replace(/^-+|-+$/g,"").slice(0,64):"";return codexLinuxAccountSwitcherId(id)}
 function codexLinuxAccountSwitcherProfilePath(id){const valid=codexLinuxAccountSwitcherId(id);if(!valid)throw Error("Invalid account profile id");const root=codexLinuxAccountSwitcherPath.resolve(codexLinuxAccountSwitcherDataHome,"codex-desktop","account-profiles"),candidate=codexLinuxAccountSwitcherPath.resolve(root,valid);if(candidate!==root&&!candidate.startsWith(root+codexLinuxAccountSwitcherPath.sep))throw Error("Account profile path escaped its managed root");return candidate}

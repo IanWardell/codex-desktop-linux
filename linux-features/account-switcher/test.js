@@ -810,18 +810,37 @@ test("JS and shell reject profile IDs outside the path-contained contract", () =
     const home = path.join(tempDir, "home");
     const configDir = path.join(home, ".config", "codex-desktop");
     fs.mkdirSync(configDir, { recursive: true });
-    fs.writeFileSync(path.join(configDir, "account-switcher.active"), "../escape\nisolated\ndefault\n", { mode: 0o600 });
-    const shellResult = spawnSync("bash", [path.join(__dirname, "launcher-hook.sh")], {
-      env: { HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: path.join(home, ".local", "share") },
-      encoding: "utf8",
-    });
-    assert.equal(shellResult.status, 1);
-    assert.match(shellResult.stderr, /refusing invalid profile id/);
+    for (const id of ["../escape", ".", ".."]) {
+      fs.writeFileSync(path.join(configDir, "account-switcher.active"), `${id}\nisolated\ndefault\n`, { mode: 0o600 });
+      const shellResult = spawnSync("bash", [path.join(__dirname, "launcher-hook.sh")], {
+        env: { HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: path.join(home, ".local", "share") },
+        encoding: "utf8",
+      });
+      assert.equal(shellResult.status, 1, `shell accepted ${id}`);
+      assert.match(shellResult.stderr, /refusing invalid profile id/);
+    }
 
     const patched = applyMainBundlePatch("be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);");
     assert.match(patched, /const codexLinuxAccountSwitcherIdPattern=\/\^\[a-z0-9\]\[a-z0-9\._-\]\{0,63\}\$\//);
+    assert.match(patched, /value!=="\."&&value!=="\.\."&&codexLinuxAccountSwitcherIdPattern\.test\(value\)/);
+    const resultPath = path.join(tempDir, "js-id-results.json");
+    const fixture = `
+const fs=require("node:fs");
+const V={isTrustedIpcSender:()=>true};let handler;
+const l={app:{whenReady:()=>new Promise(()=>{}),once:()=>{},quit:()=>{}},ipcMain:{handle:(name,value)=>{handler=value}}};
+let be;be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);
+setImmediate(async()=>{const rejected=[];for(const id of [".",".."])try{await handler({sender:{},senderFrame:{}},{action:"create",id,name:id});rejected.push(false)}catch{rejected.push(true)}const valid=await handler({sender:{},senderFrame:{}},{action:"create",id:"work",name:"Work"});fs.writeFileSync(${JSON.stringify(resultPath)},JSON.stringify({rejected,valid:valid.profile.id}));process.exit(0)});
+`;
+    const jsResult = spawnSync(process.execPath, ["-e", applyMainBundlePatch(fixture)], {
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: path.join(home, ".local", "share") },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(jsResult.status, 0, `${jsResult.stderr}\n${jsResult.stdout}`);
+    assert.deepEqual(JSON.parse(fs.readFileSync(resultPath, "utf8")), { rejected: [true, true], valid: "work" });
     const sharedState = fs.readFileSync(path.join(__dirname, "shared-state.sh"), "utf8");
     assert.match(sharedState, /ACCOUNT_SWITCHER_ID_RE='\^\[a-z0-9\]\[a-z0-9\._-\]\{0,63\}\$'/);
+    assert.match(sharedState, /"\$\{1:-\}" != \. && "\$\{1:-\}" != \.\./);
     const launcher = fs.readFileSync(path.join(__dirname, "launcher-hook.sh"), "utf8");
     assert.match(launcher, /account_switcher_validate_id "\$profile_id"/);
     assert.doesNotMatch(launcher, /\[a-z0-9\]\[a-z0-9\._-\]/);

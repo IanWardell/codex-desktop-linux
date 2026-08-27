@@ -61,7 +61,7 @@ account_switcher_read_process_identity() {
 }
 
 account_switcher_validate_id() {
-    [[ "${1:-}" =~ $ACCOUNT_SWITCHER_ID_RE ]]
+    [[ "${1:-}" != . && "${1:-}" != .. && "${1:-}" =~ $ACCOUNT_SWITCHER_ID_RE ]]
 }
 
 account_switcher_durable_replace() {
