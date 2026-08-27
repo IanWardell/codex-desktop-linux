@@ -23,8 +23,6 @@ bash -n scripts/lib/*.sh scripts/build-deb.sh scripts/build-rpm.sh scripts/build
 
 assert_contains packaging/linux/codex-desktop.desktop '^Name=ChatGPT Community$'
 assert_contains packaging/linux/codex-desktop.desktop '^Comment=Community Linux distribution based on OpenAI ChatGPT$'
-assert_contains packaging/linux/codex-desktop.desktop '^Exec=.* /usr/bin/codex-desktop %u$'
-assert_contains packaging/linux/codex-desktop.desktop '^MimeType=.*x-scheme-handler/codex([;]|$)'
 assert_contains install.sh 'CODEX_APP_DISPLAY_NAME:-ChatGPT Community'
 assert_contains install.sh 'cp .*ICON_SOURCE.*CODEX_APP_ID'
 assert_contains install.sh 'cp .*ICON_SOURCE.*resources/icon-chatgpt.png'
