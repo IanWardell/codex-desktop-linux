@@ -35,20 +35,6 @@ remove_tree_safely() {
     rm -rf -- "$path"
 }
 
-normalize_install_tree_permissions() {
-    local root="$1"
-    [ -d "$root" ] && [ ! -L "$root" ] || error "Install tree must be a real directory: $root"
-
-    # Builds may run under a restrictive caller umask. The extracted official
-    # application and generated community metadata are runtime payloads, not
-    # user secrets, and must remain readable after packaging, bind mounting,
-    # or installation by a different user. Preserve executable classification
-    # while matching the permission normalization used by native packages.
-    find -P "$root" -type d -exec chmod 0755 {} +
-    find -P "$root" -type f \( -perm /u=x -o -perm /g=x -o -perm /o=x \) -exec chmod 0755 {} +
-    find -P "$root" -type f ! \( -perm /u=x -o -perm /g=x -o -perm /o=x \) -exec chmod 0644 {} +
-}
-
 cleanup() {
     remove_tree_safely "$WORK_DIR"
 }

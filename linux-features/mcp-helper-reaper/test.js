@@ -39,20 +39,6 @@ function run(command, args, options = {}) {
   return result;
 }
 
-async function waitForFileText(file, pattern, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const value = fs.readFileSync(file, "utf8");
-      if (pattern.test(value)) return value;
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.fail(`timed out waiting for ${pattern} in ${file}`);
-}
-
 test("stage hook installs the orphan reaper without wrapping node_repl", () => {
   const tempDir = makeTempDir("codex-mcp-helper-reaper-stage-");
   const appDir = path.join(tempDir, "app");
@@ -243,14 +229,14 @@ test("cold-start hook launches a short all-parent scan", async () => {
 
   run("bash", [COLD_START_HOOK, appDir, stateDir, logDir], {
     env: {
-      CODEX_MCP_HELPER_REAPER_DISABLE: "0",
       CODEX_MCP_HELPER_REAPER_TEST_LOG: callLog,
       CODEX_MCP_HELPER_REAPER_DELAY: "0",
       CODEX_MCP_HELPER_REAPER_PASSES: "1",
     },
   });
 
-  const calls = await waitForFileText(callLog, /--all-codex-parents/);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const calls = fs.readFileSync(callLog, "utf8");
   assert.match(calls, /--all-codex-parents/);
   assert.match(calls, /--include-orphans/);
   assert.match(calls, /--app-dir /);

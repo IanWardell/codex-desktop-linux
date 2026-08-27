@@ -51,23 +51,6 @@ assert_absent packaging/linux/codex-packaged-runtime.sh '--if-stale'
 
 selector_fixture="$(mktemp -d)"
 trap 'rm -rf -- "$selector_fixture"' EXIT
-
-permission_fixture="$selector_fixture/install-permissions"
-permission_work="$selector_fixture/install-permissions-work"
-mkdir -p "$permission_fixture/.codex-linux/launcher.d" "$permission_fixture/resources" "$permission_work"
-printf '%s\n' runtime > "$permission_fixture/resources/app.asar"
-printf '%s\n' '#!/bin/sh' 'exit 0' > "$permission_fixture/ChatGPT"
-ln -s resources/app.asar "$permission_fixture/app-link"
-chmod 0700 "$permission_fixture" "$permission_fixture/.codex-linux" "$permission_fixture/.codex-linux/launcher.d" "$permission_fixture/resources"
-chmod 0600 "$permission_fixture/resources/app.asar"
-chmod 0700 "$permission_fixture/ChatGPT"
-WORK_DIR="$permission_work" bash -c '. scripts/lib/install-helpers.sh; normalize_install_tree_permissions "$1"; trap - EXIT' _ "$permission_fixture"
-[ "$(stat -c '%a' "$permission_fixture/.codex-linux/launcher.d")" = 755 ] || fail "install directories were not normalized"
-[ "$(stat -c '%a' "$permission_fixture/resources/app.asar")" = 644 ] || fail "runtime payload was not normalized"
-[ "$(stat -c '%a' "$permission_fixture/ChatGPT")" = 755 ] || fail "runtime executable was not normalized"
-[ -L "$permission_fixture/app-link" ] || fail "permission normalization replaced a symlink"
-[ "$(cat "$permission_fixture/resources/app.asar")" = runtime ] || fail "permission normalization changed payload bytes"
-
 touch -t 202608120900 "$selector_fixture/codex-desktop_2026.08.12.community_amd64.deb"
 touch -t 202608121000 "$selector_fixture/codex-desktop_2026.08.12.100000_amd64.deb"
 selected_package="$(scripts/select-latest-package.sh "$selector_fixture/codex-desktop_*.deb")"
