@@ -55,6 +55,57 @@ test("official Linux validation runs fully on every pull request but not hourly"
   assert.match(workflow, /^      - \.github\/workflows\/upstream-build-app\.yml$/m);
   const signedBaseline = job(workflow, "signed-baseline");
   assert.match(signedBaseline, /architecture: \[amd64, arm64\]/);
+  assert.match(signedBaseline, /name: Build required default baseline/);
+  assert.match(
+    signedBaseline,
+    /if ! cmp -s "\$upstream_root\/usr\/lib\/chatgpt\/resources\/app\.asar" "\$CODEX_INSTALL_DIR\/resources\/app\.asar"/,
+  );
+  assert.match(signedBaseline, /report\.enabledFeatures\.length !== 0/);
+  assert.match(signedBaseline, /report\.patches\.length !== 0/);
+  assert.match(signedBaseline, /report\.upstreamAppAsar\?\.preservedByteForByte !== true/);
+  assert.match(signedBaseline, /name: Require signed renderer dependency regression/);
+  assert.doesNotMatch(
+    signedBaseline,
+    /name: Require signed renderer dependency regression\n\s+if:/,
+  );
+  assert.match(signedBaseline, /EXPECTED_SIGNED_VERSION: \$\{\{ inputs\.version \}\}/);
+  assert.match(
+    signedBaseline,
+    /EXPECTED_SIGNED_REPOSITORY_PATH: \$\{\{ matrix\.architecture == 'amd64' && inputs\.amd64_repository_path \|\| inputs\.arm64_repository_path \}\}/,
+  );
+  assert.match(
+    signedBaseline,
+    /EXPECTED_SIGNED_SHA256: \$\{\{ matrix\.architecture == 'amd64' && inputs\.amd64_sha256 \|\| inputs\.arm64_sha256 \}\}/,
+  );
+  assert.match(signedBaseline, /process\.env\.GITHUB_EVENT_NAME === "workflow_dispatch"/);
+  assert.match(signedBaseline, /signed renderer regression is not bound to the expected campaign/);
+  assert.match(
+    signedBaseline,
+    /"\$upstream_root\/usr\/lib\/chatgpt\/resources\/app\.asar"/,
+  );
+  assert.match(signedBaseline, /function requireUniqueAsset\(pattern, description\)/);
+  assert.match(signedBaseline, /matches\.length !== 1/);
+  assert.match(
+    signedBaseline,
+    /requireUniqueAsset\(\/\^authed-route-\[A-Za-z0-9_-\]\+\\\.js\$\/, "authenticated route"\)/,
+  );
+  assert.match(
+    signedBaseline,
+    /requireUniqueAsset\(\/\^app-primary-\[A-Za-z0-9_-\]\+\\\.js\$\/, "primary application"\)/,
+  );
+  assert.doesNotMatch(
+    signedBaseline,
+    /["'](?:authed-route|app-primary)-[A-Za-z0-9_-]+\.js["']/,
+  );
+  assert.doesNotMatch(signedBaseline, /\b\d{2}\.\d{3}\.\d{5}\b/);
+  assert.doesNotMatch(
+    signedBaseline,
+    /pool\/main\/c\/chatgpt\/chatgpt_[^\s"']+\.deb/,
+  );
+  assert.doesNotMatch(signedBaseline, /\b[0-9a-f]{64}\b/);
+  assert.match(signedBaseline, /!authed\.includes\(`\.\/\$\{primaryName\}`\)/);
+  assert.match(signedBaseline, /const authedFingerprint = authedName\.slice/);
+  assert.match(signedBaseline, /primary\.includes\(reverseMarker\)/);
   assert.match(
     signedBaseline,
     /name: Validate the Nix ELF contract against the official payload[\s\S]*?env:\n          CODEX_INSTALL_DIR:.*matrix\.architecture[\s\S]*?nix\/elf-runtime\.cjs fix[\s\S]*?nix\/elf-runtime\.cjs audit/,

@@ -540,6 +540,23 @@ exit 0
 SCRIPT
 }
 
+stage_deb_maintainer_scripts() {
+    local root="$1"
+    local package_name="$2"
+    local postinst_template="$3"
+    local prerm_template="$4"
+    local postrm_template="$5"
+
+    mkdir -p "$root/DEBIAN"
+    sed \
+        -e "s|/opt/codex-desktop|/opt/$package_name|g" \
+        -e "s|codex_desktop_repair_system_package_shadow_entries codex-desktop|codex_desktop_repair_system_package_shadow_entries $package_name|g" \
+        "$postinst_template" > "$root/DEBIAN/postinst"
+    cp "$prerm_template" "$root/DEBIAN/prerm"
+    cp "$postrm_template" "$root/DEBIAN/postrm"
+    chmod 0755 "$root/DEBIAN/postinst" "$root/DEBIAN/prerm" "$root/DEBIAN/postrm"
+}
+
 write_no_updater_deb_prerm() {
     local target="$1"
     local package_name
@@ -990,11 +1007,11 @@ stage_enabled_native_feature_artifacts() {
         case "$feature_id" in
             computer-use-linux)
                 stage_update_builder_native_artifact \
-                    "$APP_DIR/resources/plugins/openai-bundled/plugins/computer-use/bin/codex-computer-use-linux" \
+                    "$APP_DIR/resources/plugins/openai-bundled/plugins/unified-computer-use/bin/codex-computer-use-linux" \
                     "$update_builder_root/target/release/codex-computer-use-linux" \
                     "$feature_id backend"
                 stage_update_builder_native_artifact \
-                    "$APP_DIR/resources/plugins/openai-bundled/plugins/computer-use/bin/codex-computer-use-cosmic" \
+                    "$APP_DIR/resources/plugins/openai-bundled/plugins/unified-computer-use/bin/codex-computer-use-cosmic" \
                     "$update_builder_root/target/release/codex-computer-use-cosmic" \
                     "$feature_id COSMIC helper"
                 ;;

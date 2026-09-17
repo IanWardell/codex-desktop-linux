@@ -87,14 +87,23 @@ test("non-Debian package formats map the official runtime libraries", () => {
   const pacman = fs.readFileSync(path.join(repoRoot, "packaging/linux/PKGBUILD.template"), "utf8");
   const flake = fs.readFileSync(path.join(repoRoot, "flake.nix"), "utf8");
 
-  for (const soname of ["libatspi.so.0", "libnotify.so.4", "libssl.so.3", "libusb-1.0.so.0", "libX11-xcb.so.1"]) {
+  for (const soname of [
+    "libatspi.so.0",
+    "libnotify.so.4",
+    "libssl.so.3",
+    "libtss2-esys.so.0",
+    "libtss2-mu.so.0",
+    "libtss2-tcti-device.so.0",
+    "libusb-1.0.so.0",
+    "libX11-xcb.so.1",
+  ]) {
     assert.match(rpm, new RegExp(soname.replaceAll(".", "\\.")));
   }
-  for (const packageName of ["libnotify", "libusb", "openssl", "systemd-libs", "xz"]) {
+  for (const packageName of ["libnotify", "libusb", "openssl", "systemd-libs", "tpm2-tss", "xz"]) {
     assert.match(pacman, new RegExp(`'${packageName}'`));
   }
   assert.match(rpm, /Requires:.*\bxz\b/);
-  for (const packageName of ["graphite2", "libglvnd", "openssl", "xz"]) {
+  for (const packageName of ["graphite2", "libglvnd", "openssl", "tpm2-tss", "xz"]) {
     assert.match(flake, new RegExp(`\\b${packageName}\\b`));
   }
 });
@@ -219,6 +228,31 @@ test("update-builder carries the shared feature compatibility registry", (t) => 
       },
     ),
     "",
+  );
+});
+
+test("update-builder stages the attached CLI resource", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-update-builder-attached-cli-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const config = path.join(root, "features.json");
+  const builder = path.join(root, "builder");
+  fs.writeFileSync(config, `${JSON.stringify({ enabled: ["shared-app-server-socket"] })}\n`);
+
+  runPackageCommon(
+    `CODEX_LINUX_FEATURES_CONFIG=${JSON.stringify(config)} stage_update_builder_linux_features_tree ${JSON.stringify(builder)}\n` +
+      `CODEX_LINUX_FEATURES_CONFIG=${JSON.stringify(config)} stage_update_builder_linux_features_config ${JSON.stringify(builder)}`,
+    root,
+  );
+
+  const staged = path.join(
+    builder,
+    "linux-features/shared-app-server-socket/attached-cli.sh",
+  );
+  assert.equal(fs.lstatSync(staged).isFile(), true);
+  assert.equal(fs.statSync(staged).mode & 0o777, 0o755);
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(builder, "linux-features/features.json"), "utf8")),
+    { enabled: ["shared-app-server-socket"] },
   );
 });
 

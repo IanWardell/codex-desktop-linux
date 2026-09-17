@@ -3,6 +3,7 @@
 
 const assert = require("node:assert/strict");
 const { spawn, spawnSync } = require("node:child_process");
+const crypto = require("node:crypto");
 const { EventEmitter, once } = require("node:events");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -60,7 +61,7 @@ const CURRENT_REMOTE_RUNTIME_DECOY_ASSET =
 const CURRENT_REMOTE_TERMINAL_STATUS_ASSET =
   CURRENT_REMOTE_RUNTIME_ASSET;
 const CURRENT_APP_MAIN_PAGE_ASSET = CURRENT_REMOTE_RUNTIME_ASSET;
-const CURRENT_REMOTE_CONNECTIONS_VISIBILITY_ASSET = CURRENT_REMOTE_RUNTIME_ASSET;
+const CURRENT_REMOTE_CONNECTIONS_VISIBILITY_ASSET = "app-primary-visibility-test.js";
 const CURRENT_REMOTE_LOAD_GATE_ASSET = CURRENT_REMOTE_RUNTIME_ASSET;
 const OLD_REMOTE_LOAD_GATE_ASSET =
   "app-initial~artifact-tab-content.electron~notebook-preview-panel~app-main~business-checkout~hm0a50up-test.js";
@@ -73,7 +74,7 @@ function syntheticReasoningSummaryTurnStartBundle() {
 }
 
 function syntheticCurrentReasoningSummaryTurnStartBundle() {
-  return "async function HWt(e,t,n,r,i,a,o){let s=n.request,N=a.latestThreadSettings,S=a.initialParams,ye=N?.summary??`none`;S?.summary!==void 0&&(ye=S.summary),o.reasoningSummaryOverride!=null&&(ye=o.reasoningSummaryOverride),s.summary!==void 0&&(ye=s.summary);logger.info(`Reasoning summary turn-start config resolved`,{safe:{summary:ye}});return{summary:ye}}async function QWt(e,t,n,r,i,a){return await HWt(e,t,n,r,i,a,{canUseProjectlessWorkspace:!gh(e.getHostId())||a.mode===`durable`||!1,canMaterializeCodexHomeRoots:!gh(e.getHostId())&&!0,reasoningSummaryOverride:e.getDefaultFeatureOverride(`concurrent_reasoning_summaries`)===!0?`detailed`:null})}";
+  return "async function HWt(e,t,n,r,i,a,o){let s=n.request,N=a.latestThreadSettings,S=a.initialParams,ye=N?.summary??`none`;S?.summary!==void 0&&(ye=S.summary),o.reasoningSummaryOverride!=null&&(ye=o.reasoningSummaryOverride),s.summary!==void 0&&(ye=s.summary);logger.info(`Reasoning summary turn-start config resolved`,{safe:{summary:ye}});return{summary:ye}}async function QWt(e,t,n,r,i,a){return await HWt(e,t,n,r,i,a,{canUseProjectlessWorkspace:!gh(e.getHostId()),canMaterializeCodexHomeRoots:!gh(e.getHostId())&&!0,preserveWorkspaceSandboxPolicyWithDefault:gh(e.getHostId()),carryProjectlessRuntimeRoots:!gh(e.getHostId()),latestUseAppServerPermissionDefault:!0,reasoningSummaryOverride:e.getDefaultFeatureOverride(`concurrent_reasoning_summaries`)===!0?`detailed`:null})}";
 }
 
 test("remote mobile README assigns every descriptor to one control topology", () => {
@@ -118,8 +119,8 @@ function syntheticMainBundle() {
   return [
     'let i=require("node:path"),o=require("node:fs"),s=require("node:crypto"),h=require("node:child_process"),b={createRequire:()=>()=>({})};',
     "function TV(e){return Buffer.from(JSON.stringify(e),`utf8`)}",
-    "var bV=(0,b.createRequire)(__filename),xV=`remote-control-device-key.node`,SV=`codex-device-key-sign-payload/v1`;",
-    "function wV({resourcesPath:e}){let t=null,n=()=>{if(process.platform!==`darwin`&&process.platform!==`win32`)throw Error(`Remote control device keys are only available on macOS and Windows`);if(e==null)throw Error(`Remote control device keys require resourcesPath`);return t??=bV(i.join(e,`native`,xV)),t};return{createDeviceKey:e=>n().createDeviceKey(e??`hardware_only`),deleteDeviceKey:e=>n().deleteDeviceKey(e),getDeviceKeyPublic:e=>n().getDeviceKeyPublic(e),signDeviceKey:async(e,t)=>{let r=TV(t);return{...await n().signDeviceKey(e,r),signedPayloadBase64:r.toString(`base64`)}}}}",
+    "var bV=(0,b.createRequire)(__filename),xV=`remote-control-device-key.node`,SV=`codex-device-key-sign-payload/v1`,wV=class{resourcesPath;addon=null;constructor(e){this.resourcesPath=e}createDeviceKey(e){return this.getAddon().createDeviceKey(e??`hardware_only`)}deleteDeviceKey(e){return this.getAddon().deleteDeviceKey(e)}getDeviceKeyPublic(e){return this.getAddon().getDeviceKeyPublic(e)}async signDeviceKey(e,t){let n=TV(t);return{...await this.getAddon().signDeviceKey(e,n),signedPayloadBase64:n.toString(`base64`)}}getAddon(){if(this.resourcesPath==null)throw Error(`Remote control device keys require resourcesPath`);return this.addon??=bV(i.join(this.resourcesPath,`native`,xV)),this.addon}};",
+    "function Owner(){this.remoteControlDeviceKeyClient=new wV(null),this.executionHostRegistry={}}",
     "async function mV({codexHome:e,hostConfig:n,logger:r=t.Jr()}){if(n.kind===`local`)try{await hV(i.default.join(e??t.Rr({hostConfig:n,preferWsl:t.Kr(n)}),pV))&&r.info(`Removed remote_control from config before app-server start`)}catch(e){r.warning(`Failed to remove remote_control before app-server start`,{safe:{},sensitive:{error:e}})}}",
   ].join("");
 }
@@ -128,8 +129,8 @@ function syntheticCurrentMainBundle() {
   return [
     'let i=require("node:path"),o=require("node:fs"),s=require("node:crypto"),h=require("node:child_process"),b={createRequire:()=>()=>({})};',
     "function mz(e){return Buffer.from(JSON.stringify({domain:`codex-device-key-sign-payload/v1`,payload:e}),`utf8`)}",
-    "var lz=(0,b.createRequire)(__filename),uz=`remote-control-device-key.node`,dz=`codex-device-key-sign-payload/v1`;",
-    "function pz({resourcesPath:e}){let t=null,n=()=>{if(process.platform!==`darwin`&&process.platform!==`win32`)throw Error(`Remote control device keys are only available on macOS and Windows`);if(e==null)throw Error(`Remote control device keys require resourcesPath`);return t??=lz((0,i.join)(e,`native`,uz)),t};return{createDeviceKey:e=>n().createDeviceKey(e??`hardware_only`),deleteDeviceKey:e=>n().deleteDeviceKey(e),getDeviceKeyPublic:e=>n().getDeviceKeyPublic(e),signDeviceKey:async(e,t)=>{let r=mz(t);return{...await n().signDeviceKey(e,r),signedPayloadBase64:r.toString(`base64`)}}}}",
+    "var lz=(0,b.createRequire)(__filename),uz=`remote-control-device-key.node`,dz=`codex-device-key-sign-payload/v1`,pz=class{resourcesPath;addon=null;constructor(e){this.resourcesPath=e}createDeviceKey(e){return this.getAddon().createDeviceKey(e??`hardware_only`)}deleteDeviceKey(e){return this.getAddon().deleteDeviceKey(e)}getDeviceKeyPublic(e){return this.getAddon().getDeviceKeyPublic(e)}async signDeviceKey(e,t){let n=mz(t);return{...await this.getAddon().signDeviceKey(e,n),signedPayloadBase64:n.toString(`base64`)}}getAddon(){if(this.resourcesPath==null)throw Error(`Remote control device keys require resourcesPath`);return this.addon??=lz((0,i.join)(this.resourcesPath,`native`,uz)),this.addon}};",
+    "function Owner(){this.remoteControlDeviceKeyClient=new pz(null),this.executionHostRegistry={}}",
     "async function vV({codexHome:e,hostConfig:n,logger:r=t.Jr()}){if(n.kind===`local`)try{await yV(i.default.join(e??t.Rr({hostConfig:n,preferWsl:t.Kr(n)}),_V))&&r.info(`Removed remote_control from config before app-server start`)}catch(e){r.warning(`Failed to remove remote_control before app-server start`,{safe:{},sensitive:{error:e}})}}",
   ].join("");
 }
@@ -138,9 +139,20 @@ function syntheticCryptoAliasCollisionMainBundle() {
   return [
     'let a=require("node:path"),o=require("node:fs"),c=require("node:crypto"),h=require("node:child_process"),b={createRequire:()=>()=>({})};',
     "function mz(e){return Buffer.from(JSON.stringify({domain:`codex-device-key-sign-payload/v1`,payload:e}),`utf8`)}",
-    "var lz=(0,b.createRequire)(__filename),uz=`remote-control-device-key.node`,dz=`codex-device-key-sign-payload/v1`;",
-    "function pz({resourcesPath:e}){let t=null,n=()=>{if(process.platform!==`darwin`&&process.platform!==`win32`)throw Error(`Remote control device keys are only available on macOS and Windows`);if(e==null)throw Error(`Remote control device keys require resourcesPath`);return t??=lz((0,a.join)(e,`native`,uz)),t};return{createDeviceKey:e=>n().createDeviceKey(e??`hardware_only`),deleteDeviceKey:e=>n().deleteDeviceKey(e),getDeviceKeyPublic:e=>n().getDeviceKeyPublic(e),signDeviceKey:async(e,t)=>{let r=mz(t);return{...await n().signDeviceKey(e,r),signedPayloadBase64:r.toString(`base64`)}}}}",
+    "var lz=(0,b.createRequire)(__filename),uz=`remote-control-device-key.node`,dz=`codex-device-key-sign-payload/v1`,pz=class{resourcesPath;addon=null;constructor(e){this.resourcesPath=e}createDeviceKey(e){return this.getAddon().createDeviceKey(e??`hardware_only`)}deleteDeviceKey(e){return this.getAddon().deleteDeviceKey(e)}getDeviceKeyPublic(e){return this.getAddon().getDeviceKeyPublic(e)}async signDeviceKey(e,t){let n=mz(t);return{...await this.getAddon().signDeviceKey(e,n),signedPayloadBase64:n.toString(`base64`)}}getAddon(){if(this.resourcesPath==null)throw Error(`Remote control device keys require resourcesPath`);return this.addon??=lz((0,a.join)(this.resourcesPath,`native`,uz)),this.addon}};",
+    "function Owner(){this.remoteControlDeviceKeyClient=new pz(null),this.executionHostRegistry={}}",
   ].join("");
+}
+
+function captureWarns(callback) {
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.map(String).join(" "));
+  try {
+    return { value: callback(), warnings };
+  } finally {
+    console.warn = originalWarn;
+  }
 }
 
 function createPatchedDeviceKeyClient(configHome, moduleOverrides = {}, processEnv = {}) {
@@ -164,7 +176,7 @@ function createPatchedDeviceKeyClient(configHome, moduleOverrides = {}, processE
     require: (moduleName) => moduleOverrides[moduleName] ?? require(moduleName),
     setTimeout,
   };
-  vm.runInNewContext(`${patched};module.exports=wV({resourcesPath:null});`, context);
+  vm.runInNewContext(`${patched};module.exports=new Owner().remoteControlDeviceKeyClient;`, context);
   return context.module.exports;
 }
 
@@ -339,9 +351,9 @@ function syntheticCurrentRemoteNotificationLifecycleBundle() {
     "function Of({conversationId:e,conversations:t,getWorkspaceBrowserRoot:n,getWorkspaceKind:r,hostId:i,setConversation:a,thread:o,threadsById:s,updateConversationState:c}){let h=o.status??null;if(t.has(e)){c(e,e=>{e.resumeState===`needs_resume`&&(e.threadRuntimeStatus=h)});return}}",
     "function xm(e,t,n,r){let i=e.items.find(e=>e.id===t);return i?i.type===n?i:(r.error(`Item has unexpected type`,{safe:{itemId:t,type:i.type,expectedType:n},sensitive:{}}),null):(r.error(`Item not found in turn state`,{safe:{itemId:t},sensitive:{}}),null)}",
     "function Sm(e,t){let n=e.items.findIndex(e=>e.id===t.id);n>=0?e.items[n]=t:e.items.push(t)}",
-    "function $dt(e,t,n){let{manager:r,notificationContext:i,automationTurns:a,createId:o}=e;switch(t.method){case`turn/started`:{let{threadId:n,turn:a}=t.params,s=Ul(n),c=i.threadStore.conversations.get(s);if(c==null){r.logger.error(`Received turn/started for unknown conversation`,{safe:{conversationId:s},sensitive:{}});break}r.updateConversationState(s,e=>{let t=e.turns.find(e=>e.turnId===a.id);t==null&&(t={turnId:a.id,status:a.status,items:[]},e.turns.push(t)),t.status=a.status});break}case`turn/completed`:{let{threadId:o,turn:s}=t.params,c=Ul(o);if(!i.threadStore.conversations.has(c)){a.delete(r.getHostId(),o,s.id),i.unread.discardTurn(c,s.id),r.logger.error(`Received turn/completed for unknown conversation`,{safe:{conversationId:c},sensitive:{}});break}r.updateConversationState(c,e=>{let t=e.turns.find(e=>e.turnId===s.id);t&&(t.status=s.status)});break}}}",
-    "function Sdt(e,t){let{manager:n,notificationContext:r,createId:i}=e;switch(t.method){case`item/started`:{let{item:a,threadId:o,turnId:s,startedAtMs:c}=t.params,l=Ul(o);if(!r.threadStore.conversations.has(l)){n.logger.error(`Received item/started for unknown conversation`,{safe:{conversationId:l},sensitive:{}});break}n.updateConversationState(l,e=>{let t=e.turns.find(e=>e.turnId===s);t&&Sm(t,{...a,completed:!1,startedAtMs:c})});break}case`item/completed`:{let{item:a,threadId:o,turnId:s,completedAtMs:c}=t.params;let l=Ul(o);if(a.type===`commandExecution`&&r.itemStreamState.clearItemTerminalInputBuffer(l,a.id),r.threadStore.conversations.get(l)==null){n.logger.error(`Received item/completed for unknown conversation`,{safe:{conversationId:l},sensitive:{}});break}n.updateConversationState(l,t=>{let o=t.turns.find(e=>e.turnId===s);if(!o)return;let d={...a,completed:!0,completedAtMs:c};Sm(o,d)});break}}}",
-    "function tLn(e,t,o){let{manager:n,notificationContext:r}=e;if(!(r.streamState.shouldIgnoreThreadMutationAsFollower(t.method,t.params,`notification`)||r.resumeNotificationBuffer.buffer(t,o)||r.threadStartedNotificationDeferral.bufferNotification(t,o)||o?.())){switch(t.method){case`turn/started`:case`turn/completed`:if($dt(e,t,o)===`deferred`)return;break;case`item/started`:case`item/completed`:if(Sdt(e,t)===`deferred`)return;break}r.events.emitNotification(t)}}",
+    "function $dt(e,t,n,r){let{manager:i,notificationContext:a,createId:o}=e;switch(t.method){case`turn/started`:{let{threadId:n,turn:r}=t.params,s=Ul(n),c=a.threadStore.conversations.get(s);if(c==null){i.logger.error(`Received turn/started for unknown conversation`,{safe:{conversationId:s},sensitive:{}});break}i.updateConversationState(s,e=>{let t=e.turns.find(e=>e.turnId===r.id);t==null&&(t={turnId:r.id,status:r.status,items:[]},e.turns.push(t)),t.status=r.status});break}case`turn/completed`:{let{threadId:o,turn:s}=t.params,c=Ul(o);if(!a.threadStore.conversations.has(c)){a.unread.discardTurn(c,s.id),i.logger.error(`Received turn/completed for unknown conversation`,{safe:{conversationId:c},sensitive:{}});break}i.updateConversationState(c,e=>{let t=e.turns.find(e=>e.turnId===s.id);t&&(t.status=s.status,e.automationCapability=n)});break}}}",
+    "function Sdt(e,t,n){let{manager:r,notificationContext:i,createId:a}=e;switch(t.method){case`item/started`:{let{item:o,threadId:s,turnId:c,startedAtMs:l}=t.params,u=Ul(s);if(!i.threadStore.conversations.has(u)){r.logger.error(`Received item/started for unknown conversation`,{safe:{conversationId:u},sensitive:{}});break}r.updateConversationState(u,e=>{let t=e.turns.find(e=>e.turnId===c);t&&Sm(t,{...o,completed:!1,startedAtMs:l})});break}case`item/completed`:{let{item:o,threadId:s,turnId:c,completedAtMs:l}=t.params;let u=Ul(s);if(o.type===`commandExecution`&&i.itemStreamState.clearItemTerminalInputBuffer(u,o.id),i.threadStore.conversations.get(u)==null){r.logger.error(`Received item/completed for unknown conversation`,{safe:{conversationId:u},sensitive:{}});break}r.updateConversationState(u,t=>{let s=t.turns.find(e=>e.turnId===c);if(!s)return;let d={...o,completed:!0,completedAtMs:l};Sm(s,d)});break}}}",
+    "function bn(e,t){return{method:e,params:t}}function tLn(e,t,n,r,o){let a=bn(t,n),u=a.method===`turn/completed`&&r?.threadId===a.params.threadId&&r.turnId===a.params.turn.id?r:null,s={notification:a,automationCapability:u},{manager:c,notificationContext:l}=e;if(!(l.streamState.shouldIgnoreThreadMutationAsFollower(a.method,a.params,`notification`)||l.resumeNotificationBuffer.buffer(s,o)||l.threadStartedNotificationDeferral.bufferNotification(s,o)||o?.())){switch(a.method){case`turn/started`:case`turn/completed`:if($dt(e,a,u,o)===`deferred`)return;break;case`item/started`:case`item/completed`:if(Sdt(e,a,u)===`deferred`)return;break}l.events.emitNotification(a)}}",
   ].join("");
 }
 
@@ -366,7 +378,7 @@ function syntheticAppServerManagerStatusBundle() {
     "function wO(e,t){return e.bump(t)}",
     "function TO(e,t,n){return e.current(t)===n}",
     "function PO(e,t,n){return e.set(bO,t,n)}",
-    "function SO(e,t){let n=t.getHostId(),r=wO(e,n),i=e.get(bO,n);t.addNotificationCallback(`remoteControl/status/changed`,({params:t})=>{TO(e,n,r)&&PO(e,n,t)}),t.sendRequest(`remoteControl/status/read`,void 0).then(t=>{e.get(bO,n)===i&&TO(e,n,r)&&PO(e,n,t)}).catch(t=>{TO(e,n,r)&&z.error(`Failed to read remote-control status`,{safe:{},sensitive:{error:t}})})}",
+    "function SO(e,t){let n=t.getHostId();if(NO(n))return;let r=wO(e,n),i=e.get(bO,n);t.addNotificationCallback(`remoteControl/status/changed`,({params:t})=>{TO(e,n,r)&&PO(e,n,t)}),t.sendRequest(`remoteControl/status/read`,void 0).then(t=>{e.get(bO,n)===i&&TO(e,n,r)&&PO(e,n,t)}).catch(t=>{TO(e,n,r)&&z.error(`Failed to read remote-control status`,{safe:{},sensitive:{error:t}})})}",
   ].join("");
 }
 
@@ -983,9 +995,60 @@ test("remote mobile control feature exposes opt-in main-bundle and webview patch
     );
     assert.ok(visibilityDescriptor);
     assert.equal(visibilityDescriptor.pattern.test("remote-connections-settings-fixture.js"), false);
+    assert.equal(visibilityDescriptor.pattern.test(CURRENT_REMOTE_RUNTIME_ASSET), false);
     assert.equal(visibilityDescriptor.pattern.test(CURRENT_REMOTE_CONNECTIONS_VISIBILITY_ASSET), true);
     assert.equal(visibilityDescriptor.pattern.test("use-plugin-install-flow-fixture.js"), false);
     assert.equal(visibilityDescriptor.pattern.test("app-main-fixture.js"), false);
+    const currentVisibilityOwner = syntheticCurrentUsePluginVisibilityBundle();
+    const patchedVisibilityOwner = applyLinuxRemoteControlVisibilityPatch(currentVisibilityOwner);
+    assert.equal(
+      visibilityDescriptor.assetMatch(
+        currentVisibilityOwner,
+        CURRENT_REMOTE_CONNECTIONS_VISIBILITY_ASSET,
+        {},
+      ),
+      true,
+    );
+    assert.equal(
+      visibilityDescriptor.assetMatch(
+        patchedVisibilityOwner,
+        CURRENT_REMOTE_CONNECTIONS_VISIBILITY_ASSET,
+        {},
+      ),
+      true,
+    );
+    assert.equal(
+      visibilityDescriptor.assetMatch(
+        "function unrelated(){return!0}",
+        CURRENT_REMOTE_CONNECTIONS_VISIBILITY_ASSET,
+        {},
+      ),
+      false,
+    );
+    assert.equal(
+      visibilityDescriptor.assetMatch(
+        currentVisibilityOwner + currentVisibilityOwner,
+        CURRENT_REMOTE_CONNECTIONS_VISIBILITY_ASSET,
+        {},
+      ),
+      false,
+    );
+    assert.equal(
+      visibilityDescriptor.assetMatch(
+        currentVisibilityOwner + patchedVisibilityOwner,
+        CURRENT_REMOTE_CONNECTIONS_VISIBILITY_ASSET,
+        {},
+      ),
+      false,
+    );
+    assert.equal(
+      visibilityDescriptor.assetMatch(
+        patchedVisibilityOwner.replace("accessRequired!==!0", "accessRequired===!0"),
+        CURRENT_REMOTE_CONNECTIONS_VISIBILITY_ASSET,
+        {},
+      ),
+      false,
+    );
 
     const copyDescriptor = descriptors.find((descriptor) =>
       descriptor.id === "feature:remote-mobile-control:linux-remote-control-copy"
@@ -1076,7 +1139,7 @@ test("Linux remote-control feature patch updates the device-key provider", () =>
 
   assert.notEqual(patched, source);
   assert.match(patched, /codexLinuxRemoteControlDeviceKeyClient/);
-  assert.match(patched, /process\.platform===`linux`\)return codexLinuxRemoteControlDeviceKeyClient\(\)/);
+  assert.match(patched, /remoteControlDeviceKeyClient=process\.platform===`linux`\?codexLinuxRemoteControlDeviceKeyClient\(\):new wV/);
   assert.doesNotMatch(patched, /n\.kind===`local`&&process\.platform!==`linux`/);
   assert.equal(applyLinuxRemoteControlDeviceKeyPatch(patched), patched);
 });
@@ -1087,9 +1150,48 @@ test("Linux remote-control device-key patch handles current minified aliases", (
 
   assert.notEqual(patched, source);
   assert.match(patched, /codexLinuxRemoteControlDeviceKeyClient/);
-  assert.match(patched, /process\.platform===`linux`\)return codexLinuxRemoteControlDeviceKeyClient\(\)/);
+  assert.match(patched, /remoteControlDeviceKeyClient=process\.platform===`linux`\?codexLinuxRemoteControlDeviceKeyClient\(\):new pz/);
   assert.doesNotMatch(patched, /n\.kind===`local`&&process\.platform!==`linux`/);
   assert.equal(applyLinuxRemoteControlDeviceKeyPatch(patched), patched);
+});
+
+test("Linux remote-control device-key patch rejects incomplete current state", () => {
+  const source = `function codexLinuxRemoteControlDeviceKeyClient(){}${syntheticCurrentMainBundle()}`;
+  const warnings = captureWarns(() => applyLinuxRemoteControlDeviceKeyPatch(source));
+
+  assert.equal(warnings.value, source);
+  assert.match(warnings.warnings.join("\n"), /incomplete Linux remote-control device-key patch/u);
+});
+
+test("Linux remote-control device-key patch rejects ambiguous and unrelated anchors byte-identically", () => {
+  const source = syntheticMainBundle();
+  const requireAnchor =
+    "var bV=(0,b.createRequire)(__filename),xV=`remote-control-device-key.node`";
+  const providerStart = source.indexOf(",wV=class");
+  const providerEnd = source.indexOf(";function Owner") + 1;
+  const providerAnchor = source.slice(providerStart, providerEnd);
+  const construction =
+    "this.remoteControlDeviceKeyClient=new wV(null),this.executionHostRegistry";
+  const patched = applyLinuxRemoteControlDeviceKeyPatch(source);
+  const injectedProviderStart = patched.indexOf("function codexLinuxRemoteControlDeviceKeyClient");
+  const injectedProviderEnd = patched.indexOf(requireAnchor);
+  const partialPatched = patched.slice(0, injectedProviderStart) +
+    patched.slice(injectedProviderEnd);
+  const variants = {
+    "duplicate require anchor": source.replace(requireAnchor, `${requireAnchor};${requireAnchor}`),
+    "duplicate provider anchor": source.slice(0, providerEnd) + providerAnchor +
+      source.slice(providerEnd),
+    "duplicate construction anchor": `${source}function Other(){${construction}={}}`,
+    "provider linked to another require": source.replace("this.addon??=bV(", "this.addon??=otherRequire("),
+    "mixed current and patched construction": `${patched}function Other(){${construction}={}}`,
+    "partial patched state": partialPatched,
+  };
+
+  for (const [name, drifted] of Object.entries(variants)) {
+    const result = captureWarns(() => applyLinuxRemoteControlDeviceKeyPatch(drifted));
+    assert.equal(result.value, drifted, name);
+    assert.equal(result.warnings.length, 1, name);
+  }
 });
 
 test("Linux remote-control device-key provider does not capture a function-local child-process alias", () => {
@@ -1135,7 +1237,7 @@ test("Linux remote-control device-key provider avoids upstream minified alias co
       setTimeout,
     };
 
-    vm.runInNewContext(`${patched};module.exports=pz({resourcesPath:null});`, context);
+    vm.runInNewContext(`${patched};module.exports=new Owner().remoteControlDeviceKeyClient;`, context);
     const created = await context.module.exports.createDeviceKey("allow_os_protected_nonextractable");
     assert.equal(created.algorithm, "ecdsa_p256_sha256");
     assert.equal(created.protectionClass, "os_protected_nonextractable");
@@ -1543,14 +1645,14 @@ test("Linux remote-control feature sync does not advertise SSH hosts to mobile",
   assert.equal(hostCalls[1].params.enablement.remote_control, undefined);
 });
 
-test("Linux remote-control visibility patch handles current settings bundle shape", () => {
+test("Linux remote-control visibility patch rejects an owner without the current access gate", () => {
   const source = syntheticCurrentVisibilityBundle();
-  const patched = applyLinuxRemoteControlVisibilityPatch(source);
+  const { result, warnings } = captureWarnings(() =>
+    applyLinuxRemoteControlVisibilityPatch(source)
+  );
 
-  assert.notEqual(patched, source);
-  assert.match(patched, /navigator\.userAgent\.includes\(`Linux`\)/);
-  assert.match(patched, /return\(n\|\|t\)&&\(n\|\|\(e\?\.available\?\?!0\)\)&&e\?\.accessRequired!==!0/);
-  assert.equal(applyLinuxRemoteControlVisibilityPatch(patched), patched);
+  assert.equal(result, source);
+  assert.ok(warnings.some((warning) => warning.includes("unique remote-control visibility gate")));
 });
 
 test("Linux remote-control visibility patch handles current use-plugin gate shape", () => {
@@ -1945,24 +2047,29 @@ test("Linux remote mobile hydration buffers and replays late notifications", asy
     manager,
     notificationContext,
   };
-  manager.onNotification = (method, params, callback) =>
-    onNotification(reductionContext, { method, params }, callback);
+  manager.onNotification = (method, params, automationCapability = null, notificationCallback) =>
+    onNotification(reductionContext, method, params, automationCapability, notificationCallback);
   const callbackCalls = new Map();
   const callback = (name, result = false) => () => {
     callbackCalls.set(name, (callbackCalls.get(name) ?? 0) + 1);
     return result;
   };
+  const completionCapability = {
+    automationKind: "scheduled",
+    threadId: "thread-late",
+    turnId: "turn-1",
+  };
   const notifications = [
-    ["turn/started", { threadId: "thread-late", turn: { id: "turn-1", status: "inProgress" } }, callback("initiating")],
-    ["item/started", { threadId: "thread-late", turnId: "turn-1", item: { id: "item-1", type: "agentMessage" }, startedAtMs: 10 }, callback("buffered-started")],
-    ["item/started", { threadId: "thread-late", turnId: "turn-1", item: { id: "item-suppressed", type: "agentMessage" }, startedAtMs: 11 }, callback("buffered-suppressed", true)],
-    ["item/completed", { threadId: "thread-late", turnId: "turn-1", item: { id: "item-1", type: "agentMessage", text: "started then completed" }, completedAtMs: 20 }, callback("buffered-completed")],
-    ["item/completed", { threadId: "thread-late", turnId: "turn-1", item: { id: "item-2", type: "agentMessage", text: "completed without started" }, completedAtMs: 21 }, callback("buffered-completed-without-start")],
-    ["turn/completed", { threadId: "thread-late", turn: { id: "turn-1", status: "completed" } }, callback("buffered-turn-completed")],
+    ["turn/started", { threadId: "thread-late", turn: { id: "turn-1", status: "inProgress" } }, null, callback("initiating")],
+    ["item/started", { threadId: "thread-late", turnId: "turn-1", item: { id: "item-1", type: "agentMessage" }, startedAtMs: 10 }, null, callback("buffered-started")],
+    ["item/started", { threadId: "thread-late", turnId: "turn-1", item: { id: "item-suppressed", type: "agentMessage" }, startedAtMs: 11 }, null, callback("buffered-suppressed", true)],
+    ["item/completed", { threadId: "thread-late", turnId: "turn-1", item: { id: "item-1", type: "agentMessage", text: "started then completed" }, completedAtMs: 20 }, null, callback("buffered-completed")],
+    ["item/completed", { threadId: "thread-late", turnId: "turn-1", item: { id: "item-2", type: "agentMessage", text: "completed without started" }, completedAtMs: 21 }, null, callback("buffered-completed-without-start")],
+    ["turn/completed", { threadId: "thread-late", turn: { id: "turn-1", status: "completed" } }, completionCapability, callback("buffered-turn-completed")],
   ];
 
-  for (const [method, params, notificationCallback] of notifications) {
-    manager.onNotification(method, params, notificationCallback);
+  for (const [method, params, automationCapability, notificationCallback] of notifications) {
+    manager.onNotification(method, params, automationCapability, notificationCallback);
   }
 
   assert.equal(hydrationCalls, 1);
@@ -1992,6 +2099,7 @@ test("Linux remote mobile hydration buffers and replays late notifications", asy
   const hydratedConversation = conversations.get("thread-late");
   assert.equal(hydratedConversation.turns.length, 1);
   assert.equal(hydratedConversation.turns[0].status, "completed");
+  assert.equal(hydratedConversation.automationCapability, completionCapability);
   assert.deepEqual(
     Array.from(hydratedConversation.turns[0].items, (item) => ({
       completed: item.completed,
@@ -2018,9 +2126,9 @@ test("Linux remote mobile hydration recovery rejects partial lifecycle drift", (
   assert.ok(warnings.some((warning) => warning.includes("complete current remote notification recovery lifecycle")));
 });
 
-test("Linux remote mobile hydration rejects the retired two-argument dispatcher byte-identically", () => {
+test("Linux remote mobile hydration rejects a current dispatcher without its callback byte-identically", () => {
   const source = syntheticCurrentRemoteNotificationReductionBundle()
-    .replace("function tLn(e,t,o)", "function tLn(e,t)")
+    .replace("function tLn(e,t,n,r,o)", "function tLn(e,t,n,r)")
     .replace("||o?.()", "");
   const { result, warnings } = captureWarnings(() =>
     applyLinuxRemoteMobileConversationHydrationPatch(source));
@@ -2040,6 +2148,7 @@ test("Linux remote-control status guard skips slow remote SSH status reads", asy
   const context = {
     module: { exports: {} },
     navigator: { userAgent: "X11; Linux x86_64" },
+    NO: () => false,
     Promise,
     z: { error() {} },
   };
@@ -2638,7 +2747,7 @@ test("patched Linux device-key provider can create, sign with, and delete a key"
       setTimeout,
     };
 
-    vm.runInNewContext(`${patched};module.exports=wV({resourcesPath:null});`, context);
+    vm.runInNewContext(`${patched};module.exports=new Owner().remoteControlDeviceKeyClient;`, context);
     const client = context.module.exports;
     const created = await client.createDeviceKey("allow_os_protected_nonextractable");
     assert.equal(created.algorithm, "ecdsa_p256_sha256");
@@ -2655,6 +2764,28 @@ test("patched Linux device-key provider can create, sign with, and delete a key"
     assert.equal(signature.algorithm, "ecdsa_p256_sha256");
     assert.match(signature.signatureDerBase64, /^[A-Za-z0-9+/]+=*$/);
     assert.match(signature.signedPayloadBase64, /^[A-Za-z0-9+/]+=*$/);
+    const signedPayload = Buffer.from(signature.signedPayloadBase64, "base64");
+    assert.deepEqual(JSON.parse(signedPayload.toString("utf8")), {
+      domain: "codex-device-key-sign-payload/v1",
+      payload: {
+        type: "remoteControlClientEnrollment",
+        nonce: "test",
+      },
+    });
+    const publicKey = crypto.createPublicKey({
+      format: "der",
+      key: Buffer.from(created.publicKeySpkiDerBase64, "base64"),
+      type: "spki",
+    });
+    assert.equal(
+      crypto.verify(
+        "sha256",
+        signedPayload,
+        publicKey,
+        Buffer.from(signature.signatureDerBase64, "base64"),
+      ),
+      true,
+    );
 
     const storeDirectory = path.join(sharedConfigDirectory, "remote-control-device-keys");
     const storePath = path.join(storeDirectory, "remote-control-device-keys-v1.json");
@@ -3266,7 +3397,8 @@ test("remote mobile control feature participates in ASAR patching and reports", 
           syntheticAppMainActiveStatusBundle(),
         );
         const report = createPatchReport();
-        patchExtractedApp(tempApp, { report });
+        const patchOptions = { corePatchRoot: path.join(tempApp, "empty-core") };
+        patchExtractedApp(tempApp, { ...patchOptions, report });
 
         const patchedFile = fs.readFileSync(path.join(buildDir, "main.js"), "utf8");
         const patchedAppServerLaunchFile = fs.readFileSync(
@@ -3425,7 +3557,7 @@ test("remote mobile control feature participates in ASAR patching and reports", 
         );
 
         const secondReport = createPatchReport();
-        patchExtractedApp(tempApp, { report: secondReport });
+        patchExtractedApp(tempApp, { ...patchOptions, report: secondReport });
         assert.ok(
           secondReport.patches.some((patch) =>
             patch.name === "feature:remote-mobile-control:linux-remote-terminal-status-recovery" &&

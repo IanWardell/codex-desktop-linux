@@ -3,8 +3,16 @@
 Linux Computer Use is an opt-in UI surface backed by a native Rust MCP backend,
 `codex-computer-use-linux`. The official Linux package is the baseline, and the
 community integration is disabled until the `computer-use-linux` feature is
-explicitly enabled. Enabling it stages the Linux backend/plugin and the seven
+explicitly enabled. Enabling it stages the Linux backend/plugin and the
 feature-owned UI descriptors; none of them are default core patches.
+
+In Settings → Computer use, **Any App**
+controls native access independently of browser access. Use that row to install
+or enable native access on a fresh profile.
+
+The backend's capabilities are listed below. The in-app API exposes a subset;
+see [supported operations](../linux-features/computer-use-linux/README.md#supported-operations)
+for its limitations.
 
 It supports:
 
@@ -17,6 +25,13 @@ It supports:
   RemoteDesktop portal, `xdotool` on X11, or `ydotool`
 - pointer-direction feedback for the built-in V2 pet after successful click,
   scroll, and drag actions
+
+The in-app adapter returns a compact accessibility projection and suppresses an
+unchanged compact projection on repeated reads. Use `disableDiffing: true` for a
+fresh compact tree, or `compact: false` for complete backend metadata.
+`maxNodes`/`maxDepth` bound accessibility traversal; screenshot calls accept
+`maxWidth`, `maxHeight`, `maxBytes`, `scale`, `format`, and `quality`. Screenshot
+methods already emit the image and should not be emitted a second time.
 
 ## Runtime Dependencies
 
@@ -105,11 +120,11 @@ Community, ask Codex:
 You can also run the backend directly:
 
 ```bash
-./codex-app/resources/plugins/openai-bundled/plugins/computer-use/bin/codex-computer-use-linux doctor
-./codex-app/resources/plugins/openai-bundled/plugins/computer-use/bin/codex-computer-use-linux setup
-./codex-app/resources/plugins/openai-bundled/plugins/computer-use/bin/codex-computer-use-linux apps
-./codex-app/resources/plugins/openai-bundled/plugins/computer-use/bin/codex-computer-use-linux windows
-./codex-app/resources/plugins/openai-bundled/plugins/computer-use/bin/codex-computer-use-linux screenshot
+./codex-app/resources/plugins/openai-bundled/plugins/unified-computer-use/bin/codex-computer-use-linux doctor
+./codex-app/resources/plugins/openai-bundled/plugins/unified-computer-use/bin/codex-computer-use-linux setup
+./codex-app/resources/plugins/openai-bundled/plugins/unified-computer-use/bin/codex-computer-use-linux apps
+./codex-app/resources/plugins/openai-bundled/plugins/unified-computer-use/bin/codex-computer-use-linux windows
+./codex-app/resources/plugins/openai-bundled/plugins/unified-computer-use/bin/codex-computer-use-linux screenshot
 ```
 
 ## Enable The In-App UI
