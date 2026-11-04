@@ -29,7 +29,7 @@ let
     ];
   };
 
-  evalNixOS = moduleConfig: lib.evalModules {
+  evalNixOSWith = systemConfig: moduleConfig: lib.evalModules {
     specialArgs = { inherit pkgs; };
     modules = [
       nixosModule
@@ -38,13 +38,16 @@ let
           assertions = lib.mkOption { type = lib.types.listOf lib.types.anything; default = [ ]; };
           environment.systemPackages = lib.mkOption { type = lib.types.listOf lib.types.package; default = [ ]; };
           environment.sessionVariables = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
+          programs.nix-ld.enable = lib.mkOption { type = lib.types.bool; default = false; };
+          programs.nix-ld.libraries = lib.mkOption { type = lib.types.listOf lib.types.package; default = [ ]; };
           services.udev.packages = lib.mkOption { type = lib.types.listOf lib.types.package; default = [ ]; };
           systemd.user.services = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
         };
-        config.programs.codexDesktopLinux = moduleConfig;
+        config = lib.mkMerge [ { programs.codexDesktopLinux = moduleConfig; } systemConfig ];
       })
     ];
   };
+  evalNixOS = evalNixOSWith { };
 
   fakeDesktop = pkgs.runCommand "codex-desktop-module-test" { } ''
     mkdir -p "$out/bin" "$out/share/applications" "$out/opt/codex-desktop/resources"
@@ -59,6 +62,10 @@ let
     desktopPackage = fakeDesktop;
   };
   fakeCli = pkgs.writeShellScriptBin "codex" "exit 0";
+  fakeRuntimeLibrary = pkgs.runCommand "codex-desktop-module-test-library" { } "mkdir -p $out/lib";
+  fakeDesktopWithRuntime = fakeDesktop.overrideAttrs (_previous: {
+    passthru = { workspaceRuntimeLibraries = [ fakeRuntimeLibrary ]; };
+  });
   baseConfig = { enable = true; package = fakeDesktop; };
   bundledRemoteConfig = baseConfig // { remoteControl.enable = true; };
   remoteConfig = baseConfig // {
@@ -102,6 +109,16 @@ let
   assertionsFail = evaluated: lib.any (item: !item.assertion) evaluated.config.assertions;
   invalidHomeFiles = map (cfg: assertionsFail (evalHome cfg)) invalidEnvironmentFileConfigs;
   invalidNixOSFiles = map (cfg: assertionsFail (evalNixOS cfg)) invalidEnvironmentFileConfigs;
+  accountSwitcherPackage = packages.codex-desktop.override {
+    linuxFeatureIds = [ "account-switcher" ];
+  };
+  # hasInfix builds a regex, whose pattern cannot carry Nix store context.
+  # Only the comparison pattern loses context; the package keeps its dependency.
+  secretToolBin = builtins.unsafeDiscardStringContext "${lib.getBin pkgs.libsecret}/bin";
+  maximalPackages = [
+    packages.codex-desktop-maximal-directory-watch
+    packages.codex-desktop-maximal-shallow-watch
+  ];
 in
 assert lib.assertMsg
   (features.normalize [ "ui-tweaks" "ui-tweaks" "agent-workspace" ] == [ "agent-workspace" "ui-tweaks" ])
@@ -109,6 +126,12 @@ assert lib.assertMsg
 assert lib.assertMsg
   (features.normalize [ "record-and-replay" ] == [ "chronicle-skysight" "record-and-replay" ])
   "Nix feature dependencies were not added to an existing direct selection";
+assert lib.assertMsg
+  (features.normalize [ "global-dictation" ] == [ "global-dictation" ])
+  "dictation must remain independently selectable";
+assert lib.assertMsg
+  (features.normalize [ "wayland-global-shortcuts" ] == [ "wayland-global-shortcuts" ])
+  "Wayland shortcuts must remain independently selectable";
 assert lib.assertMsg
   (features.normalize [ "codex-wrapper-updater" "zed-opener" ] == [ ])
   "known retired and aliased-retired feature IDs were not ignored";
@@ -118,6 +141,25 @@ assert lib.assertMsg
 assert lib.assertMsg
   (!(builtins.tryEval (features.normalize [ "directory-only-working-tree-watch" "shallow-repository-watches" ])).success)
   "conflicting watcher features were accepted";
+assert lib.assertMsg
+  (!(builtins.tryEval (features.normalize [ "community-profile-isolation" "shared-app-server-socket" ])).success)
+  "Community profile isolation conflict with shared app-server socket was accepted";
+assert lib.assertMsg
+  (!(builtins.tryEval (features.normalize [ "account-switcher" "shared-app-server-socket" ])).success)
+  "Account switching conflict with shared app-server socket was accepted";
+assert lib.assertMsg
+  (lib.all (package:
+    let selected = package.passthru.linuxFeatureIds;
+    in features.normalize selected == selected
+      && lib.elem "shared-app-server-socket" selected
+      && !(lib.elem "account-switcher" selected)
+  ) maximalPackages)
+  "Maximal Nix profiles must retain the shared server without conflicting account switching";
+assert lib.assertMsg
+  (accountSwitcherPackage.passthru.linuxFeatureIds == [ "account-switcher" ]
+    && lib.hasInfix secretToolBin accountSwitcherPackage.installPhase
+    && !(lib.hasInfix secretToolBin packages.codex-desktop.installPhase))
+  "Account switching must remain selectable with its conditional Secret Service CLI runtime";
 assert lib.assertMsg
   (!features.optionType.check [ "not-a-feature" ]
     && features.optionType.check [ "codex-wrapper-updater" ])
@@ -132,6 +174,17 @@ assert lib.assertMsg
 assert lib.assertMsg
   (homeCliPackage.drvPath != fakeDesktop.drvPath && nixosCliPackage.drvPath != fakeDesktop.drvPath)
   "cliPackage did not wrap the Desktop launcher";
+assert lib.assertMsg
+  ((evalNixOSWith { programs.nix-ld.enable = true; } (baseConfig // { package = fakeDesktopWithRuntime; })).config.programs.nix-ld.libraries
+    == [ fakeRuntimeLibrary ])
+  "NixOS did not publish the workspace runtime libraries through nix-ld";
+assert lib.assertMsg
+  ((evalNixOS (baseConfig // { package = fakeDesktopWithRuntime; })).config.programs.nix-ld.libraries == [ ])
+  "NixOS set nix-ld libraries while nix-ld is disabled";
+assert lib.assertMsg
+  (lib.elem pkgs.lcms2.out packages.codex-desktop.passthru.workspaceRuntimeLibraries
+    && lib.elem pkgs.freetype packages.codex-desktop.passthru.workspaceRuntimeLibraries)
+  "the Desktop package does not expose its workspace runtime libraries";
 assert lib.assertMsg
   ((builtins.head (evalHome remoteConfig).config.home.packages).drvPath != fakeDesktop.drvPath)
   "Home Manager did not use the remote-control CLI fallback";

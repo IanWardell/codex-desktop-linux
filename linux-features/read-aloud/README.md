@@ -32,8 +32,11 @@ or:
 CODEX_LINUX_READ_ALOUD_ENABLED=1 codex-desktop
 ```
 
-The generated Read Aloud settings page also gets setup controls for machines
-where the default Kokoro paths are not ready:
+Settings > General gets a **Read Aloud** section. Its toggle and pace are
+stored in the same Linux `settings.json` that the main-process helper reads
+(`codex-linux-read-aloud-enabled` and `codex-linux-read-aloud-kokoro-speed`),
+and it has setup controls for machines where the default Kokoro paths are not
+ready:
 
 - `Choose folder` stores a folder that already contains `kokoro-v1.0.onnx` and
   `voices-v1.0.bin`.
@@ -41,6 +44,23 @@ where the default Kokoro paths are not ready:
   model files into the default data directory.
 - `Speech pace` controls Kokoro playback speed from `0.70x` to `1.40x`
   and stores the value in `codex-linux-read-aloud-kokoro-speed`.
+
+## How it is wired
+
+The official webview is an rspack build, so every patch finds its target by
+content, not by file name:
+
+- `main-handler` adds one `vscode://codex/linux-read-aloud` route to the
+  desktop fetch request entry, next to the official dictation route, and
+  answers with the same inline `fetch-response` view message. Only the two
+  read-aloud settings keys can be read or written through it.
+- `webview-runtime` appends the self-contained click, setup, and settings
+  runtime to the rspack runtime entry chunks (main and detached windows).
+- `assistant-runtime` wraps the two assistant message render calls of the
+  primary thread chunk with the speech icon button.
+- `settings-toggle` adds one host element to the General settings page; the
+  runtime renders the section into it, so the injected JSX references only the
+  page module's own JSX runtime.
 
 Nothing is downloaded during app install or on first launch.
 
@@ -68,6 +88,24 @@ below.
 
 Default speech uses an opt-in Kokoro ONNX runtime, similar in shape to `readd`
 but not dependent on a local `readd` checkout. The app stages only a tiny runner.
+The app selects a Kokoro voice and language code from the detected language;
+the first validation target is Chinese with `zf_xiaobei` and `cmn` using the
+existing v1.0 model/voice files.
+Automatic detection counts Unicode letters in the cleaned response and switches
+from English only when a supported script accounts for more than 60% of them.
+Digits, punctuation, whitespace and combining marks do not affect the count.
+Japanese combines Han and kana letters only when kana make up at least 20%
+of those letters; otherwise Han contributes to Chinese. This conservative
+guard keeps short kana examples from switching a Chinese response to Japanese.
+Kanji-heavy Japanese may need an explicit language override. Short non-Latin examples in a mostly English response
+therefore keep the English voice. Ties and other ambiguous text default to
+English; this is a character-count heuristic, not a general language detector.
+It chooses one voice for the whole response rather than switching voices
+between fragments, so occasional foreign words may be pronounced imperfectly.
+Set `CODEX_LINUX_READ_ALOUD_LANGUAGE` to an explicit language code (such as `es`,
+`fr`, `de`, `it`, or `pt`) to override automatic detection. Existing explicit Kokoro voice/language
+overrides also bypass automatic unsupported-language fallback; when no automatic
+Kokoro mapping exists, unspecified Kokoro values retain the English defaults.
 Users provide or download the model files and Python runtime outside the Electron
 bundle.
 
@@ -91,9 +129,10 @@ Runtime overrides:
 - `CODEX_LINUX_READ_ALOUD_KOKORO_PYTHON`
 - `CODEX_LINUX_READ_ALOUD_KOKORO_MODEL`
 - `CODEX_LINUX_READ_ALOUD_KOKORO_VOICES`
-- `CODEX_LINUX_READ_ALOUD_KOKORO_VOICE`, default `bm_george`
+- `CODEX_LINUX_READ_ALOUD_KOKORO_VOICE`, overrides the automatic language voice; English defaults to `bm_george`
+- `CODEX_LINUX_READ_ALOUD_KOKORO_LANGUAGE_VOICE`, optional voice override with precedence over `CODEX_LINUX_READ_ALOUD_KOKORO_VOICE`
 - `CODEX_LINUX_READ_ALOUD_KOKORO_SPEED`, default `1.05`, clamped to `0.70`-`1.40`
-- `CODEX_LINUX_READ_ALOUD_KOKORO_LANG`, default `en-us`
+- `CODEX_LINUX_READ_ALOUD_KOKORO_LANG`, overrides the automatic language; English defaults to `en-us`
 - `CODEX_LINUX_READ_ALOUD_KOKORO_THREADS`, default `4`
 - `CODEX_LINUX_READ_ALOUD_KOKORO_FIRST_CHARS`, default `90`
 - `CODEX_LINUX_READ_ALOUD_KOKORO_CHUNK_CHARS`, default `180`
@@ -111,10 +150,10 @@ The default downloads use Hugging Face-hosted Kokoro files that match the
 - `https://huggingface.co/zijuncheng/kokoro_model_v1.0/resolve/main/kokoro-v1.0.onnx`
 - `https://huggingface.co/zijuncheng/kokoro_model_v1.0/resolve/main/voices-v1.0.bin`
 
-The settings page has a `?` help affordance beside the setup actions. It
-summarizes the two supported setup paths: choose a local folder containing both
-files, or let Codex create the managed Python runtime and download the Hugging
-Face files into the default data directory.
+The Read Aloud settings section has a `?` help affordance beside the setup actions. It
+summarizes the two supported setup paths: choose a local folder containing
+`kokoro-v1.0.onnx` and `voices-v1.0.bin`, or let Codex create the managed Python
+runtime and download those files into the default data directory.
 
 For private/local setups, a custom command can still be used. Codex writes the
 cleaned response text to stdin:

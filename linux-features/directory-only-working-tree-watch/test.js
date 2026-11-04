@@ -74,8 +74,8 @@ function sha256(contents) {
 
 function currentBundleFixture() {
   return [
-    "var CurrentWatcher=class{runsInsideWsl;hostConfig={id:`local`," +
-      "display_name:`Local`,kind:`local`};id=`local`;isLocal=!0;",
+    'class CurrentWatcher{runsInsideWsl;processOwner;workspaceRoot=new Root(this);hostConfig={id:"local",' +
+      'display_name:"Local",kind:"local"};id="local";isLocal=!0;',
     "async platformPath(){return x}",
     "getFileSystemPath(e){return e}",
     "async startFileWatch(e){",
@@ -87,102 +87,115 @@ function currentBundleFixture() {
   ].join("");
 }
 
-// Exact relevant fragments from OpenAI Desktop 26.901.20858. Keep these
-// independent of patch.js so drift in the production contract cannot silently
-// rewrite the test fixture into a passing shape.
+// Exact semantic fragments from the current signed OpenAI Desktop rspack
+// bundles (`early-bootstrap-<n>-<hash>.js` main-process chunk and `worker.js`).
+// Keep these independent of patch.js so drift in the production contract
+// cannot silently rewrite the test fixture into a passing shape.
 const CURRENT_WORKER_LOCAL_FILE_WATCH = [
-  "async startFileWatch(e){let t=oV(),n=!1,r=await this.platformPath(),",
-  "i=(0,w.watch)(this.getFileSystemPath(e.path),{recursive:e.recursive},(t,n)=>{",
-  "let i=n==null?null:r.join(e.path,...n.split(this.runsInsideWsl?",
-  "E.default.win32.sep:E.default.sep)),a=i==null?[]:[i];i!=null&&t===`rename`&&",
-  "e.renameEventHandling===`changed-path-with-parent-directory`&&a.push(r.dirname(i)),",
-  "e.onChange({changedPaths:a})}),a=e=>{n||(n=!0,i.close(),t.resolve(e))};",
-  "return i.on(`error`,e=>{a({reason:`watch-error`,error:e})}),{coverage:{recursive:",
+  "async startFileWatch(e){let t=oV(),r=!1,n=await this.platformPath(),",
+  "i=(0,uR.watch)(this.getFileSystemPath(e.path),{recursive:e.recursive},(t,r)=>{",
+  "let i=null==r?null:n.join(e.path,...r.split(this.runsInsideWsl?",
+  "c1().win32.sep:c1().sep)),a=null==i?[]:[i];null!=i&&\"rename\"===t&&",
+  "\"changed-path-with-parent-directory\"===e.renameEventHandling&&a.push(n.dirname(i)),",
+  "e.onChange({changedPaths:a})}),a=e=>{r||(r=!0,i.close(),t.resolve(e))};",
+  "return i.on(\"error\",e=>{a({reason:\"watch-error\",error:e})}),{coverage:{recursive:",
   "e.recursive,typedPathChanges:!1},path:e.path,closed:t.promise,dispose:async()=>{",
-  "a({reason:`disposed`})}}}",
+  "a({reason:\"disposed\"})}}}",
 ].join("");
 
-const CURRENT_SRC_LOCAL_FILE_WATCH = [
-  "async startFileWatch(e){let t=gb(),n=!1,r=await this.platformPath(),",
-  "a=(0,c.watch)(this.getFileSystemPath(e.path),{recursive:e.recursive},(t,n)=>{",
-  "let a=n==null?null:r.join(e.path,...n.split(this.runsInsideWsl?",
-  "i.default.win32.sep:i.default.sep)),o=a==null?[]:[a];a!=null&&t===`rename`&&",
-  "e.renameEventHandling===`changed-path-with-parent-directory`&&o.push(r.dirname(a)),",
-  "e.onChange({changedPaths:o})}),o=e=>{n||(n=!0,a.close(),t.resolve(e))};",
-  "return a.on(`error`,e=>{o({reason:`watch-error`,error:e})}),{coverage:{recursive:",
+const CURRENT_BOOTSTRAP_LOCAL_FILE_WATCH = [
+  "async startFileWatch(e){let t=(0,q.udX)(),n=!1,r=await this.platformPath(),",
+  "i=(0,ep.watch)(this.getFileSystemPath(e.path),{recursive:e.recursive},(t,n)=>{",
+  "let i=null==n?null:r.join(e.path,...n.split(this.runsInsideWsl?",
+  "em().win32.sep:em().sep)),a=null==i?[]:[i];null!=i&&\"rename\"===t&&",
+  "\"changed-path-with-parent-directory\"===e.renameEventHandling&&a.push(r.dirname(i)),",
+  "e.onChange({changedPaths:a})}),a=e=>{n||(n=!0,i.close(),t.resolve(e))};",
+  "return i.on(\"error\",e=>{a({reason:\"watch-error\",error:e})}),{coverage:{recursive:",
   "e.recursive,typedPathChanges:!1},path:e.path,closed:t.promise,dispose:async()=>{",
-  "o({reason:`disposed`})}}}",
+  "a({reason:\"disposed\"})}}}",
 ].join("");
 
 const CURRENT_WORKER_REMOTE_FILE_WATCH = [
-  "async startFileWatch(e){let{onChange:t,...n}=e,r=await this.callHost(e=>",
-  "e.startFileWatch(n,t)),i=!1,a=()=>{i||(i=!0,r[Symbol.dispose]())},o,s;try{",
-  "[o,s]=await Promise.all([r.coverage,r.path])}catch(e){throw a(),e}let c=r.closed()",
-  ".finally(a);return{coverage:o,path:s,closed:c,dispose:async()=>{try{await r.dispose()}",
-  "finally{a()}}}}",
+  "async startFileWatch(e){let t,r,{onChange:n,...i}=e,a=await this.callHost(e=>",
+  "e.startFileWatch(i,n)),o=!1,s=()=>{o||(o=!0,a[Symbol.dispose]())};try{",
+  "[t,r]=await Promise.all([a.coverage,a.path])}catch(e){throw s(),e}return{coverage:t,",
+  "path:r,closed:a.closed().finally(s),dispose:async()=>{try{await a.dispose()}",
+  "finally{s()}}}}",
 ].join("");
 
-const CURRENT_SRC_REMOTE_FILE_WATCH = [
+const CURRENT_BOOTSTRAP_REMOTE_FILE_WATCH = [
   "async startFileWatch(e){let t=await this.startFileWatchSession({onChange:e.onChange,",
   "path:e.path,watchId:e.watchId});return{coverage:t.coverage,path:t.path,closed:t.closed,",
   "dispose:async()=>{await t.dispose()}}}",
 ].join("");
 
+const CURRENT_PARCEL_EXTERNAL =
+  '93861(e){"use strict";e.exports=require("@parcel/watcher")}';
 const CURRENT_PARCEL_HELPER =
-  "async function oye(e,t){return new sye(await import(`@parcel/watcher`),e,t).start()}";
+  "async function oye(e,t){return new sye(await Promise.resolve().then(" +
+  "r.t.bind(r,93861,23)),e,t).start()}";
 const CURRENT_GIT_ROUTE_PREFIX =
-  "case`git`:{let e=new Que;return{git:{watchIgnoreSources:process.platform===`linux`?" +
-  "{getEnvironment:async()=>{if(n==null)throw Error(`Git hosts require a main RPC connection`);" +
-  "return n.getLocalGitIgnoreEnvironment()},getWatchTargets:Bee}:void 0," +
-  "createExecutionHost:e=>{if(n==null)throw Error(`Git hosts require a main RPC connection`);" +
-  "return new nde(n,e)},startMetadataWatch:(t,n)=>t.isLocal?" +
-  "process.platform===`linux`&&n.recursive!==!1?oye(n,{ignoredPaths:[]}):" +
+  'case"git":{let s=getIgnoreSource(),e=new Que(s,e=>{let t=e.getPid();if(null==t)return;notify(e)});' +
+  "return{git:{getWatchIgnoreSources:s?void 0:" +
+  "()=>({getEnvironment:async()=>(function(){let e=process.env.HOME;" +
+  'return{defaultExcludesFile:null==e?null:`${e}/.config/git/ignore`,globalConfigFiles:[]}})(),' +
+  "getWatchTargets:Bee,pruneIgnoredDirectories:!0})," +
+  "createExecutionHost:h=>{if(h.id===e.id&&!isRemote(h))return e;" +
+  'if(null==n)throw Error("Git hosts require a main RPC connection");' +
+  "return new nde(n,h)},startMetadataWatch:(t,n)=>t.isLocal?" +
+  '"linux"===process.platform&&!1!==n.recursive?oye(n,{ignoredPaths:[]}):' +
   "e.startFileWatch(n):t.startFileWatch(n),";
 const CURRENT_PARCEL_ROUTE =
-  "startWorkingTreeWatch:(t,n,r)=>t.isLocal?process.platform===`linux`?" +
-  "oye(n,{ignoredPaths:[E.posix.join(n.path,`.git`),...r]}):e.startFileWatch(n):" +
-  "t.startFileWatch(n)";
+  "startWorkingTreeWatch:(t,n,r)=>{if(!t.isLocal)return t.startFileWatch(n);" +
+  'if("linux"===process.platform)return oye(n,{ignoredPaths:[E().join(n.path,".git"),...r]});' +
+  "if(0===r.length)return e.startFileWatch(n)";
 const CURRENT_WATCHBOUND_ROUTE =
-  `startWorkingTreeWatch:(t,n,r)=>t.isLocal?process.platform===\`linux\`?` +
-  `/*${PARCEL_WATCH_MARKER}*/e.startFileWatch({...n,` +
+  `startWorkingTreeWatch:(t,n,r)=>{if(!t.isLocal)return t.startFileWatch(n);` +
+  `if("linux"===process.platform)return /*${PARCEL_WATCH_MARKER}*/e.startFileWatch({...n,` +
   `[Symbol.for(\`${PARCEL_FALLBACK_SYMBOL_KEY}\`)]:()=>` +
-  "oye(n,{ignoredPaths:[E.posix.join(n.path,`.git`),...r]})}):" +
-  "e.startFileWatch(n):t.startFileWatch(n)";
-const CURRENT_GIT_ROUTE_SUFFIX = "}}}case`open-in`:";
+  'oye(n,{ignoredPaths:[E().join(n.path,".git"),...r]})});' +
+  "if(0===r.length)return e.startFileWatch(n)";
+const CURRENT_GIT_ROUTE_SUFFIX = '}}}}case"open-in":';
 
 function currentWorkerSource(route = CURRENT_PARCEL_ROUTE) {
   return [
-    "var Que=class{runsInsideWsl;hostConfig={id:`local`,display_name:`Local`," +
-      "kind:`local`};id=`local`;isLocal=!0;",
+    "(()=>{var n={",
+    CURRENT_PARCEL_EXTERNAL,
+    ",83481(e,t,r){\"use strict\";",
+    'class Que{runsInsideWsl;processOwner;workspaceRoot=new WorkerRoot(this);hostConfig={id:"local",display_name:"Local",' +
+      'kind:"local"};id="local";isLocal=!0;',
     CURRENT_WORKER_LOCAL_FILE_WATCH,
-    "};var CurrentWorkerRemote=class{",
+    "}class CurrentWorkerRemote{",
     CURRENT_WORKER_REMOTE_FILE_WATCH,
-    "};",
+    "}",
     CURRENT_PARCEL_HELPER,
     "function currentDependencies(r,n){switch(r){",
     CURRENT_GIT_ROUTE_PREFIX,
     route,
     CURRENT_GIT_ROUTE_SUFFIX,
-    "return{openIn:null}}}",
+    "return{openIn:null}}}}}})();",
   ].join("");
 }
 
-function currentSrcSource() {
+function currentBootstrapSource() {
   return [
-    "var CurrentSrcRemote=class{",
-    CURRENT_SRC_REMOTE_FILE_WATCH,
-    "};var are=class{runsInsideWsl;hostConfig={id:`local`,display_name:`Local`," +
-      "kind:`local`};id=`local`;isLocal=!0;",
-    CURRENT_SRC_LOCAL_FILE_WATCH,
-    "};",
+    "exports.ids=[339],exports.modules={41251(e,t,n){\"use strict\";",
+    "class CurrentSrcRemote{",
+    CURRENT_BOOTSTRAP_REMOTE_FILE_WATCH,
+    '}class uq{runsInsideWsl;processOwner;workspaceRoot=new SrcRoot(this);hostConfig={id:"local",display_name:"Local",' +
+      'kind:"local"};id="local";isLocal=!0;',
+    CURRENT_BOOTSTRAP_LOCAL_FILE_WATCH,
+    "}}};",
   ].join("");
 }
+
+const BOOTSTRAP_CHUNK = "early-bootstrap-339-0123456789abcdef.js";
 
 function currentBundlePair(t, overrides = {}) {
   const extractedDir = tempDirectory(t, "directory-watch-current-contract-");
   const buildDir = path.join(extractedDir, ".vite", "build");
   const sources = new Map([
-    ["src-Cz_uUmVl.js", overrides.src ?? currentSrcSource()],
+    [BOOTSTRAP_CHUNK, overrides.bootstrap ?? currentBootstrapSource()],
     ["worker.js", overrides.worker ?? currentWorkerSource()],
     ...Object.entries(overrides.extra ?? {}),
   ]);
@@ -280,7 +293,7 @@ test("the worker patch injects one Watchbound adapter and is idempotent", () => 
     settings,
   );
   assert.equal(legacy.matched, 0);
-  assert.match(legacy.reason, /current 26\.901\.20858 working-tree contract rejected/iu);
+  assert.match(legacy.reason, /current working-tree contract rejected/iu);
 });
 
 test("the current OpenAI Parcel route hands the working tree to the Watchbound host", () => {
@@ -324,38 +337,38 @@ test("the current OpenAI Parcel route hands the working tree to the Watchbound h
 test("correlates minified aliases instead of pinning their spellings", () => {
   const parcelHelper =
     "async function parcelStart(root,settings){return new ParcelWatcher(" +
-    "await import(`@parcel/watcher`),root,settings).start()}";
+    "await Promise.resolve().then(load.t.bind(load,93861,23)),root,settings).start()}";
   const gitRoutePrefix =
-    "case`git`:{let localHost=new LocalHost;return{git:{" +
-    "watchIgnoreSources:process.platform===`linux`?{getEnvironment:async()=>{" +
-    "if(mainConnection==null)throw Error(`Git hosts require a main RPC connection`);" +
-    "return mainConnection.getLocalGitIgnoreEnvironment()},getWatchTargets:getWatchTargets}:void 0," +
-    "createExecutionHost:executionOptions=>{if(mainConnection==null)" +
-    "throw Error(`Git hosts require a main RPC connection`);" +
+    "case\"git\":{let ignoreSource=getIgnoreSource(),localHost=new LocalHost(ignoreSource,event=>{notify(event)});return{git:{" +
+    "getWatchIgnoreSources:ignoreSource?void 0:()=>({getEnvironment:async()=>(function(){return readIgnoreEnvironment()})()," +
+    "getWatchTargets:getWatchTargets,pruneIgnoredDirectories:!0}),createExecutionHost:executionOptions=>{" +
+    "if(executionOptions.id===localHost.id&&!isRemote(executionOptions))return localHost;" +
+    "if(null==mainConnection)" +
+    "throw Error(\"Git hosts require a main RPC connection\");" +
     "return new RemoteHost(mainConnection,executionOptions)}," +
     "startMetadataWatch:(host,options)=>host.isLocal?" +
-    "process.platform===`linux`&&options.recursive!==!1?" +
+    "\"linux\"===process.platform&&!1!==options.recursive?" +
     "parcelStart(options,{ignoredPaths:[]}):localHost.startFileWatch(options):" +
     "host.startFileWatch(options),";
   const parcelRoute =
-    "startWorkingTreeWatch:(host,options,ignoredPaths)=>host.isLocal?process.platform===`linux`?" +
-    "parcelStart(options,{ignoredPaths:[pathApi.posix.join(options.path,`.git`),...ignoredPaths]}):" +
-    "localHost.startFileWatch(options):host.startFileWatch(options)";
+    "startWorkingTreeWatch:(host,options,ignoredPaths)=>{if(!host.isLocal)return host.startFileWatch(options);" +
+    "if(\"linux\"===process.platform)return parcelStart(options,{ignoredPaths:[pathApi().join(options.path,\".git\"),...ignoredPaths]});" +
+    "if(0===ignoredPaths.length)return localHost.startFileWatch(options)";
   const worker = currentWorkerSource(parcelRoute)
     .replace(CURRENT_PARCEL_HELPER, parcelHelper)
     .replace(CURRENT_GIT_ROUTE_PREFIX, gitRoutePrefix)
-    .replace("var Que=class{", "var LocalHost=class{");
+    .replace("class Que{", "class LocalHost{");
 
   const first = patchWorkerSource(worker, normalizedSettings());
   assert.equal(first.matched, 1);
   assert.equal(first.changed, 1);
   assert.ok(first.source.includes(parcelHelper));
   assert.ok(first.source.includes(
-    `startWorkingTreeWatch:(host,options,ignoredPaths)=>host.isLocal?process.platform===\`linux\`?` +
-      `/*${PARCEL_WATCH_MARKER}*/localHost.startFileWatch({...options,` +
+    `startWorkingTreeWatch:(host,options,ignoredPaths)=>{if(!host.isLocal)return host.startFileWatch(options);` +
+      `if("linux"===process.platform)return /*${PARCEL_WATCH_MARKER}*/localHost.startFileWatch({...options,` +
       `[Symbol.for(\`${PARCEL_FALLBACK_SYMBOL_KEY}\`)]:()=>` +
-      "parcelStart(options,{ignoredPaths:[pathApi.posix.join(options.path,`.git`),...ignoredPaths]})}):" +
-      "localHost.startFileWatch(options):host.startFileWatch(options)",
+      'parcelStart(options,{ignoredPaths:[pathApi().join(options.path,".git"),...ignoredPaths]})});' +
+      "if(0===ignoredPaths.length)return localHost.startFileWatch(options)",
   ));
   assert.match(first.source, /parcelStart\(options,/u);
 
@@ -371,20 +384,21 @@ test("feature patch reports drift instead of patching an ambiguous bundle", () =
 
   assert.equal(result.matched, 0);
   assert.equal(result.changed, 0);
-  assert.match(result.reason, /current 26\.901\.20858 working-tree contract rejected/iu);
+  assert.match(result.reason, /current working-tree contract rejected/iu);
   const descriptor = descriptors.find(({ id }) => id === "worker-directory-watch");
   assert.equal(descriptor.status(result, []).status, "skipped-optional");
 });
 
-test("bundle discovery patches the current src and worker copies", (t) => {
+test("bundle discovery patches the current bootstrap companion and worker copies", (t) => {
   const extractedDir = tempDirectory(t, "directory-watch-bundle-");
   const buildDir = path.join(extractedDir, ".vite", "build");
   writeFile(path.join(buildDir, "unrelated.js"), "const unrelated=true;");
+  writeFile(path.join(buildDir, "early-bootstrap.js"), `var m={${CURRENT_PARCEL_EXTERNAL}};${CURRENT_PARCEL_HELPER}`);
   const targets = [
-    path.join(buildDir, "src-Cz_uUmVl.js"),
+    path.join(buildDir, BOOTSTRAP_CHUNK),
     path.join(buildDir, "worker.js"),
   ];
-  writeFile(targets[0], currentSrcSource());
+  writeFile(targets[0], currentBootstrapSource());
   writeFile(targets[1], currentWorkerSource());
 
   const discovery = findLocalFileWatchBundles(
@@ -404,7 +418,7 @@ test("bundle discovery patches the current src and worker copies", (t) => {
   assert.equal(first.matched, 2);
   assert.equal(first.changed, 2);
   assert.deepEqual(first.targets, [
-    path.join(".vite", "build", "src-Cz_uUmVl.js"),
+    path.join(".vite", "build", BOOTSTRAP_CHUNK),
     path.join(".vite", "build", "worker.js"),
   ]);
   for (const target of targets) {
@@ -427,7 +441,7 @@ test("bundle discovery rejects a missing Parcel route without changing either bu
   const extractedDir = tempDirectory(t, "directory-watch-missing-parcel-");
   const buildDir = path.join(extractedDir, ".vite", "build");
   const sources = new Map([
-    ["src-current.js", currentBundleFixture()],
+    ["early-bootstrap-916-fedcba9876543210.js", currentBundleFixture()],
     ["worker.js", currentBundleFixture()],
   ]);
   for (const [name, source] of sources) writeFile(path.join(buildDir, name), source);
@@ -452,7 +466,7 @@ test("bundle discovery rejects duplicate Parcel routes without changing either b
   const extractedDir = tempDirectory(t, "directory-watch-duplicate-parcel-");
   const buildDir = path.join(extractedDir, ".vite", "build");
   const sources = new Map([
-    ["src-current.js", currentBundleFixture()],
+    ["early-bootstrap-916-fedcba9876543210.js", currentBundleFixture()],
     [
       "worker.js",
       `${currentWorkerSource()}${CURRENT_GIT_ROUTE_PREFIX}` +
@@ -482,7 +496,7 @@ test("bundle discovery rejects a Parcel route outside worker.js without changing
   const buildDir = path.join(extractedDir, ".vite", "build");
   const sources = new Map([
     [
-      "src-current.js",
+      "early-bootstrap-916-fedcba9876543210.js",
       `${currentBundleFixture()}${CURRENT_PARCEL_HELPER}${CURRENT_GIT_ROUTE_PREFIX}` +
         `${CURRENT_PARCEL_ROUTE}${CURRENT_GIT_ROUTE_SUFFIX}`,
     ],
@@ -506,10 +520,10 @@ test("bundle discovery rejects a Parcel route outside worker.js without changing
   }
 });
 
-test("bundle discovery rejects copies outside the current src and worker pair", (t) => {
+test("bundle discovery rejects copies outside the current companion and worker pair", (t) => {
   const extractedDir = tempDirectory(t, "directory-watch-ambiguous-");
   const buildDir = path.join(extractedDir, ".vite", "build");
-  for (const name of ["src-first.js", "src-second.js", "worker.js"]) {
+  for (const name of ["early-bootstrap-87-0123456789abcdef.js", "early-bootstrap-824-fedcba9876543210.js", "worker.js"]) {
     writeFile(path.join(buildDir, name), currentBundleFixture());
   }
 
@@ -526,7 +540,7 @@ test("bundle discovery rejects copies outside the current src and worker pair", 
   assert.match(result.reason, /Found 3 current local startFileWatch bundles/u);
 });
 
-test("patches the pristine 26.901.20858 bundle contract and accepts only its exact completed state", (t) => {
+test("patches the pristine current bundle contract and accepts only its exact completed state", (t) => {
   const candidate = currentBundlePair(t, {
     extra: { "unrelated.js": "const unrelatedWatch=host.startFileWatch(options);" },
   });
@@ -536,21 +550,21 @@ test("patches the pristine 26.901.20858 bundle contract and accepts only its exa
   assert.equal(first.matched, 2);
   assert.equal(first.changed, 2);
   assert.deepEqual(first.targets, [
-    path.join(".vite", "build", "src-Cz_uUmVl.js"),
+    path.join(".vite", "build", BOOTSTRAP_CHUNK),
     path.join(".vite", "build", "worker.js"),
   ]);
 
   const completed = readBundlePair(candidate);
   assert.notDeepEqual(completed, pristine);
   const worker = completed.get("worker.js");
-  const src = completed.get("src-Cz_uUmVl.js");
+  const bootstrap = completed.get(BOOTSTRAP_CHUNK);
   assert.equal(worker.split(PARCEL_WATCH_MARKER).length - 1, 1);
   assert.match(worker, new RegExp(`function ${HELPER_NAME}\\(`, "u"));
-  assert.match(src, new RegExp(`function ${HELPER_NAME}\\(`, "u"));
+  assert.match(bootstrap, new RegExp(`function ${HELPER_NAME}\\(`, "u"));
   assert.ok(worker.includes(CURRENT_WATCHBOUND_ROUTE));
   assert.ok(worker.includes(CURRENT_PARCEL_HELPER));
   assert.ok(worker.includes(CURRENT_WORKER_REMOTE_FILE_WATCH));
-  assert.ok(src.includes(CURRENT_SRC_REMOTE_FILE_WATCH));
+  assert.ok(bootstrap.includes(CURRENT_BOOTSTRAP_REMOTE_FILE_WATCH));
   assert.ok(worker.includes(":t.startFileWatch(n)"));
   assert.equal(completed.get("unrelated.js"), pristine.get("unrelated.js"));
 
@@ -564,7 +578,7 @@ test("patches the pristine 26.901.20858 bundle contract and accepts only its exa
   assert.deepEqual(readBundlePair(candidate), completed);
 });
 
-test("rejects markers outside the exact 26.901.20858 Watchbound handoff", (t) => {
+test("rejects markers outside the exact current Watchbound handoff", (t) => {
   const unmarkedHandoff = CURRENT_WATCHBOUND_ROUTE.replace(
     `/*${PARCEL_WATCH_MARKER}*/`,
     "",
@@ -577,10 +591,10 @@ test("rejects markers outside the exact 26.901.20858 Watchbound handoff", (t) =>
       },
     },
     {
-      name: "marker in the src bundle",
+      name: "marker in the bootstrap companion bundle",
       overrides: {
         worker: currentWorkerSource(unmarkedHandoff),
-        src: `/*${PARCEL_WATCH_MARKER}*/${currentSrcSource()}`,
+        bootstrap: `/*${PARCEL_WATCH_MARKER}*/${currentBootstrapSource()}`,
       },
     },
     {
@@ -604,13 +618,13 @@ test("rejects markers outside the exact 26.901.20858 Watchbound handoff", (t) =>
 
 test("rejects dual ownership, unrelated lookalikes, and unproven minified aliases", (t) => {
   const parcelCall =
-    "oye(n,{ignoredPaths:[E.posix.join(n.path,`.git`)]})";
+    'oye(n,{ignoredPaths:[E().join(n.path,".git")]})';
   const unmarkedHandoff = CURRENT_WATCHBOUND_ROUTE.replace(
     `/*${PARCEL_WATCH_MARKER}*/`,
     "",
   );
   const unrelatedLookalike =
-    "function unrelated(n,e){return process.platform===`linux`?" +
+    'function unrelated(n,e){return"linux"===process.platform?' +
     `${parcelCall}:e.startFileWatch(n)}`;
   const cases = [
     {
@@ -631,23 +645,43 @@ test("rejects dual ownership, unrelated lookalikes, and unproven minified aliase
     {
       name: "an uncorrelated local host alias",
       worker: currentWorkerSource(
-        CURRENT_PARCEL_ROUTE.replace(":e.startFileWatch(n)", ":other.startFileWatch(n)"),
+        CURRENT_PARCEL_ROUTE.replace(
+          "if(0===r.length)return e.startFileWatch(n)",
+          "if(0===r.length)return other.startFileWatch(n)",
+        ),
       ),
     },
     {
       name: "a routed local host with a different class",
-      worker: currentWorkerSource().replace("let e=new Que", "let e=new OtherHost"),
+      worker: currentWorkerSource().replace(
+        'case"git":{let s=getIgnoreSource(),e=new Que',
+        'case"git":{let s=getIgnoreSource(),e=new OtherHost',
+      ),
     },
     {
       name: "a local method moved outside the routed class",
       worker: currentWorkerSource().replace(
         CURRENT_WORKER_LOCAL_FILE_WATCH,
-        `};var OtherHost=class extends BaseHost{${CURRENT_WORKER_LOCAL_FILE_WATCH}`,
+        `}class OtherHost extends BaseHost{${CURRENT_WORKER_LOCAL_FILE_WATCH}`,
+      ),
+    },
+    {
+      name: "a Parcel helper loading a different external module",
+      worker: currentWorkerSource().replace(
+        "r.t.bind(r,93861,23)",
+        "r.t.bind(r,12345,23)",
+      ),
+    },
+    {
+      name: "a helper external that no longer requires @parcel/watcher",
+      worker: currentWorkerSource().replace(
+        'require("@parcel/watcher")',
+        'require("chokidar")',
       ),
     },
     {
       name: "an uncorrelated main connection alias",
-      worker: currentWorkerSource().replace("new nde(n,e)", "new nde(other,e)"),
+      worker: currentWorkerSource().replace("new nde(n,h)", "new nde(other,h)"),
     },
   ];
 
@@ -667,14 +701,14 @@ test("rejects missing, duplicate, and partial current contracts", (t) => {
     currentWorkerSource(),
     normalizedSettings(),
   ).source;
-  const completedSrc = patchWorkerSource(
-    currentSrcSource(),
+  const completedBootstrap = patchWorkerSource(
+    currentBootstrapSource(),
     normalizedSettings(),
   ).source;
   const staleSettings = { ...normalizedSettings(), maxWatches: 4096 };
   const staleWorker = patchWorkerSource(currentWorkerSource(), staleSettings).source;
-  const staleSrc = patchWorkerSource(currentSrcSource(), staleSettings).source;
-  const workerOriginalIndex = completedWorker.indexOf("var Que=class{");
+  const staleBootstrap = patchWorkerSource(currentBootstrapSource(), staleSettings).source;
+  const workerOriginalIndex = completedWorker.indexOf("(()=>{var n={");
   const workerHelper = completedWorker.slice(0, workerOriginalIndex);
   const workerWithoutHelper = completedWorker.slice(workerOriginalIndex);
   const workerBranchStart = completedWorker.indexOf(
@@ -706,42 +740,42 @@ test("rejects missing, duplicate, and partial current contracts", (t) => {
           "const GIT_QUERY_TIMEOUT_MS = 5000;",
           "const GIT_QUERY_TIMEOUT_MS = 5001;",
         ),
-        src: completedSrc,
+        bootstrap: completedBootstrap,
       },
     },
     {
       name: "missing completed helper",
       overrides: {
         worker: workerWithoutHelper,
-        src: completedSrc,
+        bootstrap: completedBootstrap,
       },
     },
     {
       name: "duplicate completed helper",
       overrides: {
         worker: `${workerHelper}${completedWorker}`,
-        src: completedSrc,
+        bootstrap: completedBootstrap,
       },
     },
     {
       name: "one completed bundle plus one pristine bundle",
       overrides: {
         worker: completedWorker,
-        src: currentSrcSource(),
+        bootstrap: currentBootstrapSource(),
       },
     },
     {
       name: "duplicate completed marker",
       overrides: {
         worker: `/*${PARCEL_WATCH_MARKER}*/${completedWorker}`,
-        src: completedSrc,
+        bootstrap: completedBootstrap,
       },
     },
     {
       name: "missing completed marker",
       overrides: {
         worker: completedWorker.replace(`/*${PARCEL_WATCH_MARKER}*/`, ""),
-        src: completedSrc,
+        bootstrap: completedBootstrap,
       },
     },
     {
@@ -751,28 +785,31 @@ test("rejects missing, duplicate, and partial current contracts", (t) => {
           `${HELPER_NAME}(this,e,`,
           `missing${HELPER_NAME}(this,e,`,
         ),
-        src: completedSrc,
+        bootstrap: completedBootstrap,
       },
     },
     {
       name: "duplicate completed branch",
       overrides: {
         worker: completedWorker.replace(workerBranch, `${workerBranch}${workerBranch}`),
-        src: completedSrc,
+        bootstrap: completedBootstrap,
       },
     },
     {
       name: "completed route retargeted to a different local class",
       overrides: {
-        worker: completedWorker.replace("let e=new Que", "let e=new OtherHost"),
-        src: completedSrc,
+        worker: completedWorker.replace(
+          'case"git":{let s=getIgnoreSource(),e=new Que',
+          'case"git":{let s=getIgnoreSource(),e=new OtherHost',
+        ),
+        bootstrap: completedBootstrap,
       },
     },
     {
       name: "stale completed settings",
       overrides: {
         worker: staleWorker,
-        src: staleSrc,
+        bootstrap: staleBootstrap,
       },
     },
   ];
@@ -857,10 +894,10 @@ test("restores both current bundles after injected writes and permits retry", (t
 
 test("rejects non-lossless UTF-8 bundles without changing their bytes", (t) => {
   const candidate = currentBundlePair(t);
-  const srcPath = path.join(candidate.buildDir, "src-Cz_uUmVl.js");
-  fs.appendFileSync(srcPath, Buffer.from([0xff]));
+  const bootstrapPath = path.join(candidate.buildDir, BOOTSTRAP_CHUNK);
+  fs.appendFileSync(bootstrapPath, Buffer.from([0xff]));
   const before = new Map(
-    ["src-Cz_uUmVl.js", "worker.js"].map((name) => [
+    [BOOTSTRAP_CHUNK, "worker.js"].map((name) => [
       name,
       fs.readFileSync(path.join(candidate.buildDir, name)),
     ]),
@@ -890,7 +927,7 @@ test("rejects non-lossless UTF-8 bundles without changing their bytes", (t) => {
 test("keeps transaction byte oracles private from injected writers", (t) => {
   const candidate = currentBundlePair(t);
   const before = new Map(
-    ["src-Cz_uUmVl.js", "worker.js"].map((name) => [
+    [BOOTSTRAP_CHUNK, "worker.js"].map((name) => [
       name,
       fs.readFileSync(path.join(candidate.buildDir, name)),
     ]),
@@ -921,7 +958,7 @@ test("keeps transaction byte oracles private from injected writers", (t) => {
 test("keeps transaction byte oracles private from injected readers", (t) => {
   const candidate = currentBundlePair(t);
   const before = new Map(
-    ["src-Cz_uUmVl.js", "worker.js"].map((name) => [
+    [BOOTSTRAP_CHUNK, "worker.js"].map((name) => [
       name,
       fs.readFileSync(path.join(candidate.buildDir, name)),
     ]),
@@ -1041,14 +1078,42 @@ test("reports failed-integrity when rollback cannot prove original current bundl
     /rollback byte verification failed.*rollback write also failed: simulated rollback failure/u,
   );
   assert.equal(
-    fs.readFileSync(path.join(candidate.buildDir, "src-Cz_uUmVl.js"), "utf8"),
-    before.get("src-Cz_uUmVl.js"),
+    fs.readFileSync(path.join(candidate.buildDir, BOOTSTRAP_CHUNK), "utf8"),
+    before.get(BOOTSTRAP_CHUNK),
   );
   assert.equal(
     fs.readFileSync(path.join(candidate.buildDir, "worker.js"), "utf8"),
     "corrupt-current-worker",
   );
 });
+
+test(
+  "signed upstream rspack bundles expose exactly the bootstrap and worker contracts",
+  { skip: process.env.CODEX_SIGNED_EXTRACTED_APP == null },
+  () => {
+    const root = process.env.CODEX_SIGNED_EXTRACTED_APP;
+    const discovery = findLocalFileWatchBundles(root, normalizedSettings());
+    assert.equal(discovery.reason, null);
+    const names = discovery.targets.map(({ bundlePath }) => path.basename(bundlePath));
+    assert.equal(names.length, 2);
+    assert.match(names[0], /^early-bootstrap-\d+-[0-9a-f]+\.js$/u);
+    assert.equal(names[1], "worker.js");
+    for (const { bundlePath, result } of discovery.targets) {
+      assert.equal(result.changed, 1, bundlePath);
+      assert.ok(result.source.startsWith(`function ${HELPER_NAME}(`), bundlePath);
+      assert.doesNotThrow(() => new Function("exports", "require", result.source), bundlePath);
+      assert.deepEqual(
+        patchWorkerSource(result.source, normalizedSettings()),
+        { source: result.source, matched: 1, changed: 0, reason: null },
+        bundlePath,
+      );
+    }
+    const worker = discovery.targets[1].result.source;
+    assert.equal(worker.split(PARCEL_WATCH_MARKER).length - 1, 1);
+    PARCEL_WORKING_TREE_WATCH.lastIndex = 0;
+    assert.equal(PARCEL_WORKING_TREE_WATCH.test(worker), false);
+  },
+);
 
 test("feature descriptors stage Watchbound before patching the worker", () => {
   assert.equal(WATCHBOUND_VERSION, "2.1.2");
@@ -1170,11 +1235,19 @@ function createPackageFixture(t, name, version, files, metadataOverrides = {}) {
 const QUALIFIED_ELECTRON_VERSION = "42.3.0";
 
 function writeExtractedAppRuntime(extractedDir, electron = QUALIFIED_ELECTRON_VERSION) {
-  writeJson(path.join(extractedDir, "package.json"), {
+  const metadata = {
     name: "openai-codex-electron",
-    version: "26.901.20858",
-    devDependencies: { electron },
-  });
+    version: "0.0.0-test",
+  };
+  if (electron != null) metadata.devDependencies = { electron };
+  writeJson(path.join(extractedDir, "package.json"), metadata);
+}
+
+function writeObservedRuntimeExecutable(extractedDir, ...nodeVersions) {
+  writeFile(
+    path.join(extractedDir, "ChatGPT"),
+    Buffer.from(nodeVersions.map((version) => `node.js/v${version}\0`).join("")),
+  );
 }
 
 function packageStageOptions(extractedDir, fixture, overrides = {}) {
@@ -1346,7 +1419,7 @@ test("the artifact manifest requires every supported Codex architecture", (t) =>
   }
 });
 
-test("Watchbound staging uses pinned runtime metadata without executing Electron", async (t) => {
+test("Watchbound staging uses observed runtime evidence without executing Electron", async (t) => {
   const fixture = packageFixtureManifest(t);
   const extractedDir = tempDirectory(t, "watchbound-runtime-app-");
   writeExtractedAppRuntime(extractedDir);
@@ -1375,6 +1448,52 @@ test("Watchbound staging uses pinned runtime metadata without executing Electron
     node: "24.15.0",
     qualification: "pinned-artifact-manifest",
   });
+
+  writeExtractedAppRuntime(extractedDir, null);
+  assert.throws(
+    () => validateTargetRuntime(
+      extractedDir,
+      fixture.manifest,
+      undefined,
+      undefined,
+    ),
+    /Observed upstream runtime evidence is missing/u,
+  );
+
+  writeObservedRuntimeExecutable(extractedDir, "24.15.0");
+  assert.deepEqual(validateTargetRuntime(
+    extractedDir,
+    fixture.manifest,
+    undefined,
+    undefined,
+  ), {
+    electron: QUALIFIED_ELECTRON_VERSION,
+    node: "24.15.0",
+    qualification: "signed-runtime-executable",
+  });
+
+  writeObservedRuntimeExecutable(extractedDir, "24.15.0", "24.16.0");
+  assert.throws(
+    () => validateTargetRuntime(
+      extractedDir,
+      fixture.manifest,
+      undefined,
+      undefined,
+    ),
+    /Observed upstream runtime evidence is ambiguous/u,
+  );
+
+  writeObservedRuntimeExecutable(extractedDir, "24.15.0");
+  assert.throws(
+    () => validateTargetRuntime(
+      extractedDir,
+      fixture.manifest,
+      undefined,
+      "24.16.0",
+    ),
+    /Observed upstream Node\.js 24\.15\.0 does not match build target 24\.16\.0/u,
+  );
+  writeExtractedAppRuntime(extractedDir);
 
   assert.deepEqual(validateTargetRuntime(
     extractedDir,
@@ -1429,6 +1548,37 @@ test("Watchbound staging uses pinned runtime metadata without executing Electron
     () => validateArtifactManifest(unsupportedNodeManifest),
     /target runtime contract is invalid/u,
   );
+});
+
+test("Watchbound staging prefers the copied app runtime over the upstream fallback", async (t) => {
+  const fixture = packageFixtureManifest(t);
+  const extractedDir = tempDirectory(t, "watchbound-runtime-copied-app-");
+  const upstreamAppDir = tempDirectory(t, "watchbound-runtime-upstream-app-");
+  writeExtractedAppRuntime(extractedDir, null);
+  writeObservedRuntimeExecutable(extractedDir, "24.15.0");
+  writeObservedRuntimeExecutable(upstreamAppDir, "24.16.0");
+
+  const previousUpstreamAppDir = process.env.UPSTREAM_APP_DIR;
+  process.env.UPSTREAM_APP_DIR = upstreamAppDir;
+  t.after(() => {
+    if (previousUpstreamAppDir == null) delete process.env.UPSTREAM_APP_DIR;
+    else process.env.UPSTREAM_APP_DIR = previousUpstreamAppDir;
+  });
+
+  const result = await stageWatchboundPackages(packageStageOptions(
+    extractedDir,
+    fixture,
+    {
+      arch: "x64",
+      materializePackage: fixtureMaterializer(fixture),
+    },
+  ));
+
+  assert.deepEqual(result.runtime, {
+    electron: QUALIFIED_ELECTRON_VERSION,
+    node: "24.15.0",
+    qualification: "signed-runtime-executable",
+  });
 });
 
 test("verified Watchbound packages stage idempotently into app node_modules", async (t) => {
@@ -1951,6 +2101,61 @@ test("Watchbound package-set commit rolls back an injected partial failure", asy
   );
 });
 
+test("the default package commit copies nested and hidden entries into its reservation", (t) => {
+  const workspace = tempDirectory(t, "watchbound-package-reserved-entries-");
+  const sourceDir = path.join(workspace, "source");
+  const targetDir = path.join(workspace, "target");
+  const nativeBytes = Buffer.from([0, 255, 127, 10]);
+  writeFile(path.join(sourceDir, ".metadata"), "metadata\n");
+  writeFile(path.join(sourceDir, "lib", "nested", "owned"), "owned\n", 0o755);
+  writeFile(path.join(sourceDir, "native.node"), nativeBytes);
+  fs.mkdirSync(path.join(sourceDir, "empty"));
+  let reservation;
+
+  commitPackageDirectoryNoReplace(sourceDir, targetDir, (identity) => {
+    reservation = identity;
+    assert.deepEqual(fs.readdirSync(targetDir), []);
+  });
+
+  const after = fs.lstatSync(targetDir, { bigint: true });
+  assert.equal(after.dev, reservation.dev);
+  assert.equal(after.ino, reservation.ino);
+  assert.deepEqual(fs.readdirSync(targetDir).sort(), [
+    ".metadata", "empty", "lib", "native.node",
+  ]);
+  assert.equal(fs.readFileSync(path.join(targetDir, ".metadata"), "utf8"), "metadata\n");
+  assert.equal(
+    fs.readFileSync(path.join(targetDir, "lib", "nested", "owned"), "utf8"),
+    "owned\n",
+  );
+  assert.equal(fs.statSync(path.join(targetDir, "lib", "nested", "owned")).mode & 0o777, 0o755);
+  assert.deepEqual(fs.readFileSync(path.join(targetDir, "native.node")), nativeBytes);
+  assert.deepEqual(fs.readdirSync(path.join(targetDir, "empty")), []);
+});
+
+test("the default package commit atomically refuses an empty destination", (t) => {
+  const workspace = tempDirectory(t, "watchbound-package-empty-no-replace-");
+  const sourceDir = path.join(workspace, "source");
+  const targetDir = path.join(workspace, "target");
+  writeFile(path.join(sourceDir, "owned"), "owned\n");
+  fs.mkdirSync(targetDir);
+  const targetIdentity = fs.lstatSync(targetDir, { bigint: true });
+  let reserved = false;
+
+  assert.throws(
+    () => commitPackageDirectoryNoReplace(sourceDir, targetDir, () => {
+      reserved = true;
+    }),
+    (error) => error?.code === "EEXIST",
+  );
+
+  const after = fs.lstatSync(targetDir, { bigint: true });
+  assert.equal(reserved, false);
+  assert.equal(after.dev, targetIdentity.dev);
+  assert.equal(after.ino, targetIdentity.ino);
+  assert.deepEqual(fs.readdirSync(targetDir), []);
+});
+
 test("the default package commit atomically refuses an existing destination", (t) => {
   const workspace = tempDirectory(t, "watchbound-package-no-replace-");
   const sourceDir = path.join(workspace, "source");
@@ -1975,6 +2180,48 @@ test("the default package commit atomically refuses an existing destination", (t
   assert.equal(after.ino, targetIdentity.ino);
   assert.equal(fs.readFileSync(path.join(targetDir, "foreign"), "utf8"), "preserve\n");
   assert.equal(fs.existsSync(path.join(targetDir, "owned")), false);
+});
+
+test("the default package copy refuses existing reservation entries", async (t) => {
+  for (const kind of ["file", "directory", "symlink"]) {
+    await t.test(kind, (t) => {
+      const workspace = tempDirectory(t, "watchbound-package-entry-no-replace-");
+      const sourceDir = path.join(workspace, "source");
+      const targetDir = path.join(workspace, "target");
+      const conflictPath = path.join(targetDir, "lib");
+      const foreignDir = path.join(workspace, "foreign");
+      writeFile(path.join(sourceDir, "lib", "owned"), "owned\n");
+      writeFile(path.join(foreignDir, "foreign-owner"), "preserve\n");
+      let conflictIdentity;
+      let markerPath;
+
+      assert.throws(
+        () => commitPackageDirectoryNoReplace(sourceDir, targetDir, () => {
+          if (kind === "file") {
+            markerPath = conflictPath;
+            writeFile(markerPath, "preserve\n");
+          } else if (kind === "directory") {
+            markerPath = path.join(conflictPath, "foreign-owner");
+            writeFile(markerPath, "preserve\n");
+          } else {
+            markerPath = path.join(foreignDir, "foreign-owner");
+            fs.symlinkSync(foreignDir, conflictPath, "dir");
+          }
+          conflictIdentity = fs.lstatSync(conflictPath, { bigint: true });
+        }),
+        (error) => error?.code === "EEXIST",
+      );
+
+      const after = fs.lstatSync(conflictPath, { bigint: true });
+      assert.equal(after.dev, conflictIdentity.dev);
+      assert.equal(after.ino, conflictIdentity.ino);
+      assert.equal(fs.readFileSync(markerPath, "utf8"), "preserve\n");
+      if (kind !== "file") {
+        assert.equal(fs.existsSync(path.join(conflictPath, "owned")), false);
+      }
+      assert.deepEqual(fs.readdirSync(foreignDir), ["foreign-owner"]);
+    });
+  }
 });
 
 test("the default package commit rejects a swapped reservation before copying", (t) => {
@@ -2013,11 +2260,16 @@ test("the default package commit verifies reservation identity after copying", (
   const movedTarget = path.join(workspace, "moved-target");
   const markerPath = path.join(targetDir, "foreign-owner");
   writeFile(path.join(sourceDir, "owned"), "owned\n");
+  writeFile(path.join(sourceDir, "nested", "owned"), "nested\n");
   const originalCpSync = fs.cpSync;
+  let swapped = false;
   fs.cpSync = (...args) => {
     originalCpSync(...args);
-    fs.renameSync(targetDir, movedTarget);
-    writeFile(markerPath, "preserve\n");
+    if (!swapped) {
+      swapped = true;
+      fs.renameSync(targetDir, movedTarget);
+      writeFile(markerPath, "preserve\n");
+    }
   };
 
   try {
@@ -2036,6 +2288,8 @@ test("the default package commit verifies reservation identity after copying", (
   assert.equal(fs.readFileSync(markerPath, "utf8"), "preserve\n");
   assert.equal(fs.existsSync(path.join(targetDir, "owned")), false);
   assert.equal(fs.readFileSync(path.join(movedTarget, "owned"), "utf8"), "owned\n");
+  assert.equal(fs.existsSync(path.join(targetDir, "nested")), false);
+  assert.equal(fs.readFileSync(path.join(movedTarget, "nested", "owned"), "utf8"), "nested\n");
 });
 
 test("the default package copy remains bound to a moved reservation", (t) => {
@@ -2045,10 +2299,15 @@ test("the default package copy remains bound to a moved reservation", (t) => {
   const movedTarget = path.join(workspace, "moved-target");
   const markerPath = path.join(targetDir, "foreign-owner");
   writeFile(path.join(sourceDir, "owned"), "owned\n");
+  writeFile(path.join(sourceDir, "nested", "owned"), "nested\n");
   const originalCpSync = fs.cpSync;
+  let swapped = false;
   fs.cpSync = (...args) => {
-    fs.renameSync(targetDir, movedTarget);
-    writeFile(markerPath, "preserve\n");
+    if (!swapped) {
+      swapped = true;
+      fs.renameSync(targetDir, movedTarget);
+      writeFile(markerPath, "preserve\n");
+    }
     originalCpSync(...args);
   };
 
@@ -2068,6 +2327,46 @@ test("the default package copy remains bound to a moved reservation", (t) => {
   assert.equal(fs.readFileSync(markerPath, "utf8"), "preserve\n");
   assert.equal(fs.existsSync(path.join(targetDir, "owned")), false);
   assert.equal(fs.readFileSync(path.join(movedTarget, "owned"), "utf8"), "owned\n");
+  assert.equal(fs.existsSync(path.join(targetDir, "nested")), false);
+  assert.equal(fs.readFileSync(path.join(movedTarget, "nested", "owned"), "utf8"), "nested\n");
+});
+
+test("the default package-set commit rolls back a partially copied reservation", async (t) => {
+  const fixture = packageFixtureManifest(t);
+  const extractedDir = tempDirectory(t, "watchbound-package-copy-rollback-");
+  writeExtractedAppRuntime(extractedDir);
+  const firstTarget = packageTarget(extractedDir, fixture.manifest.packages.targets.x64.name);
+  const originalCpSync = fs.cpSync;
+  let injected = false;
+  fs.cpSync = (source, target, options) => {
+    originalCpSync(source, target, options);
+    if (
+      target.startsWith("/proc/self/fd/") &&
+      path.basename(path.dirname(source)) === "watchbound-node"
+    ) {
+      injected = true;
+      assert.equal(fs.existsSync(firstTarget), true);
+      assert.equal(fs.lstatSync(target).isFile(), true);
+      throw Object.assign(new Error("injected reserved-entry copy failure"), {
+        code: "EIO",
+      });
+    }
+  };
+
+  try {
+    await assert.rejects(
+      stageWatchboundPackages(packageStageOptions(extractedDir, fixture, {
+        arch: "x64",
+        materializePackage: fixtureMaterializer(fixture),
+      })),
+      /injected reserved-entry copy failure/u,
+    );
+  } finally {
+    fs.cpSync = originalCpSync;
+  }
+
+  assert.equal(injected, true);
+  assert.deepEqual(fs.readdirSync(extractedDir), ["package.json"]);
 });
 
 test("package reservation identity ambiguity is failed-integrity", async (t) => {

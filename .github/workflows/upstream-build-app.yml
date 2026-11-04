@@ -82,7 +82,21 @@ jobs:
             --metadata upstream/${{ matrix.architecture }}.json \
             --key-base64 assets/openai-codex-linux-repository-key.gpg.base64 \
             --arch ${{ matrix.architecture }})"
+          asar_dir="upstream/${{ matrix.architecture }}/signed-app"
+          mkdir -p "$asar_dir"
+          dpkg-deb --fsys-tarfile "$package" | \
+            tar -xf - -C "$asar_dir" --strip-components=4 \
+              ./usr/lib/chatgpt/ChatGPT \
+              ./usr/lib/chatgpt/resources/app.asar \
+              ./usr/lib/chatgpt/resources/app.asar.unpacked
+          asar="$asar_dir/resources/app.asar"
+          test -x "$asar_dir/ChatGPT"
+          test -s "$asar"
+          test -d "$asar.unpacked"
           echo "package=$package" >> "$GITHUB_OUTPUT"
+          echo "asar=$asar" >> "$GITHUB_OUTPUT"
+          echo "app_dir=$asar_dir" >> "$GITHUB_OUTPUT"
+          echo "executable=$asar_dir/ChatGPT" >> "$GITHUB_OUTPUT"
       - name: Require the dispatched signed campaign
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -103,6 +117,49 @@ jobs:
             throw new Error("invalid dispatched release identity");
           }
           NODE
+      - name: Qualify Watchbound against the signed runtime executable
+        run: |
+          set -euo pipefail
+          official_asar="$(realpath -- "${{ steps.upstream.outputs.asar }}")"
+          runtime_metadata="$(mktemp -d)"
+          trap 'rm -rf "$runtime_metadata"' EXIT
+          (
+            cd "$runtime_metadata"
+            npx --yes @electron/asar extract-file \
+              "$official_asar" \
+              package.json
+          )
+          test -s "$runtime_metadata/package.json"
+          node - \
+            "$runtime_metadata" \
+            "${{ steps.upstream.outputs.executable }}" \
+            "${{ matrix.architecture }}" <<'NODE'
+          const fs = require("node:fs");
+          const {
+            validateArtifactManifest,
+            validateTargetRuntime,
+          } = require("./linux-features/directory-only-working-tree-watch/watchbound-package.js");
+          const manifest = JSON.parse(fs.readFileSync(
+            "linux-features/directory-only-working-tree-watch/watchbound-artifacts.json",
+            "utf8",
+          ));
+          validateArtifactManifest(manifest);
+          const runtime = validateTargetRuntime(
+            process.argv[2],
+            manifest,
+            undefined,
+            undefined,
+            process.argv[3],
+          );
+          if (runtime.qualification !== "signed-runtime-executable") {
+            throw new Error(
+              `Watchbound ${process.argv[4]} runtime qualification did not use the signed executable`,
+            );
+          }
+          console.log(
+            `Watchbound ${process.argv[4]} runtime qualified from signed executable: Node.js ${runtime.node}`,
+          );
+          NODE
       - name: Build required default baseline
         env:
           CODEX_TARGET_ARCH: ${{ matrix.architecture }}
@@ -110,28 +167,85 @@ jobs:
           CODEX_INSTALL_DIR: ${{ github.workspace }}/codex-app-${{ matrix.architecture }}
         run: |
           ./install.sh "${{ steps.upstream.outputs.package }}"
-          upstream_root="$(mktemp -d)"
-          dpkg-deb -x "${{ steps.upstream.outputs.package }}" "$upstream_root"
-          if ! cmp -s "$upstream_root/usr/lib/chatgpt/resources/app.asar" "$CODEX_INSTALL_DIR/resources/app.asar"; then
-            echo "default build did not preserve the signed app.asar byte-for-byte" >&2
-            exit 1
-          fi
-          node - "$CODEX_INSTALL_DIR/.codex-linux/patch-report.json" "$CODEX_INSTALL_DIR/resources/app.asar" <<'NODE'
+          node - "${{ steps.upstream.outputs.asar }}" \
+            "$CODEX_INSTALL_DIR/resources/app.asar" \
+            "$CODEX_INSTALL_DIR/.codex-linux/patch-report.json" <<'NODE'
           const crypto = require("node:crypto");
           const fs = require("node:fs");
-          const report = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-          const asarSha256 = crypto.createHash("sha256")
-            .update(fs.readFileSync(process.argv[3]))
-            .digest("hex");
+          const { requiredPatchNamesForProfile } = require("./scripts/patches/runner.js");
+          const sha256 = (file) => crypto.createHash("sha256")
+            .update(fs.readFileSync(file)).digest("hex");
+          const upstreamSha256 = sha256(process.argv[2]);
+          const outputSha256 = sha256(process.argv[3]);
+          const report = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+          const requiredNames = requiredPatchNamesForProfile("upstream-build");
+          const required = new Set(requiredNames);
+          const reportedNames = new Set(report.patches.map(({ name }) => name));
           if (report.enabledFeatures.length !== 0
-              || report.patches.length !== 0
-              || report.upstreamAppAsar?.preservedByteForByte !== true
-              || report.upstreamAppAsar?.sha256 !== asarSha256) {
-            throw new Error(`unexpected default patch report: ${JSON.stringify(report)}`);
+              || report.patches.length !== required.size
+              || reportedNames.size !== report.patches.length
+              || report.patches.some((patch) => !required.has(patch.name)
+                || patch.ciPolicy !== "required-upstream"
+                || patch.sourceKind !== "core"
+                || patch.status !== "applied")
+              || report.upstreamAppAsar?.preservedByteForByte !== (required.size === 0)
+              || report.upstreamAppAsar?.sha256 !== upstreamSha256
+              || report.outputAppAsar?.sha256 !== outputSha256
+              || (required.size === 0
+                ? upstreamSha256 !== outputSha256
+                : upstreamSha256 === outputSha256)) {
+            throw new Error(`unexpected required default patch report: ${JSON.stringify(report)}`);
           }
           NODE
+          node scripts/ci/validate-patch-report.js \
+            "$CODEX_INSTALL_DIR/.codex-linux/patch-report.json" \
+            --profile upstream-build
           test -x "$CODEX_INSTALL_DIR/ChatGPT"
           test -x "$CODEX_INSTALL_DIR/resources/codex"
+      - name: Test required core patches against the signed bundle
+        run: |
+          set -euo pipefail
+          extracted_asar="$(mktemp -d)"
+          trap 'rm -rf "$extracted_asar"' EXIT
+          npx --yes @electron/asar extract \
+            "${{ steps.upstream.outputs.asar }}" \
+            "$extracted_asar"
+          CODEX_SIGNED_EXTRACTED_APP="$extracted_asar" node - <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const childProcess = require("node:child_process");
+          const { corePatchDescriptors } = require("./scripts/patches/runner.js");
+          const tests = corePatchDescriptors()
+            .filter(({ ciPolicy }) => ciPolicy === "required-upstream")
+            .map(({ sourcePath }) => path.join(path.dirname(sourcePath), "test.js"));
+          if (tests.some((testPath) => !fs.existsSync(testPath))) {
+            throw new Error(`required core patch regression test missing: ${tests.join(", ")}`);
+          }
+          if (tests.length > 0) {
+            const result = childProcess.spawnSync(process.execPath, ["--test", ...tests], {
+              env: process.env,
+              stdio: "inherit",
+            });
+            if (result.error) throw result.error;
+            if (result.status !== 0) process.exit(result.status ?? 1);
+          }
+          NODE
+      - name: Test profile isolation, Computer Use and account menu against the signed bundle
+        run: |
+          set -euo pipefail
+          extracted_asar="$(mktemp -d)"
+          trap 'rm -rf "$extracted_asar"' EXIT
+          npx --yes @electron/asar extract \
+            "${{ steps.upstream.outputs.asar }}" \
+            "$extracted_asar"
+          CODEX_SIGNED_EXTRACTED_APP="$extracted_asar" \
+            node --test linux-features/community-profile-isolation/test.js
+          CODEX_SIGNED_EXTRACTED_APP="$extracted_asar" \
+            node --test linux-features/computer-use-linux/unified.test.js \
+              linux-features/computer-use-linux/resume.test.js \
+              linux-features/computer-use-linux/current-signed.test.js \
+              linux-features/computer-use-linux/native-applications.test.js \
+              linux-features/account-switcher/test.js
       - name: Require signed renderer dependency regression
         env:
           EXPECTED_SIGNED_VERSION: ${{ inputs.version }}
@@ -149,38 +263,77 @@ jobs:
             throw new Error("signed renderer regression is not bound to the expected campaign");
           }
           NODE
-          upstream_root="$(mktemp -d)"
           extracted_asar="$(mktemp -d)"
-          dpkg-deb -x "${{ steps.upstream.outputs.package }}" "$upstream_root"
+          trap 'rm -rf "$extracted_asar"' EXIT
           npx --yes @electron/asar extract \
-            "$upstream_root/usr/lib/chatgpt/resources/app.asar" \
+            "${{ steps.upstream.outputs.asar }}" \
             "$extracted_asar"
           node - "$extracted_asar/webview/assets" <<'NODE'
           const fs = require("node:fs");
           const path = require("node:path");
           const assets = process.argv[2];
-          function requireUniqueAsset(pattern, description) {
-            const matches = fs.readdirSync(assets, { withFileTypes: true })
-              .filter((entry) => entry.isFile() && pattern.test(entry.name))
-              .map((entry) => entry.name);
-            if (matches.length !== 1) {
-              throw new Error(`expected exactly one ${description} asset, found ${matches.length}: ${matches.join(", ")}`);
-            }
-            return matches[0];
-          }
-          const authedName = requireUniqueAsset(/^authed-route-[A-Za-z0-9_-]+\.js$/, "authenticated route");
-          const primaryName = requireUniqueAsset(/^app-primary-[A-Za-z0-9_-]+\.js$/, "primary application");
-          const authed = fs.readFileSync(path.join(assets, authedName), "utf8");
-          const primary = fs.readFileSync(path.join(assets, primaryName), "utf8");
-          if (!authed.includes(`./${primaryName}`)) {
-            throw new Error(`${authedName} no longer imports ${primaryName}`);
-          }
-          const authedFingerprint = authedName.slice("authed-route-".length, -".js".length);
-          for (const reverseMarker of [authedName, "authed-route", authedFingerprint]) {
-            if (primary.includes(reverseMarker)) {
-              throw new Error(`${primaryName} restored the retired reverse dependency via ${reverseMarker}`);
+          // The rspack webview keeps entry chunks in assets/ and lazy chunks in
+          // assets/async/. A static ESM import cycle between them blocks renderer
+          // startup, which is the upstream regression this step guards against.
+          const files = [];
+          for (const directory of ["", "async"]) {
+            const dir = path.join(assets, directory);
+            if (!fs.existsSync(dir)) continue;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (entry.isFile() && entry.name.endsWith(".js")) files.push(path.posix.join(directory, entry.name));
             }
           }
+          if (!files.some((name) => name.startsWith("async/"))) {
+            throw new Error("expected rspack async webview chunks in webview/assets/async");
+          }
+          const staticImport = /(?:\bfrom|\bimport)\s*"(\.\.?\/[^"]+\.js)"/g;
+          const graph = new Map();
+          let edgeCount = 0;
+          for (const name of files) {
+            const source = fs.readFileSync(path.join(assets, name), "utf8");
+            const targets = [];
+            for (const match of source.matchAll(staticImport)) {
+              const target = path.posix.normalize(path.posix.join(path.posix.dirname(name), match[1]));
+              if (!fs.existsSync(path.join(assets, target))) {
+                throw new Error(`${name} statically imports missing ${match[1]}`);
+              }
+              targets.push(target);
+            }
+            edgeCount += targets.length;
+            graph.set(name, targets);
+          }
+          if (edgeCount === 0) {
+            throw new Error("found no static imports between webview chunks; the import scan is stale");
+          }
+          const done = new Set();
+          const active = new Set();
+          for (const root of graph.keys()) {
+            if (done.has(root)) continue;
+            const stack = [[root, 0]];
+            active.add(root);
+            while (stack.length > 0) {
+              const frame = stack[stack.length - 1];
+              const [name, index] = frame;
+              const targets = graph.get(name) ?? [];
+              if (index === targets.length) {
+                stack.pop();
+                active.delete(name);
+                done.add(name);
+                continue;
+              }
+              frame[1] += 1;
+              const target = targets[index];
+              if (active.has(target)) {
+                const cycle = stack.map(([entry]) => entry);
+                throw new Error(`webview chunks restored a static import cycle: ${cycle.slice(cycle.indexOf(target)).concat(target).join(" -> ")}`);
+              }
+              if (!done.has(target)) {
+                active.add(target);
+                stack.push([target, 0]);
+              }
+            }
+          }
+          console.log(`webview static import graph is acyclic: ${files.length} chunks, ${edgeCount} imports`);
           NODE
       - name: Validate the Nix ELF contract against the official payload
         env:
@@ -191,6 +344,7 @@ jobs:
             --root "$CODEX_INSTALL_DIR" \
             --arch "${{ matrix.architecture }}"
           fix_root="$(mktemp -d)"
+          trap 'rm -rf "$fix_root"' EXIT
           cp -a "$CODEX_INSTALL_DIR/." "$fix_root/"
           chmod -R u+w "$fix_root"
           if [ "${{ matrix.architecture }}" = amd64 ]; then
@@ -217,13 +371,14 @@ jobs:
         if: matrix.architecture == 'amd64'
         run: |
           set -euo pipefail
-          upstream_root="$(mktemp -d)"
           extracted_asar="$(mktemp -d)"
-          dpkg-deb -x "${{ steps.upstream.outputs.package }}" "$upstream_root"
+          trap 'rm -rf "$extracted_asar"' EXIT
           npx --yes @electron/asar extract \
-            "$upstream_root/usr/lib/chatgpt/resources/app.asar" \
+            "${{ steps.upstream.outputs.asar }}" \
             "$extracted_asar"
-          node scripts/ci/verify-official-linux-features.js "$extracted_asar"
+          node scripts/ci/verify-official-linux-features.js \
+            "$extracted_asar" \
+            "${{ steps.upstream.outputs.app_dir }}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: official-linux-${{ matrix.architecture }}-metadata
@@ -288,6 +443,60 @@ jobs:
           PACMAN_STAGE_ONLY=1 ./scripts/build-pacman.sh
           APPIMAGE_STAGE_ONLY=1 ./scripts/build-appimage.sh
 
+  community-profile-isolation-feature-alone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev gnupg
+      - name: Build Community profile isolation alone from the signed package
+        env:
+          CODEX_LINUX_FEATURES_CONFIG: ${{ github.workspace }}/community-profile-isolation-features.json
+          CODEX_INSTALL_DIR: ${{ github.workspace }}/codex-app-community-profile-isolation
+          CODEX_TARGET_ARCH: amd64
+          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
+          EXPECTED_VERSION: ${{ inputs.version }}
+          EXPECTED_REPOSITORY_PATH: ${{ inputs.amd64_repository_path }}
+          EXPECTED_SHA256: ${{ inputs.amd64_sha256 }}
+        run: |
+          set -euo pipefail
+          cat > "$CODEX_LINUX_FEATURES_CONFIG" <<'JSON'
+          {
+            "enabled": ["community-profile-isolation"]
+          }
+          JSON
+          mkdir -p upstream
+          package="$(node scripts/lib/upstream-linux-package.js \
+            --output-dir upstream/amd64 \
+            --metadata upstream/amd64.json \
+            --key-base64 assets/openai-codex-linux-repository-key.gpg.base64 \
+            --arch amd64)"
+          node - upstream/amd64.json <<'NODE'
+          const fs = require("node:fs");
+          const metadata = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          if (process.env.GITHUB_EVENT_NAME === "workflow_dispatch"
+              && (metadata.version !== process.env.EXPECTED_VERSION
+                || metadata.repositoryPath !== process.env.EXPECTED_REPOSITORY_PATH
+                || metadata.sha256 !== process.env.EXPECTED_SHA256
+                || !/^[0-9a-f]{64}$/.test(process.env.EXPECTED_RELEASE_ID))) {
+            throw new Error("Community profile isolation package does not match the dispatched campaign");
+          }
+          NODE
+          ./install.sh "$package"
+          node --test linux-features/community-profile-isolation/test.js
+          wrapper="$CODEX_INSTALL_DIR/.codex-linux/features/community-profile-isolation/codex-cli-wrapper.sh"
+          test -x "$wrapper"
+          grep -R -F 'CODEX_HOME="$HOME/.codex-community"' "$CODEX_INSTALL_DIR/.codex-linux/env.d"
+          grep -R -F 'CODEX_ELECTRON_USER_DATA_PATH' "$CODEX_INSTALL_DIR/.codex-linux/launcher.d"
+
   dock-icon-feature-alone:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -308,6 +517,10 @@ jobs:
           CODEX_INSTALL_DIR: ${{ github.workspace }}/codex-app-dock-icon
           CODEX_PATCH_REPORT_JSON: ${{ github.workspace }}/dock-icon-report/patch-report.json
           CODEX_TARGET_ARCH: amd64
+          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
+          EXPECTED_VERSION: ${{ inputs.version }}
+          EXPECTED_REPOSITORY_PATH: ${{ inputs.amd64_repository_path }}
+          EXPECTED_SHA256: ${{ inputs.amd64_sha256 }}
         run: |
           set -euo pipefail
           cat > "$CODEX_LINUX_FEATURES_CONFIG" <<'JSON'
@@ -330,6 +543,17 @@ jobs:
             --metadata upstream/amd64.json \
             --key-base64 assets/openai-codex-linux-repository-key.gpg.base64 \
             --arch amd64)"
+          node - upstream/amd64.json <<'NODE'
+          const fs = require("node:fs");
+          const metadata = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          if (process.env.GITHUB_EVENT_NAME === "workflow_dispatch"
+              && (metadata.version !== process.env.EXPECTED_VERSION
+                || metadata.repositoryPath !== process.env.EXPECTED_REPOSITORY_PATH
+                || metadata.sha256 !== process.env.EXPECTED_SHA256
+                || !/^[0-9a-f]{64}$/.test(process.env.EXPECTED_RELEASE_ID))) {
+            throw new Error("Dock icon package does not match the dispatched campaign");
+          }
+          NODE
           ./install.sh "$package"
           node scripts/ci/validate-patch-report.js "$CODEX_PATCH_REPORT_JSON" \
             --require-enabled-feature ui-tweaks \
@@ -409,6 +633,7 @@ jobs:
     needs:
       - signed-baseline
       - package-matrix
+      - community-profile-isolation-feature-alone
       - dock-icon-feature-alone
       - watchdog
     runs-on: ubuntu-latest
@@ -418,10 +643,12 @@ jobs:
         env:
           SIGNED_BASELINE_RESULT: ${{ needs.signed-baseline.result }}
           PACKAGE_MATRIX_RESULT: ${{ needs.package-matrix.result }}
+          COMMUNITY_PROFILE_ISOLATION_FEATURE_ALONE_RESULT: ${{ needs.community-profile-isolation-feature-alone.result }}
           DOCK_ICON_FEATURE_ALONE_RESULT: ${{ needs.dock-icon-feature-alone.result }}
           WATCHDOG_RESULT: ${{ needs.watchdog.result }}
         run: |
           test "$SIGNED_BASELINE_RESULT" = success
           test "$PACKAGE_MATRIX_RESULT" = success
+          test "$COMMUNITY_PROFILE_ISOLATION_FEATURE_ALONE_RESULT" = success
           test "$DOCK_ICON_FEATURE_ALONE_RESULT" = success
           test "$WATCHDOG_RESULT" = success

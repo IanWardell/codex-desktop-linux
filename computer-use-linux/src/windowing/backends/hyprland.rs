@@ -207,7 +207,31 @@ impl HyprlandCaptureLayout {
     }
 }
 
+/// `grim -T` ids of the windows in the last listing, by window_id. A stableId
+/// lasts as long as its window, so per-window capture reads it here instead
+/// of listing every client again.
+static STABLE_IDS: std::sync::Mutex<Option<std::collections::HashMap<u64, String>>> =
+    std::sync::Mutex::new(None);
+
+fn stable_id_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(id) => Some(id.clone()),
+        serde_json::Value::Number(id) => Some(id.to_string()),
+        _ => None,
+    }
+}
+
 fn windows_from_hyprland_clients(clients: Vec<HyprlandClient>) -> Result<Vec<WindowInfo>> {
+    let stable_ids = clients
+        .iter()
+        .filter_map(|client| {
+            let window_id = parse_hyprland_address(&client.address).ok()?;
+            Some((window_id, stable_id_text(client.stable_id.as_ref()?)?))
+        })
+        .collect();
+    if let Ok(mut cache) = STABLE_IDS.lock() {
+        *cache = Some(stable_ids);
+    }
     let mut windows = clients
         .into_iter()
         .filter(|client| client.mapped.unwrap_or(true))
@@ -240,6 +264,372 @@ pub async fn activate_window(window_id: u64) -> Result<()> {
             command_detail(&legacy_output)
         );
     }
+}
+
+/// Sends key presses to a window without focusing it, through Hyprland's
+/// `send_key_state` dispatcher. Every press is a down and an up event; all
+/// events go in one `[[BATCH]]` socket request per chunk. A failure after
+/// any key arrived says how many did, so the caller does not resend them.
+/// A batch that stops between a key's down and up events, or whose outcome
+/// is unknown, gets a best-effort release so the client does not start its
+/// own key repeat.
+pub async fn send_key_events(
+    window_id: u64,
+    presses: &[crate::hyprland_input::KeyPress],
+) -> Result<()> {
+    let socket = match socket_path() {
+        Ok(socket) => socket,
+        Err(error) => {
+            return Err(error.context("No keys were sent: could not reach the Hyprland socket"))
+        }
+    };
+    send_key_events_at(&socket, window_id, presses).await
+}
+
+async fn send_key_events_at(
+    socket: &Path,
+    window_id: u64,
+    presses: &[crate::hyprland_input::KeyPress],
+) -> Result<()> {
+    const PRESSES_PER_BATCH: usize = 64;
+    let address = format!("address:0x{window_id:x}");
+    let total = presses.len();
+    let mut delivered = 0;
+    for chunk in presses.chunks(PRESSES_PER_BATCH) {
+        let batch = chunk
+            .iter()
+            .flat_map(|press| {
+                ["down", "up"].map(|state| key_state_dispatch(&address, press, state))
+            })
+            .collect::<Vec<_>>()
+            .join(" ; ");
+        let stream = match socket_connect(socket).await {
+            Ok(stream) => stream,
+            Err(error) if delivered == 0 => {
+                return Err(error.context("No keys were sent: could not reach the Hyprland socket"))
+            }
+            Err(error) => bail!(
+                "Hyprland send_key_state stopped for {address}: {delivered} of {total} key presses were delivered, the rest were not sent. Inspect the target before retrying, and send only the remainder: {error:#}"
+            ),
+        };
+        let reply = match socket_exchange(stream, &format!("[[BATCH]]{batch}")).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                let released =
+                    release_held_keys(socket, &address, &held_after_batch(chunk, None)).await;
+                bail!(
+                    "Hyprland send_key_state failed for {address}: {delivered} of {total} key presses were delivered, and up to {} more may have been.{released} Inspect the target before retrying: {error:#}",
+                    chunk.len()
+                )
+            }
+        };
+        // Hyprland runs a batch in order and answers each dispatch. Only a
+        // complete answer says what ran: an empty or short reply (the stream
+        // closed early) or an ok after an error leaves the batch uncertain.
+        let expected = chunk.len() * 2;
+        let replies = if reply.trim().is_empty() {
+            Vec::new()
+        } else {
+            reply.split("\n\n\n").map(str::trim).collect::<Vec<_>>()
+        };
+        let first_error = replies.iter().position(|reply| *reply != "ok");
+        let exact = replies.len() == expected
+            && first_error.is_none_or(|at| replies[at..].iter().all(|reply| *reply != "ok"));
+        if !exact {
+            let released =
+                release_held_keys(socket, &address, &held_after_batch(chunk, None)).await;
+            bail!(
+                "Hyprland send_key_state failed for {address}: {delivered} of {total} key presses were confirmed, and up to {} more may have been delivered (Hyprland answered {} of {expected} dispatches).{released} Inspect the target before retrying: {}",
+                chunk.len(),
+                replies.len(),
+                reply.trim()
+            );
+        }
+        if let Some(accepted) = first_error {
+            let done = delivered + accepted / 2;
+            if done == 0 && accepted == 0 {
+                bail!(
+                    "No keys were sent: Hyprland send_key_state refused {address}: {}",
+                    reply.trim()
+                );
+            }
+            let held = held_after_batch(chunk, Some(accepted));
+            let released = if held.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " The last key went down without its release.{}",
+                    release_held_keys(socket, &address, &held).await
+                )
+            };
+            bail!(
+                "Hyprland send_key_state stopped for {address}: {done} of {total} key presses were delivered.{released} Inspect the target before retrying, and send only the remainder: {}",
+                reply.trim()
+            );
+        }
+        delivered += chunk.len();
+    }
+    Ok(())
+}
+
+fn key_state_dispatch(
+    address: &str,
+    press: &crate::hyprland_input::KeyPress,
+    state: &str,
+) -> String {
+    format!(
+        "dispatch hl.dsp.send_key_state({{ mods = \"{}\", key = \"{}\", state = \"{state}\", window = \"{address}\" }})",
+        press.mods, press.key
+    )
+}
+
+/// The presses a batch may have left down. `accepted` is how many of the
+/// batch's down/up dispatches Hyprland confirmed before its first refusal; an
+/// odd count stopped between one press's down and up. `None` means the
+/// outcome is unknown, so any press of the chunk may be the one held.
+fn held_after_batch(
+    chunk: &[crate::hyprland_input::KeyPress],
+    accepted: Option<usize>,
+) -> Vec<&crate::hyprland_input::KeyPress> {
+    match accepted {
+        Some(accepted) if accepted % 2 == 1 => chunk.get(accepted / 2).into_iter().collect(),
+        Some(_) => Vec::new(),
+        None => {
+            let mut held: Vec<&crate::hyprland_input::KeyPress> = Vec::new();
+            for press in chunk {
+                if !held.contains(&press) {
+                    held.push(press);
+                }
+            }
+            held
+        }
+    }
+}
+
+/// Sends an `up` event for each press that may still be down, and describes
+/// the outcome as a sentence for the caller's error. A release of a key that
+/// is not down is ignored by the client.
+async fn release_held_keys(
+    socket: &Path,
+    address: &str,
+    held: &[&crate::hyprland_input::KeyPress],
+) -> String {
+    if held.is_empty() {
+        return String::new();
+    }
+    let batch = held
+        .iter()
+        .map(|press| key_state_dispatch(address, press, "up"))
+        .collect::<Vec<_>>()
+        .join(" ; ");
+    // The caller still holds the input lock, and the batch may have failed
+    // on a stalled compositor, so the release gets a short budget of its own.
+    let release = async {
+        let stream = socket_connect(socket).await?;
+        let reply = socket_exchange(stream, &format!("[[BATCH]]{batch}")).await?;
+        let replies = reply.split("\n\n\n").map(str::trim).collect::<Vec<_>>();
+        if replies.len() == held.len() && replies.iter().all(|reply| *reply == "ok") {
+            Ok(())
+        } else {
+            bail!("Hyprland answered: {}", reply.trim())
+        }
+    };
+    let outcome = match tokio::time::timeout(RELEASE_TIMEOUT, release).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(anyhow::anyhow!(
+            "no answer within {} ms",
+            RELEASE_TIMEOUT.as_millis()
+        )),
+    };
+    match outcome {
+        Ok(()) => " A release was sent for every key that may have been left down.".to_string(),
+        Err(error) => format!(
+            " Releasing the keys that may have been left down also failed, so the target may repeat a key until its next key event: {error:#}."
+        ),
+    }
+}
+
+/// Path of Hyprland's control socket for the running instance.
+fn socket_path() -> Result<PathBuf> {
+    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(infer_hyprland_instance_signature)
+        .context("no Hyprland instance signature")?;
+    let path = xdg_runtime_dir()
+        .context("XDG_RUNTIME_DIR is unset")?
+        .join("hypr")
+        .join(signature)
+        .join(".socket.sock");
+    Ok(path)
+}
+
+/// Connects to Hyprland's control socket. Requests written here never
+/// appear in a process's argv, unlike `hyprctl`, so text spelled as key
+/// names cannot be read from `/proc/<pid>/cmdline`.
+async fn socket_connect(path: &Path) -> Result<tokio::net::UnixStream> {
+    tokio::time::timeout(SOCKET_TIMEOUT, tokio::net::UnixStream::connect(path))
+        .await
+        .with_context(|| format!("timed out connecting to {}", path.display()))?
+        .with_context(|| format!("failed to connect to {}", path.display()))
+}
+
+/// Writes one request and reads the reply until Hyprland closes the stream.
+async fn socket_exchange(mut stream: tokio::net::UnixStream, request: &str) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let exchange = async {
+        stream.write_all(request.as_bytes()).await?;
+        stream.shutdown().await?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await?;
+        std::io::Result::Ok(reply)
+    };
+    tokio::time::timeout(SOCKET_TIMEOUT, exchange)
+        .await
+        .context("timed out waiting for the Hyprland socket reply")?
+        .context("Hyprland socket request failed")
+}
+
+const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A PNG of one window, captured without focusing or raising it.
+pub struct WindowCapture {
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    /// Set when the window was on a hidden workspace. Hyprland stops sending
+    /// frame callbacks to off-screen windows, so their buffer holds the last
+    /// frame drawn while visible. Each capture makes the compositor send one
+    /// and the client repaints; some clients (Chromium) need several rounds.
+    pub hidden_workspace: Option<HiddenWorkspaceCapture>,
+}
+
+pub struct HiddenWorkspaceCapture {
+    pub workspace: i64,
+    /// Captures taken before two consecutive frames matched or the cap hit.
+    pub captures: u32,
+    /// False when frames were still changing at the cap: an animation, a
+    /// blinking caret, or a page that is still loading.
+    pub settled: bool,
+}
+
+/// Captures a window through `grim -T <stableId>` (ext-foreign-toplevel
+/// image capture). Works for unfocused windows and windows on hidden
+/// workspaces, needs no portal consent and never changes focus.
+/// `window` comes from the listing the caller just resolved, which also
+/// recorded its stableId; a window missing from it is listed once more.
+pub async fn capture_window(window: &WindowInfo) -> Result<WindowCapture> {
+    let window_id = window.window_id;
+    let address = format!("0x{window_id:x}");
+    let cached = STABLE_IDS
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref()?.get(&window_id).cloned());
+    let stable_id = match cached {
+        Some(id) => id,
+        None => {
+            list_windows().await?;
+            STABLE_IDS
+                .lock()
+                .ok()
+                .and_then(|cache| cache.as_ref()?.get(&window_id).cloned())
+                .with_context(|| {
+                    format!("Hyprland window {address} has no stableId; it is no longer listed, or this Hyprland is too old for per-window capture")
+                })?
+        }
+    };
+    if stable_id.is_empty() || !stable_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        bail!("Hyprland window {address} has an unexpected stableId {stable_id:?}");
+    }
+    let workspace_id = window.workspace.map(i64::from);
+    let workspace_visible = match (workspace_id, visible_workspace_ids().await) {
+        (Some(id), Some(visible)) => Some(visible.contains(&id)),
+        _ => None,
+    };
+
+    const MAX_CAPTURES: u32 = 8;
+    const SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+    let mut png = grim_toplevel(&stable_id, &address).await?;
+    let hidden_workspace = match (workspace_visible, workspace_id) {
+        (Some(false), Some(workspace)) => {
+            // Capture until two consecutive frames match: the first capture
+            // only wakes the client, and Chromium takes several rounds.
+            let mut captures = 1;
+            let mut settled = false;
+            while captures < MAX_CAPTURES {
+                tokio::time::sleep(SETTLE_INTERVAL).await;
+                let next = grim_toplevel(&stable_id, &address).await?;
+                captures += 1;
+                let same = next == png;
+                png = next;
+                if same && captures > 2 {
+                    settled = true;
+                    break;
+                }
+            }
+            Some(HiddenWorkspaceCapture {
+                workspace,
+                captures,
+                settled,
+            })
+        }
+        _ => None,
+    };
+    let (width, height) = crate::screenshot::png_dimensions(&png)
+        .context("grim -T did not return a usable PNG image")?;
+    Ok(WindowCapture {
+        png,
+        width,
+        height,
+        hidden_workspace,
+    })
+}
+
+async fn grim_toplevel(stable_id: &str, address: &str) -> Result<Vec<u8>> {
+    let mut command = Command::new("grim");
+    command.args(["-t", "png", "-T", stable_id, "-"]);
+    let output = command_runner::output(command, "capture a Hyprland window with grim -T")
+        .await
+        .context("grim is required for Hyprland background capture")?;
+    if !output.status.success() {
+        bail!(
+            "grim -T {stable_id} failed for {address}: {}",
+            command_detail(&output)
+        );
+    }
+    Ok(output.stdout)
+}
+
+async fn visible_workspace_ids() -> Option<Vec<i64>> {
+    let output = hyprctl_output_async(&["monitors", "-j"]).await.ok()?;
+    let monitors: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let ids = monitors
+        .as_array()?
+        .iter()
+        .flat_map(|monitor| {
+            ["activeWorkspace", "specialWorkspace"].map(|key| {
+                monitor
+                    .get(key)
+                    .and_then(|workspace| workspace.get("id"))
+                    .and_then(|id| id.as_i64())
+                    .filter(|id| *id != 0)
+            })
+        })
+        .flatten()
+        .collect();
+    Some(ids)
+}
+
+/// Raw `hyprctl devices -j` output, used to check the active keymap.
+pub async fn devices_json() -> Result<Vec<u8>> {
+    let output = hyprctl_output_async(&["devices", "-j"])
+        .await
+        .context("failed to run hyprctl devices -j")?;
+    if !output.status.success() {
+        bail!("hyprctl devices -j failed: {}", command_detail(&output));
+    }
+    Ok(output.stdout)
 }
 
 fn dispatch_succeeded(output: &std::process::Output) -> bool {
@@ -527,6 +917,98 @@ mod tests {
 
         assert_eq!(selected.signature, "newer");
     }
+
+    fn press(key: &str) -> crate::hyprland_input::KeyPress {
+        crate::hyprland_input::KeyPress {
+            mods: String::new(),
+            key: key.to_string(),
+        }
+    }
+
+    struct SocketDir(PathBuf);
+    impl Drop for SocketDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A fake Hyprland socket that answers each request with the next reply
+    /// and records the requests it got.
+    fn fake_hyprland_socket(
+        replies: Vec<&'static str>,
+    ) -> (SocketDir, PathBuf, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let dir = SocketDir(
+            std::env::temp_dir().join(format!("hypr-test-{}", u64::from_ne_bytes(random))),
+        );
+        fs::create_dir(&dir.0).unwrap();
+        let path = dir.0.join(".socket.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = String::new();
+                stream.read_to_string(&mut request).unwrap();
+                sender.send(request).unwrap();
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        (dir, path, receiver)
+    }
+
+    #[tokio::test]
+    async fn a_batch_stopped_between_down_and_up_releases_the_held_key() {
+        // down a, up a, down b accepted; up b refused.
+        let (_dir, socket, requests) =
+            fake_hyprland_socket(vec!["ok\n\n\nok\n\n\nok\n\n\nerror: gone", "ok"]);
+        let error = send_key_events_at(&socket, 0x42, &[press("a"), press("b")])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("1 of 2 key presses were delivered"),
+            "{error}"
+        );
+        assert!(error.contains("A release was sent"), "{error}");
+        requests.recv().unwrap();
+        let release = requests.recv().unwrap();
+        assert_eq!(
+            release,
+            "[[BATCH]]dispatch hl.dsp.send_key_state({ mods = \"\", key = \"b\", state = \"up\", window = \"address:0x42\" })"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncertain_batch_releases_every_distinct_key() {
+        // A short reply: the stream closed after two dispatches.
+        let (_dir, socket, requests) = fake_hyprland_socket(vec!["ok\n\n\nok", "ok\n\n\nok"]);
+        let error = send_key_events_at(&socket, 0x42, &[press("a"), press("b"), press("a")])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("A release was sent"), "{error}");
+        requests.recv().unwrap();
+        let release = requests.recv().unwrap();
+        assert_eq!(release.matches("state = \"up\"").count(), 2, "{release}");
+    }
+
+    #[tokio::test]
+    async fn a_complete_press_needs_no_release() {
+        let (_dir, socket, requests) =
+            fake_hyprland_socket(vec!["ok\n\n\nok\n\n\nerror: gone\n\n\nerror: gone"]);
+        let error = send_key_events_at(&socket, 0x42, &[press("a"), press("b")])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("release"), "{error}");
+        requests.recv().unwrap();
+        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -553,6 +1035,8 @@ struct HyprlandClient {
     xwayland: Option<bool>,
     #[serde(rename = "focusHistoryID")]
     focus_history_id: Option<i32>,
+    #[serde(rename = "stableId")]
+    stable_id: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

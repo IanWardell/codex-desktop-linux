@@ -95,6 +95,9 @@ Each feature directory must include:
 - optional `test.js` — self-contained tests for the feature
 
 Repository-owned build plumbing may set `"internal": true` in `feature.json`.
+Every manifest defaults to disabled when `defaultEnabled` is omitted. If
+provided, it must be the JSON boolean `false`; `true`, `null`, numbers, strings,
+arrays, and objects are rejected for repository, local, and internal features.
 Internal features are hidden from the setup wizard and public feature summary,
 cannot be selected through native `features.json`, and must be explicitly
 allowlisted by the owning build integration.
@@ -143,7 +146,7 @@ wrapper process that remains alive through the matching after-exit hooks.
 `packageResources` stage feature-owned regular files outside the app directory
 for native packages. Their targets cannot overlap the packaged app directory,
 and their quoted octal modes cannot include special permission bits.
-`packageDependencies` adds per-format runtime dependencies. Both apply only
+`packageDependencies` adds deb/RPM/pacman/ebuild runtime dependencies. Both apply only
 while their feature is enabled; see the architecture document for the field
 contract. Native package builds also strictly validate the current enabled set
 and require it to match the staged app's `.codex-linux/build-info.json`; rebuild
@@ -152,6 +155,16 @@ the app after changing the feature config.
 `packageHooks` run after declarative native package resources are staged and
 receive `PACKAGE_FORMAT`,
 `PACKAGE_ROOT`, `PACKAGE_NAME`, `PACKAGE_VERSION`, and `APP_DIR`.
+They are regular-user build-time hooks, not privileged installation scripts.
+Gentoo additionally requires an audited `gentoo.supported` declaration and
+separates bootstrap/build/runtime/install dependencies; see the
+[Gentoo feature contract](../docs/linux-features-architecture.md#gentoo-feature-contract).
+
+The supported `entrypoints` keys are `patchDescriptors`, `stageHook`, and
+`cleanupHook` (for disabled-feature cleanup). Omission, `null`, and `{}` mean
+no entrypoints. Other container types and unknown keys fail discovery in both
+the build loader and setup picker; discovery does not execute the declared code.
+Paths must stay inside the feature directory.
 
 Feature patching uses only `entrypoints.patchDescriptors`. Descriptor modules
 may export an array directly or `{ descriptors: [...] }`; `.patches`,
@@ -161,8 +174,13 @@ not supported.
 Descriptor patches use the same shape as `scripts/patches/core/**/patch.js`.
 They can target `main-bundle`, `extracted-app:pre-webview`, `webview-asset`, or
 `extracted-app:post-webview`. Feature descriptor ids are namespaced as
-`feature:<feature-id>:<descriptor-id>` in patch reports and are optional by
-default.
+`feature:<feature-id>:<descriptor-id>` in patch reports. `ciPolicy` defaults to
+`optional`, but enabled-feature acceptance defaults to enforced
+(`enforceWhenEnabled: true`): warnings or optional skips still reject the
+candidate. Only an explicitly optional descriptor may opt out with
+`enforceWhenEnabled: false`; required core and integrity checks remain in force.
+See the [descriptor status table](../docs/linux-features-architecture.md#asar-descriptors)
+for successful and not-applicable outcomes.
 
 Feature self-tests live inside each feature directory. Run them with:
 
@@ -170,7 +188,11 @@ Feature self-tests live inside each feature directory. Run them with:
 node --test linux-features/*/test.js
 ```
 
-The default core patch registry is empty. A core compatibility patch requires a
-reproduced blocker on the official Linux package and a regression test. Use
+The [core patch registry](../scripts/patches/core/README.md) contains only
+required compatibility patches for reproduced blockers with regression tests.
+An empty feature selection does not disable those core descriptors. Only when
+both sets are empty does the installer skip ASAR extraction and preserve the
+official archive unconditionally. Active descriptors and actual byte changes
+are distinguished in the [ASAR invariant](../docs/build-and-packaging.md#baseline-asar-invariant). Use
 `linux-features/` for additions that are useful for some users but not mandatory
 for every Linux build.

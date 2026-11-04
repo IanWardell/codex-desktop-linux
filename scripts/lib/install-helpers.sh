@@ -19,10 +19,10 @@ Run the helper to install them automatically:
   bash scripts/install-deps.sh
 
 Or install manually:
-  sudo apt install nodejs curl dpkg-dev gnupg                                      # Debian/Ubuntu
-  sudo dnf install nodejs curl dpkg-dev gnupg2                                     # Fedora
-  sudo pacman -S nodejs curl dpkg gnupg                                            # Arch
-  sudo zypper install nodejs curl dpkg gpg2                                        # openSUSE
+  sudo apt install nodejs npm curl dpkg-dev gnupg                                    # Debian/Ubuntu
+  sudo dnf install nodejs npm curl dpkg-dev gnupg2                                   # Fedora
+  sudo pacman -S nodejs curl dpkg gnupg                                              # Arch
+  sudo zypper install nodejs npm curl dpkg gpg2                                      # openSUSE
 EOF
 }
 
@@ -43,6 +43,7 @@ trap 'error "Failed at line $LINENO (exit code $?)"' ERR
 
 FRESH_INSTALL=0
 PROVIDED_UPSTREAM_DEB_PATH="${UPSTREAM_DEB:-}"
+SKIP_OAI_OFFICIAL_SIG_VERIFICATION=0
 INSPECT_ONLY=0
 REPORT_DIR=""
 
@@ -51,7 +52,9 @@ usage() {
 Usage: ./install.sh [OPTIONS] [path/to/chatgpt_*.deb]
 
 Builds the custom distribution from OpenAI's official Linux package. With no
-path, the package is resolved through signed stable APT metadata.
+path, the package is resolved through signed stable APT metadata. Local packages
+are verified against that metadata too, without prompting or reading user input.
+Only the explicit skip flag selects an unverified local build.
 
 Options:
   -h, --help     Show this help message and exit
@@ -59,6 +62,9 @@ Options:
   --inspect      Inspect the package and write reports without installing
   --report-dir DIR
                  Directory for --inspect reports (default: ./dist-next/rebuild)
+  --skip-oai-official-sig-verification
+                 Skip signed repository verification for a supplied local .deb
+                 for this invocation only; structural checks still apply
 
 Environment variables:
   CODEX_INSTALL_DIR   Override the install directory (default: ./codex-app)
@@ -92,6 +98,9 @@ parse_args() {
             --inspect)
                 INSPECT_ONLY=1
                 ;;
+            --skip-oai-official-sig-verification)
+                SKIP_OAI_OFFICIAL_SIG_VERIFICATION=1
+                ;;
             --report-dir)
                 shift
                 [ $# -gt 0 ] || error "--report-dir requires a directory"
@@ -105,7 +114,9 @@ parse_args() {
                 error "Unknown option: $1 (see --help)"
                 ;;
             *)
-                [ -z "$PROVIDED_UPSTREAM_DEB_PATH" ] || error "Only one upstream .deb path may be provided"
+                if [ -n "$PROVIDED_UPSTREAM_DEB_PATH" ] && [ "$1" != "$PROVIDED_UPSTREAM_DEB_PATH" ]; then
+                    error "Conflicting upstream .deb paths: $PROVIDED_UPSTREAM_DEB_PATH and $1"
+                fi
                 case "$1" in
                     *.dmg|*.DMG) error "macOS DMG inputs are no longer supported; provide the official Linux chatgpt_*.deb" ;;
                     *.deb) ;;
@@ -116,6 +127,9 @@ parse_args() {
         esac
         shift
     done
+    if [ "${SKIP_OAI_OFFICIAL_SIG_VERIFICATION:-0}" -eq 1 ] && [ -z "$PROVIDED_UPSTREAM_DEB_PATH" ]; then
+        error "--skip-oai-official-sig-verification requires a local .deb path or UPSTREAM_DEB"
+    fi
 }
 
 validate_app_identity() {
@@ -152,6 +166,14 @@ check_deps() {
     if [ ${#missing[@]} -ne 0 ]; then
         error "Missing dependencies: ${missing[*]}
 $(dependency_help)"
+    fi
+
+    # ASAR patching needs npx unless a packaged ASAR executable was supplied.
+    # Warn before downloading upstream; patch_asar() validates the tool again.
+    if [ -z "${CODEX_ASAR_BIN:-}" ] && ! command -v npx &>/dev/null; then
+        warn "npx not found on PATH: the required ASAR patch will fail." \
+            "Install npm (Debian/Ubuntu: sudo apt install npm) or ensure the version-manager" \
+            "Node bin directory is on PATH for this shell/service."
     fi
 
     info "All system dependencies found"

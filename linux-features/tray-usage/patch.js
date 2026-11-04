@@ -18,10 +18,10 @@ function trayUsageGates(source, patched) {
     const usageLimitsAlias = anchor[1];
     const escapedUsageLimitsAlias = escapeRegExp(usageLimitsAlias);
     const platformGate = patched
-      ? "process\\.platform!==`darwin`&&process\\.platform!==`linux`"
-      : "process\\.platform!==`darwin`";
+      ? '"darwin"!==process\\.platform&&"linux"!==process\\.platform'
+      : '"darwin"!==process\\.platform';
     const gatePattern = new RegExp(
-      `([A-Za-z_$][\\w$]*)=${platformGate}\\|\\|${escapedUsageLimitsAlias}\\.length===0\\?\\[\\]:`,
+      `([,\\[])${platformGate}\\|\\|0===${escapedUsageLimitsAlias}\\.length\\?\\[\\]:`,
     );
     const labelMapPattern = new RegExp(
       `${escapedUsageLimitsAlias}\\.map\\(\\(\\{label:([A-Za-z_$][\\w$]*)\\}\\)=>\\(\\{label:\\1,enabled:!1\\}\\)\\)`,
@@ -39,7 +39,7 @@ function trayUsageGates(source, patched) {
     matches.push({
       index: windowStart + gate.index,
       match: gate[0],
-      menuItemsAlias: gate[1],
+      prefix: gate[1],
       usageLimitsAlias,
     });
   }
@@ -65,8 +65,8 @@ function applyTrayUsageMainPatch(source) {
     return source;
   }
 
-  const [{ index, match, menuItemsAlias, usageLimitsAlias }] = trayUsageGates(source, false);
-  const replacement = `${menuItemsAlias}=process.platform!==\`darwin\`&&process.platform!==\`linux\`||${usageLimitsAlias}.length===0?[]:`;
+  const [{ index, match, prefix, usageLimitsAlias }] = trayUsageGates(source, false);
+  const replacement = `${prefix}"darwin"!==process.platform&&"linux"!==process.platform||0===${usageLimitsAlias}.length?[]:`;
   const patched = `${source.slice(0, index)}${replacement}${source.slice(index + match.length)}`;
   if (trayUsageMainContract(patched) !== "patched") {
     console.warn(

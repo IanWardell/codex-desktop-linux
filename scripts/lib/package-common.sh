@@ -148,6 +148,12 @@ linux_features_root_path() {
     "$node_bin" "$helper" --features-root
 }
 
+remove_update_builder_test_files() {
+    find "$1" -mindepth 1 \
+        \( -name test.js -o -name '*.test.js' -o -name '*.test-helpers.js' -o -name fixtures \) \
+        -prune -exec rm -rf -- {} +
+}
+
 stage_update_builder_linux_features_tree() {
     local update_builder_root="$1"
     local source_root
@@ -160,22 +166,42 @@ stage_update_builder_linux_features_tree() {
     cp "$source_root/features.example.json" "$target/features.example.json"
     cp "$source_root/compatibility.json" "$target/compatibility.json"
 
-    local feature_id
-    while IFS= read -r feature_id; do
-        [ -n "$feature_id" ] || continue
-        [ -d "$source_root/$feature_id" ] || error "Missing enabled Linux feature: $feature_id"
-        cp -a "$source_root/$feature_id" "$target/$feature_id"
-        find "$target/$feature_id" -type d -name target -prune -exec rm -rf {} +
+    local feature_id relative_dir source destination feature_dirs_file
+    feature_dirs_file="$(mktemp "$target/.enabled-feature-dirs.XXXXXX")"
+    if ! "$(package_node_binary)" "$REPO_DIR/scripts/lib/linux-features.js" \
+        --enabled-feature-dirs0 > "$feature_dirs_file"; then
+        rm -f "$feature_dirs_file"
+        error "Failed to discover enabled Linux features for the update-builder"
+    fi
+    while IFS= read -r -d '' feature_id && IFS= read -r -d '' relative_dir; do
+        source="$source_root/$relative_dir"
+        destination="$target/$relative_dir"
+        [ -d "$source" ] || error "Missing enabled Linux feature: $feature_id ($source)"
+        mkdir -p "$(dirname "$destination")"
+        cp -a "$source" "$destination"
+        case "$relative_dir" in
+            local/*) ;;
+            *) remove_update_builder_test_files "$destination" ;;
+        esac
+        find "$destination" -type d -name target -prune -exec rm -rf {} +
         if [ "$feature_id" = "directory-only-working-tree-watch" ]; then
-            rm -rf "$target/$feature_id/acceptance"
+            rm -rf "$destination/acceptance"
         fi
         if [ "$feature_id" = "mcp-helper-reaper" ]; then
             rm -rf \
-                "$target/$feature_id/reaper/src" \
-                "$target/$feature_id/reaper/Cargo.toml" \
-                "$target/$feature_id/reaper/Cargo.lock"
+                "$destination/reaper/src" \
+                "$destination/reaper/Cargo.toml" \
+                "$destination/reaper/Cargo.lock"
         fi
-    done < <("$(package_node_binary)" "$REPO_DIR/scripts/lib/linux-features.js" --enabled)
+        if [ "$feature_id" = "pet-overlay" ]; then
+            rm -rf \
+                "$destination/kwin-helper/src" \
+                "$destination/kwin-helper/tests" \
+                "$destination/kwin-helper/Cargo.toml" \
+                "$destination/kwin-helper/Cargo.lock"
+        fi
+    done < "$feature_dirs_file"
+    rm -f "$feature_dirs_file"
 }
 
 stage_update_builder_enabled_plugin_templates() {
@@ -345,22 +371,12 @@ render_desktop_entry() {
         mv "$rendered_target" "$target"
     else
         awk '
-            BEGIN { actions_rewritten = 0 }
             /^\[Desktop Action CheckForUpdates\]$/ { skip = 1; next }
             /^\[Desktop Action InstallReadyUpdate\]$/ { skip = 1; next }
             /^\[/ { skip = 0 }
             skip { next }
-            /^Actions=/ {
-                print "Actions=new-window;"
-                actions_rewritten = 1
-                next
-            }
+            /^Actions=/ { next }
             { print }
-            END {
-                if (actions_rewritten == 0) {
-                    print "Actions=new-window;"
-                }
-            }
         ' "$rendered_target" > "$target"
         rm -f "$rendered_target"
     fi
@@ -955,6 +971,7 @@ stage_update_builder_bundle() {
     cp "$REPO_DIR/scripts/build-pacman.sh" "$update_builder_root/scripts/build-pacman.sh"
     cp "$REPO_DIR/scripts/patch-linux-window-ui.js" "$update_builder_root/scripts/patch-linux-window-ui.js"
     cp -a "$REPO_DIR/scripts/patches/." "$update_builder_root/scripts/patches/"
+    remove_update_builder_test_files "$update_builder_root/scripts/patches"
 
     for relative in \
         asar-patch.sh \
@@ -964,12 +981,14 @@ stage_update_builder_bundle() {
         candidate-promotion.py \
         install-helpers.sh \
         linux-features.js \
+        gentoo-dependencies.js \
         linux-features.sh \
         linux-target-context.js \
         package-common.sh \
         patch-report.js \
         patch-validation.js \
         process-detection.sh \
+        stage-global-shortcuts.sh \
         upstream-linux-package.js \
         upstream-linux-package.sh; do
         cp "$REPO_DIR/scripts/lib/$relative" "$update_builder_root/scripts/lib/$relative"
@@ -1014,11 +1033,21 @@ stage_enabled_native_feature_artifacts() {
                     "$APP_DIR/resources/plugins/openai-bundled/plugins/unified-computer-use/bin/codex-computer-use-cosmic" \
                     "$update_builder_root/target/release/codex-computer-use-cosmic" \
                     "$feature_id COSMIC helper"
+                stage_update_builder_native_artifact \
+                    "$APP_DIR/resources/plugins/openai-bundled/plugins/unified-computer-use/bin/codex-computer-use-indicator" \
+                    "$update_builder_root/target/release/codex-computer-use-indicator" \
+                    "$feature_id activity indicator"
                 ;;
-            global-dictation)
+            global-dictation|wayland-global-shortcuts)
                 stage_update_builder_native_artifact \
                     "$APP_DIR/resources/native/codex-global-dictation-linux" \
                     "$update_builder_root/global-dictation-linux/target/release/codex-global-dictation-linux" \
+                    "$feature_id helper"
+                ;;
+            pet-overlay)
+                stage_update_builder_native_artifact \
+                    "$APP_DIR/resources/native/codex-pet-kwin" \
+                    "$update_builder_root/linux-features/pet-overlay/kwin-helper/target/release/codex-pet-kwin" \
                     "$feature_id helper"
                 ;;
             mcp-helper-reaper)
@@ -1032,6 +1061,21 @@ stage_enabled_native_feature_artifacts() {
                     "$APP_DIR/resources/plugins/openai-bundled/plugins/read-aloud/bin/codex-read-aloud-linux" \
                     "$update_builder_root/target/release/codex-read-aloud-linux" \
                     "$feature_id backend"
+                # Keep MCP's actual runners separate from an independently
+                # selected UI feature, including with an alternate feature root.
+                local plugin_bin="$APP_DIR/resources/plugins/openai-bundled/plugins/read-aloud/bin"
+                local builder_plugin_bin="$update_builder_root/plugins/openai-bundled/plugins/read-aloud/bin"
+                local resource
+                mkdir -p "$builder_plugin_bin"
+                for resource in kokoro-stdin kokoro_stdin.py; do
+                    ensure_file_exists "$plugin_bin/$resource" "Read Aloud MCP runner"
+                    cp -a "$plugin_bin/$resource" "$builder_plugin_bin/$resource"
+                done
+                if [ -f "$plugin_bin/install-kokoro-runtime.sh" ]; then
+                    cp -a "$plugin_bin/install-kokoro-runtime.sh" "$builder_plugin_bin/install-kokoro-runtime.sh"
+                else
+                    rm -f "$builder_plugin_bin/install-kokoro-runtime.sh"
+                fi
                 ;;
             chronicle-skysight)
                 stage_update_builder_native_artifact \
@@ -1095,6 +1139,24 @@ function assertRelativeTarget(target) {
   return resolved;
 }
 
+function restoreMode(target, mode) {
+  const stat = fs.lstatSync(target);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Linux feature staged artifact must not be a symbolic link: ${target}`);
+  }
+  // Resource modes describe files; readable directories also need traversal.
+  const directoryMode = mode |
+    ((mode & 0o400) ? 0o100 : 0) |
+    ((mode & 0o040) ? 0o010 : 0) |
+    ((mode & 0o004) ? 0o001 : 0);
+  fs.chmodSync(target, stat.isDirectory() ? directoryMode : mode);
+  if (stat.isDirectory()) {
+    for (const name of fs.readdirSync(target)) {
+      restoreMode(path.join(target, name), mode);
+    }
+  }
+}
+
 for (const entry of entries) {
   if (entry == null || typeof entry !== "object") {
     throw new Error("Linux feature staged file entry must be an object");
@@ -1106,7 +1168,7 @@ for (const entry of entries) {
   if (!fs.existsSync(target)) {
     throw new Error(`Linux feature staged file is missing from package payload: ${entry.target}`);
   }
-  fs.chmodSync(target, Number.parseInt(entry.mode, 8));
+  restoreMode(target, Number.parseInt(entry.mode, 8));
 }
 NODE
     then

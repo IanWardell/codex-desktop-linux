@@ -2,9 +2,11 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const { validateGentooAtom } = require("./gentoo-dependencies.js");
 
 const FEATURE_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const LOCAL_FEATURES_DIR = "local";
+const FEATURE_ENTRYPOINTS = new Set(["patchDescriptors", "stageHook", "cleanupHook"]);
 const RESERVED_TOP_LEVEL_NAMES = new Set([
   LOCAL_FEATURES_DIR,
   "README.md",
@@ -30,7 +32,7 @@ const RUNTIME_HOOK_DIRS = {
 };
 const STAGED_FEATURE_MANIFEST_RELATIVE_PATH = ".codex-linux/linux-features-staged.json";
 const BUILD_INFO_RELATIVE_PATH = ".codex-linux/build-info.json";
-const SUPPORTED_PACKAGE_FORMATS = new Set(["deb", "rpm", "pacman"]);
+const SUPPORTED_PACKAGE_FORMATS = new Set(["deb", "rpm", "pacman", "ebuild"]);
 const PACKAGE_DEPENDENCY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9+._:@()=<>~\/-]*$/;
 const RPM_ELF_DEPENDENCY_SUFFIX = "%{codex_elf_suffix}";
 const PACKAGE_PATH_COMPONENT_PATTERN = /^(?!-)(?!\.\.?$)[A-Za-z0-9._+@:-]+$/;
@@ -200,11 +202,14 @@ function enabledFeatureIdsFromBuildInfo(appDir) {
   return ids;
 }
 
-function normalizeLinuxFeatureSettings(value, sourcePath) {
+function normalizeLinuxFeatureSettings(value, sourcePath, options = {}) {
   if (value == null) {
     return {};
   }
   if (typeof value !== "object" || Array.isArray(value)) {
+    if (options.strict === true) {
+      throw new Error(`Linux features config ${sourcePath} settings must be an object`);
+    }
     console.warn(`WARN: Linux features config ${sourcePath} settings must be an object`);
     return {};
   }
@@ -212,6 +217,9 @@ function normalizeLinuxFeatureSettings(value, sourcePath) {
   const settings = {};
   for (const [rawId, rawSettings] of Object.entries(value)) {
     if (typeof rawId !== "string" || !FEATURE_ID_PATTERN.test(rawId)) {
+      if (options.strict === true) {
+        throw new Error(`Invalid Linux feature settings id in ${sourcePath}: ${String(rawId)}`);
+      }
       console.warn(`WARN: Invalid Linux feature settings id in ${sourcePath}: ${String(rawId)}`);
       continue;
     }
@@ -220,6 +228,9 @@ function normalizeLinuxFeatureSettings(value, sourcePath) {
       continue;
     }
     if (rawSettings == null || typeof rawSettings !== "object" || Array.isArray(rawSettings)) {
+      if (options.strict === true) {
+        throw new Error(`Linux feature '${rawId}' settings in ${sourcePath} must be an object`);
+      }
       console.warn(`WARN: Linux feature '${rawId}' settings in ${sourcePath} must be an object`);
       continue;
     }
@@ -241,7 +252,9 @@ function linuxFeaturesConfig(options = {}) {
   const available = linuxFeatureManifestMap(options);
   return {
     enabled: expandEnabledFeatureDependencies(normalizedEnabled, available),
-    settings: normalizeLinuxFeatureSettings(config.settings, configPath),
+    settings: normalizeLinuxFeatureSettings(config.settings, configPath, {
+      strict: options.strictConfig === true,
+    }),
     configPath,
   };
 }
@@ -311,15 +324,39 @@ function normalizeLinuxFeatureManifest(featuresRoot, candidate) {
   }
 
   const id = assertFeatureId(manifest.id, `Linux feature id in ${candidate.manifestPath}`);
+  const directoryName = path.basename(candidate.dir);
+  if (id !== directoryName) {
+    throw new Error(
+      `Linux feature id '${id}' in ${candidate.manifestPath} must match its directory name '${directoryName}'`,
+    );
+  }
   const readmePath = path.join(candidate.dir, "README.md");
   if (!fs.existsSync(readmePath) || isDirectory(readmePath)) {
     throw new Error(`Linux feature '${id}' must include README.md next to feature.json`);
   }
+  if (Object.prototype.hasOwnProperty.call(manifest, "defaultEnabled") &&
+      typeof manifest.defaultEnabled !== "boolean") {
+    throw new Error(`Linux feature '${id}' defaultEnabled must be a boolean (false when provided)`);
+  }
   if (manifest.defaultEnabled === true) {
     throw new Error(`Linux feature '${id}' must be disabled by default; defaultEnabled true is not allowed`);
   }
-  if (manifest.internal != null && typeof manifest.internal !== "boolean") {
+  if (Object.prototype.hasOwnProperty.call(manifest, "internal") &&
+      typeof manifest.internal !== "boolean") {
     throw new Error(`Linux feature '${id}' internal must be a boolean`);
+  }
+  if (manifest.entrypoints != null) {
+    if (typeof manifest.entrypoints !== "object" || Array.isArray(manifest.entrypoints)) {
+      throw new Error(`Linux feature '${id}' in ${candidate.manifestPath}: entrypoints must be an object`);
+    }
+    for (const key of Object.keys(manifest.entrypoints)) {
+      if (!FEATURE_ENTRYPOINTS.has(key)) {
+        throw new Error(
+          `Linux feature '${id}' in ${candidate.manifestPath}: unknown entrypoint '${key}'; ` +
+          `supported entrypoints: ${[...FEATURE_ENTRYPOINTS].join(", ")}`,
+        );
+      }
+    }
   }
 
   const relativeDir = path.relative(featuresRoot, candidate.dir);
@@ -578,19 +615,17 @@ function prefixedFeaturePatchId(feature, descriptorId) {
 }
 
 function wrapFeaturePatchDescriptor(feature, descriptor, sourcePath, index, featureIndex) {
-  if (descriptor == null || typeof descriptor !== "object") {
-    console.warn(`WARN: Linux feature '${feature.id}' patch descriptor ${index + 1} must be an object`);
-    return null;
+  const label = `Linux feature '${feature.id}' patch descriptor ${index + 1} in ${sourcePath}`;
+  if (descriptor == null || typeof descriptor !== "object" || Array.isArray(descriptor)) {
+    throw new Error(`${label} must be an object`);
   }
   if (typeof descriptor.apply !== "function") {
-    console.warn(`WARN: Linux feature '${feature.id}' patch descriptor ${index + 1} must export apply`);
-    return null;
+    throw new Error(`${label} must export an apply function`);
   }
 
   const descriptorId = descriptor.id ?? descriptor.name;
   if (typeof descriptorId !== "string" || descriptorId.length === 0) {
-    console.warn(`WARN: Linux feature '${feature.id}' patch descriptor ${index + 1} must have id or name`);
-    return null;
+    throw new Error(`${label} must have id or name`);
   }
 
   const wrappedId = prefixedFeaturePatchId(feature, descriptorId);
@@ -631,16 +666,15 @@ function featurePatchDescriptorListFromExports(feature, moduleExports, sourcePat
   const exported = moduleExports?.descriptors ??
     moduleExports;
   if (exported == null) {
-    console.warn(`WARN: Linux feature '${feature.id}' patchDescriptors entrypoint must export descriptors`);
-    return [];
+    throw new Error(
+      `Linux feature '${feature.id}' patchDescriptors entrypoint ${sourcePath} must export descriptors`,
+    );
   }
 
   const descriptors = Array.isArray(exported) ? exported : [exported];
-  return descriptors
-    .map((descriptor, index) =>
-      wrapFeaturePatchDescriptor(feature, descriptor, sourcePath, index, featureIndex),
-    )
-    .filter(Boolean);
+  return descriptors.map((descriptor, index) =>
+    wrapFeaturePatchDescriptor(feature, descriptor, sourcePath, index, featureIndex),
+  );
 }
 
 function loadLinuxFeaturePatchDescriptors(options = {}) {
@@ -1057,16 +1091,14 @@ function stageEnabledLinuxFeatureInstall(appDir, options = {}) {
 }
 
 function enabledLinuxFeaturePackageHooks(options = {}) {
-  const packageFormat = options.packageFormat ?? null;
+  const packageFormat = options.packageFormat == null ? null : normalizePackageFormat(options.packageFormat);
   const selectedOptions = options.appDir == null
     ? options
     : packageFeatureOptions(options.appDir, options);
   const hooks = [];
   for (const feature of loadEnabledLinuxFeatures(selectedOptions)) {
     for (const [index, entry] of normalizeEntryList(feature.manifest.packageHooks, "packageHook", feature).entries()) {
-      const formats = entry.formats == null
-        ? []
-        : normalizeFeatureIdList(entry.formats, "packageHook formats", feature.id);
+      const formats = normalizePackageFormats(entry.formats, feature.id, `package hook ${index + 1}`);
       if (packageFormat != null && formats.length > 0 && !formats.includes(packageFormat)) {
         continue;
       }
@@ -1160,6 +1192,11 @@ function normalizePackageDependencies(feature) {
     }
     const normalized = [];
     for (const entry of entries) {
+      if (format === "ebuild") {
+        validateGentooAtom(entry, `Linux feature '${feature.id}' ebuild package dependency`);
+        if (!normalized.includes(entry)) normalized.push(entry);
+        continue;
+      }
       const dependencyToken = typeof entry === "string"
         && format === "rpm"
         && entry.endsWith(RPM_ELF_DEPENDENCY_SUFFIX)
@@ -1504,6 +1541,12 @@ function main() {
     }
     return;
   }
+  if (command === "--enabled-feature-dirs0") {
+    for (const feature of loadEnabledLinuxFeatures()) {
+      process.stdout.write(`${feature.id}\0${feature.relativeDir}\0`);
+    }
+    return;
+  }
   if (command === "--patch-descriptor-count") {
     process.stdout.write(`${loadLinuxFeaturePatchDescriptors().length}\n`);
     return;
@@ -1516,7 +1559,7 @@ function main() {
     process.stdout.write(`${linuxFeaturesRoot()}\n`);
     return;
   }
-  console.error("Usage: linux-features.js --enabled | --patch-descriptor-count | --features-json | --features-root | --stage-install <install-dir> | --staged-files-json <install-dir> | --stage-hooks | --cleanup-hooks | --package-hooks <format> <app-dir> | --stage-package-resources <format> <package-root> <app-dir> | --restore-package-resource-permissions <format> <package-root> <app-dir> | --package-dependencies <format> <app-dir> | --package-files <format> <app-dir>");
+  console.error("Usage: linux-features.js --enabled | --enabled-feature-dirs0 | --patch-descriptor-count | --features-json | --features-root | --stage-install <install-dir> | --staged-files-json <install-dir> | --stage-hooks | --cleanup-hooks | --package-hooks <format> <app-dir> | --stage-package-resources <format> <package-root> <app-dir> | --restore-package-resource-permissions <format> <package-root> <app-dir> | --package-dependencies <format> <app-dir> | --package-files <format> <app-dir>");
   process.exit(1);
 }
 

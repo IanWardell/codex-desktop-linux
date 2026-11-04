@@ -8,13 +8,17 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const vm = require("node:vm");
 
 const {
   enabledLinuxFeatureInstallPlan,
   loadLinuxFeaturePatchDescriptors,
   stageEnabledLinuxFeatureInstall,
 } = require("../../scripts/lib/linux-features.js");
-const { patchUniqueAssetFile } = require("../../scripts/patches/lib/assets.js");
+const {
+  findWebviewAssetsContaining,
+  patchAssetFiles,
+} = require("../../scripts/patches/lib/assets.js");
 const {
   applyDockIconMainPatch,
   applyDockIconSettingsPatch,
@@ -22,29 +26,42 @@ const {
   dockIconEnabled,
 } = require("./patches/dock-icon.js");
 
+// Official 26.1027.30824 rspack/SWC main-process shape (one main-app module):
+// double-quoted strings, literal-first comparisons and inlined one-shot helpers.
 const currentAppInfoSource = [
-  "function d_(e){return`icon-chatgpt`}",
-  "function f_(e){return{dark:`icon-codex-dark-color.png`,light:`icon-codex-light.png`}}",
-  "function Gme(e){if(process.platform!==`darwin`)return null;let t=f_(e),n=g_(`${d_(e)}.png`),r=g_(t.dark),i=g_(t.light);return n==null||r==null||i==null?null:{appDefault:n,codexDark:r,codexLight:i}}",
-  "function g_(e){if(e==null)return null;let t=d.app.isPackaged?(0,g.join)(process.resourcesPath,e):null;return __(t!=null&&(0,y.existsSync)(t)?t:(0,g.join)(d.app.getAppPath(),`src`,`icons`,e))}",
+  'function d_(e){return"icon-chatgpt"}',
+  'function f_(e){return{dark:"icon-codex-dark-color.png",light:"icon-codex-light.png",spaceDark:"icon-space-dark.png",spaceLight:"icon-space-light.png"}}',
+  "async function Gme(e){return{appIconMedium:null,dockIconPreviews:function(e){if(\"darwin\"!==process.platform)return null;let t=f_(e),n=g_(`${d_(e)}.png`),r=g_(t.dark),i=g_(t.light),a=g_(t.spaceDark),o=g_(t.spaceLight);return null==n||null==r||null==i||null==a||null==o?null:{appDefault:n,codexDark:r,codexLight:i,spaceDark:a,spaceLight:o}}(e),preloadAttribution:null}}",
+  'function g_(e){if(null==e)return null;let t=d.app.isPackaged?(0,g.join)(process.resourcesPath,e):null;return __(null!=t&&(0,y.existsSync)(t)?t:(0,g.join)(d.app.getAppPath(),"src","icons",e))}',
 ].join("");
 
 const currentRuntimeSource = [
   "function t5e({buildFlavor:i,settingsStore:f,repoRoot:h,isMacOS:_,isWindows:v,isDevMode:b,onWindowRegistered:w,disposables:T}){",
-  "let D=(0,g.join)(h,`electron`,`src`,`icons`),O=e=>{if(!d.app.isPackaged)return null;let t=(0,g.join)(process.resourcesPath,e);return(0,y.existsSync)(t)?t:null},",
-  "k=e=>{let t=(0,g.join)(D,e);return(0,y.existsSync)(t)?t:null},A=e=>O(e)??k(e),j=()=>{switch(i){case o.i.Dev:case o.i.Nightly:case o.i.InternalAlpha:case o.i.PublicBeta:case o.i.Prod:return f.get(n.Xl.DOCK_ICON_PREFERENCE)??`app-default`;case o.i.Agent:return`app-default`}},M=()=>{switch(i){case o.i.Dev:return k(`icon-dev-outline.png`);case o.i.Agent:return A(`icon-agent.png`);case o.i.Nightly:case o.i.InternalAlpha:case o.i.PublicBeta:case o.i.Prod:return A(`${d_(i)}.png`)}},N=()=>v?m_(i,{localIconsDirectory:(0,g.join)(h,`electron`,`.generated`,`windows-app-icons`)}):null,P=process.platform===`linux`?p_(i,D):N(),F=f_(i),I=b?process.env.CODEX_ELECTRON_DEV_DOCK_ICONS_PATH:void 0,ee=()=>d.nativeTheme.shouldUseDarkColorsForSystemIntegratedUI?F.dark:F.light,",
-  "L=e=>{if(I){let t=`app-default`;e===`codex-system`&&(t=d.nativeTheme.shouldUseDarkColorsForSystemIntegratedUI?`codex-dark`:`codex-light`);let n=d.nativeImage.createFromPath((0,g.join)(I,`${t}.png`));if(!n.isEmpty()){d.app.dock?.setIcon(n);return}}if(e===`app-default`&&i!==o.i.Dev){let e=d.app.dock;e!=null&&Reflect.apply(e.setIcon.bind(e),e,[null]);return}let t=e===`codex-system`?ee():null,n=(t==null?null:A(t))??M(),r=n==null?d.nativeImage.createEmpty():d.nativeImage.createFromPath(n);if(!r.isEmpty()){if(e===`codex-system`){let{width:e,height:t}=r.getSize(),n=Math.round(e/128);r=r.crop({x:n,y:n,width:e-n*2,height:t-n*2})}d.app.dock?.setIcon(r)}},",
-  "R=()=>{if(!_)return;let e=j();L(e),aF({preference:e,resourceName:e===`codex-system`?F.light:null}).then(e=>{e&&L(j())})};",
-  "if(_){R();let e=()=>{let e=j();e===`codex-system`&&L(e)};d.nativeTheme.on(`updated`,e),T.add(()=>{d.nativeTheme.off(`updated`,e)})}",
+  'let D=(0,g.join)(h,"electron","src","icons"),k=e=>{let t=(0,g.join)(D,e);return(0,y.existsSync)(t)?t:null},',
+  'A=e=>(e=>{if(!d.app.isPackaged)return null;let t=(0,g.join)(process.resourcesPath,e);return(0,y.existsSync)(t)?t:null})(e)??k(e),',
+  'j=()=>{switch(i){case o.i.Dev:case o.i.Nightly:case o.i.InternalAlpha:case o.i.PublicBeta:case o.i.Prod:return f.get(n.Xl.DOCK_ICON_PREFERENCE)??"app-default";case o.i.Agent:return"app-default"}},',
+  'N=()=>v?m_(i,{localIconsDirectory:(0,g.join)(h,"electron",".generated","windows-app-icons")}):null,P="linux"===process.platform?p_(i,D):N();',
+  "let F=f_(i),I=b?process.env.CODEX_ELECTRON_DEV_DOCK_ICONS_PATH:void 0,",
+  'ee=(e,t)=>{switch(e){case"app-default":return null;case"codex-system":return t?F.dark:F.light;case"space-system":return t?F.spaceDark:F.spaceLight}},',
+  'L=e=>{if(I){let t="app-default";if("app-default"!==e){let n="space-system"===e?"space":"codex",r=d.nativeTheme.shouldUseDarkColorsForSystemIntegratedUI?"dark":"light";t=`${n}-${r}`}let n=d.nativeImage.createFromPath((0,g.join)(I,`${t}.png`));if(!n.isEmpty())return void d.app.dock?.setIcon(n)}',
+  'if("app-default"===e&&i!==o.i.Dev){let e=d.app.dock;null!=e&&Reflect.apply(e.setIcon.bind(e),e,[null]);return}',
+  'let t=ee(e,d.nativeTheme.shouldUseDarkColorsForSystemIntegratedUI),n=(null==t?null:A(t))??(()=>{switch(i){case o.i.Dev:return k("icon-dev-outline.png");case o.i.Agent:return A("icon-agent.png");case o.i.Nightly:case o.i.InternalAlpha:case o.i.PublicBeta:case o.i.Prod:return A(`${d_(i)}.png`)}})(),r=null==n?d.nativeImage.createEmpty():d.nativeImage.createFromPath(n);',
+  'if(!r.isEmpty()){if("codex-system"===e||"space-system"===e){let{width:e,height:t}=r.getSize(),n=Math.round(e/128);r=r.crop({x:n,y:n,width:e-2*n,height:t-2*n})}d.app.dock?.setIcon(r)}},',
+  'R=()=>{if(!_)return;let e=j();L(e),(function({preference:e,resourceName:t}){if("darwin"!==process.platform||!d.app.isPackaged)return Promise.resolve(!1);return aF(e,t)})({preference:e,resourceName:ee(e,!1)}).then(e=>{e&&L(j())})};',
+  'if(_){R();let e=()=>{let e=j();"app-default"!==e&&L(e)};d.nativeTheme.on("updated",e),T.add(()=>{d.nativeTheme.off("updated",e)})}',
   "let z=null,V=new H8e({onWindowRegistered:e=>{z?.registerWindow(e),w?.(e)}});return{updateDockIcon:R,windowManager:V}}",
 ].join("");
 
 const currentTraySource =
-  "let U9=null,K9=!1;async function q9(e){let t=e.buildFlavor,n=await r8e(t,e.repoRoot),i=new d.Tray(n.defaultIcon,process.platform===`win32`&&d.app.isPackaged?Y6e(t):void 0);if(!K9)return i.destroy(),null;let a=new z0e(i);return U9=a,!await a.waitForReady()||U9!==a?(U9===a&&(U9=null,a.destroy()),null):a}";
+  'let U9=null,K9=!1;async function q9(e){let t=e.buildFlavor,n=await r8e(t,e.repoRoot),i=new d.Tray(n.defaultIcon,"win32"===process.platform&&d.app.isPackaged?function(e){switch(e){case o.i.Prod:return"tray-guid"}}(t):void 0);if(!K9)return i.destroy(),null;let a=new z0e(i,e.onOpenMainWindow);return(U9=a,await a.waitForReady()&&U9===a)?a:(U9===a&&(U9=null,a.destroy()),null)}';
 
 const currentMainSource = currentAppInfoSource + currentRuntimeSource + currentTraySource;
+// Official 26.1029 rspack/SWC webview chunk carrying the Dock icon row gate
+// module (rspack duplicates it into every async chunk that needs it).
 const currentSettingsSource =
-  "import{n as e}from\"./rolldown-runtime-DAXXjFlN.js\";import{$Jt as t,VWt as n}from\"./app-initial-F3TGi7uJ.js\";function r({platform:e,dockIconPreviews:n,buildFlavor:r=`prod`}){return e!==`macOS`||r===t.Agent?null:n}var i=e((()=>{n()}));export{i as n,r as t};";
+  'export const __rspack_esm_id=572868;export const __rspack_esm_ids=[572868];export const __webpack_modules__={' +
+  'IKhT(e,t,a){var s=a("DBCl");function n({platform:e,dockIconPreviews:t,buildFlavor:a="prod"}){return"macOS"!==e||a===s.x1u.Agent?null:t}a.d(t,{_:()=>n})},' +
+  'kQ2a(e,t,a){var s=a("IKhT");function r(e,t){let n=t?.dockIconPreviews??null;return(0,s._)({platform:e,dockIconPreviews:n})}a.d(t,{r:()=>r})}};';
 
 function renameMinifiedAliases(source) {
   const aliases = [
@@ -86,6 +103,48 @@ function captureWarns(fn) {
   } finally {
     console.warn = originalWarn;
   }
+}
+
+function evaluateLinuxPreviews(patchedSource, payloadDir) {
+  const preview = patchedSource.match(
+    /dockIconPreviews:(?<expression>function\((?<arg>[A-Za-z_$][\w$]*)\)\{if\("darwin"!==process\.platform&&"linux"!==process\.platform\)return null;let (?<theme>[A-Za-z_$][\w$]*)=(?<themeHelper>[A-Za-z_$][\w$]*)\(\k<arg>\),(?<defaultIcon>[A-Za-z_$][\w$]*)=(?<resource>[A-Za-z_$][\w$]*)\(`\$\{(?<iconName>[A-Za-z_$][\w$]*)\(\k<arg>\)\}\.png`\),(?<codexDark>[A-Za-z_$][\w$]*)=\k<resource>\(\k<theme>\.dark\),(?<codexLight>[A-Za-z_$][\w$]*)=\k<resource>\(\k<theme>\.light\),(?<spaceDark>[A-Za-z_$][\w$]*)="linux"===process\.platform\?\k<codexDark>:\k<resource>\(\k<theme>\.spaceDark\),(?<spaceLight>[A-Za-z_$][\w$]*)="linux"===process\.platform\?\k<codexLight>:\k<resource>\(\k<theme>\.spaceLight\);return [^}]+\}\}\(\k<arg>\))/,
+  );
+  assert.ok(preview, "expected one complete patched preview function");
+  const sandbox = {
+    process: { platform: "linux" },
+    [preview.groups.arg]: "prod",
+    [preview.groups.themeHelper]: () => ({
+      dark: "icon-codex-dark-color.png",
+      light: "icon-codex-light.png",
+      spaceDark: "icon-space-dark.png",
+      spaceLight: "icon-space-light.png",
+    }),
+    [preview.groups.iconName]: () => "icon-chatgpt",
+    [preview.groups.resource]: (name) => {
+      const resource = path.join(payloadDir, name);
+      return fs.existsSync(resource) ? fs.readFileSync(resource, "utf8") : null;
+    },
+  };
+  vm.runInNewContext(`result=${preview.groups.expression}`, sandbox);
+  return sandbox.result;
+}
+
+function evaluateLinuxRuntimeResourceNames(patchedSource) {
+  const resourceName = patchedSource.match(
+    /(?<owner>[A-Za-z_$][\w$]*)=\((?<preference>[A-Za-z_$][\w$]*),(?<dark>[A-Za-z_$][\w$]*)\)=>\{switch\(\k<preference>\)\{case"app-default":return null;case"codex-system":return \k<dark>\?(?<theme>[A-Za-z_$][\w$]*)\.dark:\k<theme>\.light;case"space-system":return "linux"===process\.platform\?\k<dark>\?\k<theme>\.dark:\k<theme>\.light:\k<dark>\?\k<theme>\.spaceDark:\k<theme>\.spaceLight\}\}/,
+  );
+  assert.ok(resourceName, "expected one complete patched runtime resource-name function");
+  const sandbox = {
+    process: { platform: "linux" },
+    [resourceName.groups.theme]: {
+      dark: "icon-codex-dark-color.png",
+      light: "icon-codex-light.png",
+      spaceDark: "icon-space-dark.png",
+      spaceLight: "icon-space-light.png",
+    },
+  };
+  vm.runInNewContext(`${resourceName[0]};result=${resourceName.groups.owner}`, sandbox);
+  return sandbox.result;
 }
 
 function dockConfig(enabled) {
@@ -203,29 +262,75 @@ test("main patch restores official previews and synchronizes Linux windows and t
   assert.match(patched, /function codexLinuxApplyDockIcon/);
   assert.match(
     patched,
-    /O=e=>\{if\(!d\.app\.isPackaged&&process\.platform!==`linux`\)return null;let t=codexLinuxDockIconResourcePath\(e\);return\(0,y\.existsSync\)\(t\)\?t:null\}/,
+    /A=e=>\(e=>\{if\(!d\.app\.isPackaged&&"linux"!==process\.platform\)return null;let t=codexLinuxDockIconResourcePath\(e\);return\(0,y\.existsSync\)\(t\)\?t:null\}\)\(e\)\?\?k\(e\)/,
   );
   assert.match(patched, /BrowserWindow\.getAllWindows\(\)/);
   assert.match(patched, /U9\.tray\.setImage\(r\)/);
   assert.match(patched, /globalThis\.codexLinuxDockIconImage/);
   assert.match(patched, /spawn\(codexLinuxSyncScript/);
+  assert.match(patched, /"codex-system"===e\|\|"space-system"===e\?/);
+  assert.match(patched, /onWindowRegistered:e=>\{z\?\.registerWindow\(e\),w\?\.\(e\),"linux"===process\.platform&&setImmediate\(R\)\}/);
+  assert.match(patched, /new d\.Tray\("linux"===process\.platform&&globalThis\.codexLinuxDockIconImage/);
   assert.equal(applyDockIconMainPatch(patched), patched);
+});
+
+test("main patch keeps Linux previews and runtime usable without Space resources", () => {
+  const { root, install, result } = runStage();
+  try {
+    assert.equal(result.status, 0, result.stderr);
+    const payload = path.join(install, "resources", "dock-icon");
+    assert.equal(fs.existsSync(path.join(payload, "icon-space-dark.png")), false);
+    assert.equal(fs.existsSync(path.join(payload, "icon-space-light.png")), false);
+
+    const patched = applyDockIconMainPatch(currentMainSource);
+    const previews = evaluateLinuxPreviews(patched, payload);
+    assert.deepEqual({ ...previews }, {
+      appDefault: "official-icon",
+      codexDark: fs.readFileSync(path.resolve(__dirname, "../../assets/codex-linux.png"), "utf8"),
+      codexLight: fs.readFileSync(path.resolve(__dirname, "../../assets/codex-linux.png"), "utf8"),
+      spaceDark: fs.readFileSync(path.resolve(__dirname, "../../assets/codex-linux.png"), "utf8"),
+      spaceLight: fs.readFileSync(path.resolve(__dirname, "../../assets/codex-linux.png"), "utf8"),
+    });
+
+    const resourceName = evaluateLinuxRuntimeResourceNames(patched);
+    assert.equal(resourceName("app-default", false), null);
+    assert.equal(resourceName("codex-system", false), "icon-codex-light.png");
+    assert.equal(resourceName("codex-system", true), "icon-codex-dark-color.png");
+    assert.equal(resourceName("space-system", false), "icon-codex-light.png");
+    assert.equal(resourceName("space-system", true), "icon-codex-dark-color.png");
+
+    fs.rmSync(path.join(payload, "icon-codex-light.png"));
+    assert.equal(evaluateLinuxPreviews(patched, payload), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("main patch captures every minified alias and preserves their contract relationships", () => {
   const aliased = renameMinifiedAliases(currentMainSource);
   const patched = applyDockIconMainPatch(aliased);
   assert.notEqual(patched, aliased);
-  assert.match(patched, /alias10\(alias(?:\d+)\)/);
+  assert.match(patched, /alias16=alias\d+=>\(alias\d+=>\{if\(!alias28\.app\.isPackaged&&"linux"!==process\.platform\)/);
   assert.match(patched, /globalThis\.codexLinuxDockIconImage:alias(?:\d+)\.defaultIcon/);
-  assert.match(patched, /function alias2\(alias(?:\d+)\)\{if\(process\.platform!==`darwin`&&process\.platform!==`linux`\)/);
+  assert.match(patched, /null!=alias6\?\.tray&&!alias6\.tray\.isDestroyed\(\)/);
+  assert.match(patched, /dockIconPreviews:function\(alias(?:\d+)\)\{if\("darwin"!==process\.platform&&"linux"!==process\.platform\)/);
+  assert.equal(applyDockIconMainPatch(patched), patched);
+});
+
+test("main patch ignores unrelated minified callback prefixes", () => {
+  const decoy = "a=n=>{if(n){r.close(),t();return}};";
+  const source = decoy + currentMainSource;
+  const patched = applyDockIconMainPatch(source);
+  assert.notEqual(patched, source);
+  assert.equal(patched.startsWith(decoy), true);
+  assert.match(patched, /function codexLinuxApplyDockIcon/);
   assert.equal(applyDockIconMainPatch(patched), patched);
 });
 
 test("main patch rejects inconsistent cross-contract aliases byte-identically", () => {
   const inconsistent = currentMainSource.replace(
-    "O=e=>{if(!d.app.isPackaged",
-    "O=e=>{if(!otherElectron.app.isPackaged",
+    "A=e=>(e=>{if(!d.app.isPackaged",
+    "A=e=>(e=>{if(!otherElectron.app.isPackaged",
   );
   const result = captureWarns(() => applyDockIconMainPatch(inconsistent));
   assert.equal(result.value, inconsistent);
@@ -235,24 +340,34 @@ test("main patch rejects inconsistent cross-contract aliases byte-identically", 
 test("main patch rejects drift at every official-package insertion point byte-identically", () => {
   const patched = applyDockIconMainPatch(currentMainSource);
   const currentPoints = [
-    "function Gme(e){if(process.platform!==`darwin`)return null",
-    "function g_(e){if(e==null)return null;let t=d.app.isPackaged?(0,g.join)(process.resourcesPath,e):null",
-    "O=e=>{if(!d.app.isPackaged)return null;let t=(0,g.join)(process.resourcesPath,e);return(0,y.existsSync)(t)?t:null}",
+    'dockIconPreviews:function(e){if("darwin"!==process.platform)return null',
+    'function g_(e){if(null==e)return null;let t=d.app.isPackaged?(0,g.join)(process.resourcesPath,e):null',
+    "A=e=>(e=>{if(!d.app.isPackaged)return null;let t=(0,g.join)(process.resourcesPath,e);return(0,y.existsSync)(t)?t:null})",
+    'ee=(e,t)=>{switch(e){case"app-default":return null;case"codex-system":return t?F.dark:F.light;case"space-system":return t?F.spaceDark:F.spaceLight}}',
     "L=e=>{if(I){",
+    'if("app-default"===e&&i!==o.i.Dev){',
+    "d.app.dock?.setIcon(r)}}",
     "R=()=>{if(!_)return;",
+    "}).then(e=>{e&&L(j())})}",
     "if(_){R();let e=()=>",
     "onWindowRegistered:e=>{z?.registerWindow(e),w?.(e)}",
     "i=new d.Tray(n.defaultIcon",
+    "return(U9=a,await a.waitForReady()&&U9===a)",
   ];
   const patchedPoints = [
-    "function Gme(e){if(process.platform!==`darwin`&&process.platform!==`linux`)return null",
+    'dockIconPreviews:function(e){if("darwin"!==process.platform&&"linux"!==process.platform)return null',
     "function codexLinuxDockIconResourcePath",
-    "O=e=>{if(!d.app.isPackaged&&process.platform!==`linux`)return null",
+    'A=e=>(e=>{if(!d.app.isPackaged&&"linux"!==process.platform)return null',
+    'ee=(e,t)=>{switch(e){case"app-default":return null;case"codex-system":return t?F.dark:F.light;case"space-system":return "linux"===process.platform?t?F.dark:F.light:t?F.spaceDark:F.spaceLight}}',
     "L=function codexLinuxApplyDockIcon",
-    "R=()=>{if(!_&&process.platform!==`linux`)return;",
-    "if(_||process.platform===`linux`){R();let e=()=>",
-    "onWindowRegistered:e=>{z?.registerWindow(e),w?.(e),process.platform===`linux`&&setImmediate(R)}",
-    "i=new d.Tray(process.platform===`linux`&&globalThis.codexLinuxDockIconImage",
+    'if("app-default"===e&&"linux"!==process.platform&&i!==o.i.Dev){',
+    "U9.tray.setImage(r)",
+    'R=()=>{if(!_&&"linux"!==process.platform)return;',
+    "}).then(e=>{e&&L(j())})}",
+    'if(_||"linux"===process.platform){R();let e=()=>',
+    'onWindowRegistered:e=>{z?.registerWindow(e),w?.(e),"linux"===process.platform&&setImmediate(R)}',
+    'i=new d.Tray("linux"===process.platform&&globalThis.codexLinuxDockIconImage',
+    "return(U9=a,await a.waitForReady()&&U9===a)",
   ];
 
   for (const point of currentPoints) {
@@ -276,25 +391,90 @@ test("main patch rejects drift at every official-package insertion point byte-id
   assert.equal(captureWarns(() => applyDockIconMainPatch(duplicate)).value, duplicate);
 });
 
+test("main and settings repairs apply to unique semantic anchors in the signed bundle", {
+  skip: process.env.CODEX_SIGNED_EXTRACTED_APP == null,
+}, () => {
+  const extractedApp = process.env.CODEX_SIGNED_EXTRACTED_APP;
+  const buildDir = path.join(extractedApp, ".vite", "build");
+  const mainCandidates = fs.readdirSync(buildDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
+    .map((entry) => ({
+      name: entry.name,
+      source: fs.readFileSync(path.join(buildDir, entry.name), "utf8"),
+    }))
+    .filter(({ source }) =>
+      source.includes("DOCK_ICON_PREFERENCE")
+      && source.includes("dockIconPreviews:")
+      && source.includes("CODEX_ELECTRON_DEV_DOCK_ICONS_PATH"),
+    );
+  assert.equal(
+    mainCandidates.length,
+    1,
+    `expected one signed main-process Dock contract, found ${mainCandidates.map(({ name }) => name).join(", ")}`,
+  );
+  const mainPatched = applyDockIconMainPatch(mainCandidates[0].source);
+  assert.notEqual(mainPatched, mainCandidates[0].source);
+  assert.equal(applyDockIconMainPatch(mainPatched), mainPatched);
+  assert.match(mainPatched, /function codexLinuxDockIconResourcePath/);
+  assert.match(mainPatched, /function codexLinuxApplyDockIcon/);
+
+  const { root, install, result } = runStage();
+  try {
+    assert.equal(result.status, 0, result.stderr);
+    const payload = path.join(install, "resources", "dock-icon");
+    const previews = evaluateLinuxPreviews(mainPatched, payload);
+    assert.notEqual(previews, null);
+    assert.equal(previews.appDefault, "official-icon");
+    assert.equal(previews.codexDark, previews.spaceDark);
+    assert.equal(previews.codexLight, previews.spaceLight);
+    const resourceName = evaluateLinuxRuntimeResourceNames(mainPatched);
+    assert.equal(resourceName("space-system", false), "icon-codex-light.png");
+    assert.equal(resourceName("space-system", true), "icon-codex-dark-color.png");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
+  const settingsDescriptor = descriptors.find((descriptor) =>
+    descriptor.id.endsWith("settings-row"),
+  );
+  const assetsDir = path.join(extractedApp, "webview", "assets");
+  const settingsCandidates = findWebviewAssetsContaining(extractedApp, settingsDescriptor.assetNeedles)
+    .map((name) => ({ name, source: fs.readFileSync(path.join(assetsDir, name), "utf8") }));
+  assert.ok(settingsCandidates.length >= 1, "expected at least one signed Dock settings gate chunk");
+  for (const { name, source } of settingsCandidates) {
+    const settingsPatched = applyDockIconSettingsPatch(source);
+    assert.notEqual(settingsPatched, source, `expected one signed Dock settings contract in ${name}`);
+    assert.match(settingsPatched, /return"macOS"!==([A-Za-z_$][\w$]*)&&"linux"!==\1\|\|/);
+    assert.equal(applyDockIconSettingsPatch(settingsPatched), settingsPatched);
+  }
+});
+
 test("settings patch exposes the official row on Linux across minified aliases", () => {
   const patched = applyDockIconSettingsPatch(currentSettingsSource);
   assert.match(
     patched,
-    /return e!==`macOS`&&e!==`linux`\|\|r===t\.Agent\?null:n/,
+    /\{platform:e,dockIconPreviews:t,buildFlavor:a="prod"\}\)\{return"macOS"!==e&&"linux"!==e\|\|a===s\.x1u\.Agent\?null:t\}/,
   );
   assert.equal(applyDockIconSettingsPatch(patched), patched);
+  assert.equal(patched.replace('&&"linux"!==e', ""), currentSettingsSource);
 
   const aliases = currentSettingsSource
-    .replace("e!==`macOS`", "platform!==`macOS`")
-    .replace("r===t.Agent", "flavor===flavors.Agent")
-    .replace("?null:n", "?null:previews");
-  assert.match(applyDockIconSettingsPatch(aliases), /platform!==`linux`/);
+    .replace("{platform:e,", "{platform:p,")
+    .replace('"macOS"!==e', '"macOS"!==p')
+    .replace("dockIconPreviews:t,", "dockIconPreviews:previews,")
+    .replace("?null:t}", "?null:previews}")
+    .replace('buildFlavor:a="prod"', 'buildFlavor:flavor="prod"')
+    .replace("a===s.x1u.Agent", "flavor===flavors.Agent");
+  assert.match(applyDockIconSettingsPatch(aliases), /return"macOS"!==p&&"linux"!==p\|\|flavor===flavors\.Agent\?null:previews\}/);
 });
 
 test("settings drift, duplicates, and mixed contracts remain byte-identical", () => {
   const patched = applyDockIconSettingsPatch(currentSettingsSource);
   for (const source of [
-    currentSettingsSource.replace("dockIconPreviews", "dockIconPreviewsDrift"),
+    currentSettingsSource.replace("dockIconPreviews:t,", "dockIconPreviewsDrift:t,"),
+    currentSettingsSource.replace('"macOS"!==e', '"macOS"!==t'),
+    currentSettingsSource.replace("?null:t}", "?null:e}"),
+    currentSettingsSource.replace("buildFlavor:a=\"prod\"", "buildFlavor:a"),
     currentSettingsSource + currentSettingsSource,
     currentSettingsSource + patched,
   ]) {
@@ -308,39 +488,35 @@ test("descriptors select only current official-package contracts", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dock-icon-assets-"));
   try {
     const assets = path.join(root, "webview", "assets");
-    fs.mkdirSync(assets, { recursive: true });
+    fs.mkdirSync(path.join(assets, "async"), { recursive: true });
+    const copies = ["async/572868.36a6c86221.js", "async/968499.fa029184f4.js"];
+    for (const copy of copies) fs.writeFileSync(path.join(assets, copy), currentSettingsSource);
+    // Consumers of the gate without the gate module itself are not candidates.
     fs.writeFileSync(
-      path.join(assets, "dock-icon-setting-visibility-B9IZyljn.js"),
-      currentSettingsSource,
-    );
-    fs.writeFileSync(
-      path.join(assets, "dock-icon-setting-visibility-CsA3Lt9Z.js"),
-      "old DMG fixture",
+      path.join(assets, "async", "24191.7b05d5cf83.js"),
+      'export const __webpack_modules__={x(e,t,a){let n=(0,a("IKhT")._)({platform:e,dockIconPreviews:null})}};',
     );
     const settingsDescriptor = descriptors.find((descriptor) =>
       descriptor.id.endsWith("settings-row"),
     );
-    const result = patchUniqueAssetFile(
+    assert.equal(settingsDescriptor.assetMatch, undefined);
+    assert.equal(settingsDescriptor.pattern ?? settingsDescriptor.assetPattern, undefined);
+    const candidates = findWebviewAssetsContaining(root, settingsDescriptor.assetNeedles);
+    assert.deepEqual(candidates, copies);
+    const result = patchAssetFiles(
       root,
-      settingsDescriptor.pattern,
-      settingsDescriptor.assetMatch,
+      null,
       settingsDescriptor.apply,
       settingsDescriptor.missingDescription,
-      "ambiguous Dock icon Settings bundles",
+      candidates,
     );
-    assert.deepEqual(result, {
-      matched: 1,
-      changed: 1,
-      assetName: "dock-icon-setting-visibility-B9IZyljn.js",
-    });
-    assert.match(
-      fs.readFileSync(path.join(assets, "dock-icon-setting-visibility-B9IZyljn.js"), "utf8"),
-      /!==`linux`/,
-    );
-    assert.equal(
-      fs.readFileSync(path.join(assets, "dock-icon-setting-visibility-CsA3Lt9Z.js"), "utf8"),
-      "old DMG fixture",
-    );
+    assert.equal(result.matched, 2);
+    assert.equal(result.changed, 2);
+    for (const copy of copies) {
+      assert.match(fs.readFileSync(path.join(assets, copy), "utf8"), /&&"linux"!==e\|\|/);
+    }
+    const again = patchAssetFiles(root, null, settingsDescriptor.apply, "missing", candidates);
+    assert.equal(again.changed, 0);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -787,7 +963,7 @@ test("desktop synchronization serializes the per-app launcher transaction with a
   }
 });
 
-test("AppImage synchronization writes persistent launch commands for the app and action", () => {
+test("AppImage synchronization writes a persistent launch command for the app", () => {
   const fixture = createDesktopSyncFixture();
   try {
     const sourceDir = path.join(fixture.tempDir, "mounted AppDir");
@@ -819,12 +995,6 @@ test("AppImage synchronization writes persistent launch commands for the app and
     assert.doesNotMatch(managed, /\bAppRun\b/);
     assert.equal(
       managed.includes(`Exec="${desktopAppImage}" --show %u\n`),
-      true,
-    );
-    assert.equal(
-      managed.includes(
-        `Exec=env CHROME_DESKTOP=codex-desktop.desktop CODEX_MULTI_LAUNCH=1 "${desktopAppImage}" --new-instance\n`,
-      ),
       true,
     );
     const validation = childProcess.spawnSync("desktop-file-validate", [fixture.managedDesktop], {

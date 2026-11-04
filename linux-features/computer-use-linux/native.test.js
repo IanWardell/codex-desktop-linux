@@ -2,6 +2,55 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 
+test('Linux public inventory and window selectors use the trusted adapter', async () => {
+  const { installLinuxComputerUse } = await import('./native-client.mjs');
+  const original = globalThis.nodeRepl;
+  const calls = [], writes = [];
+  const apps = ['22', '18446744073709551615'].map(id => ({
+    id: `linux-window:${id}`, displayName: 'editor', title: 'Document', focused: true, isRunning: true,
+  }));
+  globalThis.nodeRepl = { write: value => writes.push(value), rpc: async (_, request) => {
+    calls.push(request);
+    return request.method === 'list_apps' ? apps : { accessibility_tree: [] };
+  }};
+  try {
+    const cua = installLinuxComputerUse({
+      listWindows: () => assert.fail('upstream missing method must be replaced'),
+      getState: () => assert.fail('upstream state still uses the unsupported Sky proxy'),
+      listBrowsers: async options => {
+        assert.equal(options.emit, false);
+        return [{ id: 'iab' }];
+      },
+      listTabs: async options => {
+        assert.deepEqual(options, { browser: 'iab', emit: false });
+        return [{ id: 'tab-1' }];
+      },
+    });
+    const windows = await cua.listWindows({ emit: false });
+    assert.deepEqual(windows.map(window => window.id), [22, '18446744073709551615']);
+    assert.equal(writes.length, 0);
+    assert.deepEqual(await cua.getState({ emit: false }), {
+      apps, browsers: [{ id: 'iab', tabs: [{ id: 'tab-1' }] }],
+    });
+    for (const window of windows) {
+      const app = await cua.getApp({ windowId: window.id });
+      await app.pressKey('ESC');
+      assert.equal(calls.at(-1).app, `linux-window:${window.id}`);
+    }
+    const before = calls.length;
+    for (const windowId of [null, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '', '1e3', '18446744073709551616']) {
+      await assert.rejects(cua.getApp({ windowId }), /exact windowId/);
+    }
+    assert.equal(calls.length, before);
+    const failedBrowser = installLinuxComputerUse({
+      listBrowsers: async () => { throw new Error('extension disconnected'); },
+    });
+    assert.deepEqual(await failedBrowser.getState({ emit: false }), {
+      apps, browsers: [], errors: ['Browsers: Error: extension disconnected'],
+    });
+  } finally { globalThis.nodeRepl = original; }
+});
+
 test('native client preserves browser inventory and binds native actions to selected app', async () => {
   const { installLinuxComputerUse } = await import('./native-client.mjs');
   const calls = [];
@@ -13,10 +62,9 @@ test('native client preserves browser inventory and binds native actions to sele
     return { ok: true };
   }};
   try {
-    const inheritedState = async () => ({ apps: [], browsers: [{ id: 'iab' }] });
-    const cua = { getState: inheritedState, initialize: inheritedState };
+    const cua = { listBrowsers: async () => [{ id: 'iab' }], listTabs: async () => [] };
     installLinuxComputerUse(cua);
-    const expected = { apps: [{ id: 'org.example.Editor', isRunning: true }], browsers: [{ id: 'iab' }] };
+    const expected = { apps: [{ id: 'org.example.Editor', isRunning: true }], browsers: [{ id: 'iab', tabs: [] }] };
     assert.deepEqual(await cua.getState({ emit: false }), expected);
     assert.deepEqual(await cua.initialize({ emit: false }), expected);
     const app = await cua.getApp('org.example.Editor');
@@ -34,7 +82,7 @@ test('trusted service validates requests before backend launch', async () => {
   await assert.rejects(handleRpc({ method: 'drag', app: 'editor', params: {} }), /not supported/);
   await assert.rejects(handleRpc({ method: 'click', app: 'editor', params: { window_id: 22 } }), /parameter/);
   for (const params of [
-    {max_nodes:0}, {max_nodes:2001}, {max_depth:-1}, {max_depth:65},
+    {max_nodes:0}, {max_nodes:10001}, {max_depth:-1}, {max_depth:65},
     {max_width:0}, {max_height:4097}, {max_bytes:1023}, {max_bytes:4194305},
     {scale:0}, {scale:1.1}, {format:'webp'}, {quality:0}, {quality:96},
   ]) {
@@ -114,6 +162,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if(r.method === 'notifications/initialized') { initialized=true; return; }
   if(!initialized) process.exit(9);
   const {name,arguments:a} = r.params;
+  // The host pages a tree from the backend's cache; that read is not a desktop call.
+  if(name === 'get_tree_page') return reply({structuredContent:{nodes:[],offset:a.offset,next_offset:null,node_count:1,message:''},content:[]});
   require('node:fs').appendFileSync(${JSON.stringify(log)}, line+'\\n');
   if (${capture}) {
     if(name === 'get_app_state') return reply({content:[{type:'text',text:JSON.stringify({accessibility_tree:[{name:'Document'}],window_context:{focused},...(a.include_screenshot ? {screenshot_error:'requested window is not focused'} : {})})}]});
@@ -222,6 +272,7 @@ test('native client compacts and suppresses repeated large accessibility observa
 
     const full = JSON.parse(await app.getAXState({emit:false,compact:false}));
     assert.match(full.accessibility_tree[0].object_ref,/org\/a11y/);
+    assert.deepEqual(calls.at(-1).params,{include_screenshot:false,verbose:true});
 
     response = {...response,accessibility_tree:tree.map((node,index) => index === 236
       ? {...node,states:node.states.filter(state => state !== 'enabled' && state !== 'showing')}
@@ -234,6 +285,31 @@ test('native client compacts and suppresses repeated large accessibility observa
     assert.equal(changed.window_context.focused,false);
     await assert.rejects(app.getAXState({maxNodes:20,max_nodes:21}),/Conflicting maxNodes/);
   } finally { globalThis.nodeRepl=original; }
+});
+
+test('native client keeps action names from compact backend nodes', async () => {
+  const { installLinuxComputerUse } = await import('./native-client.mjs');
+  const original = globalThis.nodeRepl;
+  globalThis.nodeRepl = {
+    write(){},
+    rpc:async () => ({accessibility_tree:[{
+      index:0, depth:0, object_ref:':1.234/org/a11y/atspi/accessible/0', role:'push button',
+      name:'Save', states:['enabled','focusable'], actions:['click','press'],
+    }]}),
+  };
+  try {
+    const app = await installLinuxComputerUse({}).getApp('editor');
+    const [button] = JSON.parse(await app.getAXState({emit:false,disableDiffing:true})).accessibility_tree;
+    assert.deepEqual(button.actions,['click','press']);
+    assert.equal(button.actionable,true);
+  } finally { globalThis.nodeRepl=original; }
+});
+
+test('native verbose is a boolean get_app_state parameter', async () => {
+  const { validateNativeRequest } = await import('./native-protocol.mjs');
+  assert.doesNotThrow(() => validateNativeRequest({method:'get_app_state', params:{verbose:true}}));
+  assert.throws(() => validateNativeRequest({method:'get_app_state', params:{verbose:'yes'}}), /Invalid native verbose/);
+  assert.throws(() => validateNativeRequest({method:'screenshot', app:'editor', params:{verbose:true}}), /Unsupported native operation parameter/);
 });
 
 test('native client routes screenshot limits separately from accessibility limits', async () => {
@@ -403,3 +479,92 @@ for (const captureMalformed of ['missing-image', 'uncropped']) {
     await assert.rejects(service.handleRpc({method:'screenshot',app:'editor'}), /targeted screenshot/);
   });
 }
+
+// Like the real backend: a large tree comes back as its leading nodes, the whole tree
+// stays cached, and get_tree_page pages it. Each snapshot replaces the cache.
+async function spillFixture(t, { nodes = 500, spill = true, nameBytes = 20, treeBudgetBytes } = {}) {
+  const { mkdtemp, writeFile: write, rm: remove } = await import('node:fs/promises');
+  const { tmpdir: tmp } = await import('node:os');
+  const { join: joinPath } = await import('node:path');
+  const dir = await mkdtemp(joinPath(tmp(), 'cul-spill-native-'));
+  const script = joinPath(dir, 'backend.cjs');
+  await write(script, `
+let cache = [], sequence = 0;
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+  const r = JSON.parse(line);
+  const reply = result => process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n');
+  if (r.method === 'initialize') return reply({protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}});
+  if (r.method === 'notifications/initialized') return;
+  const {name, arguments: a} = r.params;
+  if (name === 'get_tree_page') {
+    const start = Math.min(a.offset ?? 0, cache.length), end = Math.min(start + 100, cache.length);
+    return reply({structuredContent:{nodes:cache.slice(start, end), offset:start, next_offset:end < cache.length ? end : null, node_count:cache.length, message:''}, content:[]});
+  }
+  const call = sequence++;
+  cache = Array.from({length:${nodes}}, (_, index) => ({index, role:'push button', name:'Node '+index+' of call '+call+' '+'x'.repeat(${nameBytes})}));
+  // A failed spill write: no accessibility_tree_spill, only the leading nodes.
+  reply({structuredContent:{accessibility_tree:cache.slice(0, 3), accessibility_tree_truncated:false,
+    ...(${spill} ? {accessibility_tree_spill:{path:'/run/user/1000/codex-computer-use-linux/trees/tree-1-2-'+call+'.json', node_count:cache.length, bytes:1, inline_node_count:3}} : {})}, content:[]});
+});
+`);
+  const { createNativeBackendService } = await import('./native-backend-service.mjs');
+  const service = createNativeBackendService({ command: process.execPath, args: [script], timeoutMs: 5000, ...(treeBudgetBytes ? {treeBudgetBytes} : {}) });
+  t.after(async () => { service.shutdown(); await remove(dir, {recursive:true, force:true}); });
+  return service;
+}
+
+test('a large tree reaches the agent whole, and concurrent snapshots each get their own', async t => {
+  const service = await spillFixture(t);
+  const state = await service.handleRpc({method:'get_app_state', app:'editor', params:{max_nodes:10000}});
+  assert.equal(state.accessibility_tree.length, 500);
+  assert.equal(state.accessibility_tree.at(-1).index, 499);
+  assert.match(state.accessibility_tree.at(-1).name, /^Node 499 of call 0 /);
+  assert.equal(state.accessibility_tree_spill, undefined);
+  assert.equal(state.accessibility_tree_note, undefined);
+  // Each snapshot replaces the cache; calls are serialized, so each pages its own.
+  const [a, b] = await Promise.all([
+    service.handleRpc({method:'get_app_state', app:'editor', params:{}}),
+    service.handleRpc({method:'get_app_state', app:'editor', params:{}}),
+  ]);
+  assert.ok(a.accessibility_tree.every(node => node.name.includes('of call 1 ')));
+  assert.ok(b.accessibility_tree.every(node => node.name.includes('of call 2 ')));
+  assert.equal(a.accessibility_tree.length, 500);
+});
+
+test('a tree the backend could not spill to a file is still returned whole', async t => {
+  const service = await spillFixture(t, {spill:false});
+  const state = await service.handleRpc({method:'get_app_state', app:'editor', params:{}});
+  assert.equal(state.accessibility_tree.length, 500);
+});
+
+test('a tree larger than the bridge comes back partial and says so', async t => {
+  const service = await spillFixture(t, {nameBytes:1000, treeBudgetBytes:200_000});
+  const state = await service.handleRpc({method:'get_app_state', app:'editor', params:{}});
+  assert.ok(state.accessibility_tree.length > 3 && state.accessibility_tree.length < 500, String(state.accessibility_tree.length));
+  assert.ok(Buffer.byteLength(JSON.stringify(state)) <= 200_000 + 4096);
+  assert.equal(state.accessibility_tree_truncated, true);
+  assert.match(state.accessibility_tree_note, new RegExp(`${state.accessibility_tree.length} of 500 nodes`));
+});
+
+test('the native client passes the partial-tree marker to the agent', async () => {
+  const { installLinuxComputerUse } = await import('./native-client.mjs');
+  const original = globalThis.nodeRepl;
+  const writes = [];
+  const response = {accessibility_tree:[{index:0,role:'frame',states:[],actions:[]}], window_context:{focused:true},
+    accessibility_tree_truncated:true, accessibility_tree_note:'Partial tree: 1 of 9 nodes fit the host bridge.'};
+  globalThis.nodeRepl = { write:value=>writes.push(value), rpc:async () => response };
+  try {
+    const app = await installLinuxComputerUse({}).getApp('editor');
+    const state = JSON.parse(await app.getAXState({emit:false, disableDiffing:true}));
+    assert.equal(state.accessibility_tree_truncated, true);
+    assert.match(state.accessibility_tree_note, /1 of 9 nodes/);
+  } finally {
+    globalThis.nodeRepl = original;
+  }
+});
+
+test('native max_nodes accepts the backend cap of 10000', async () => {
+  const { validateNativeRequest } = await import('./native-protocol.mjs');
+  assert.doesNotThrow(() => validateNativeRequest({method:'get_app_state', params:{max_nodes:10000}}));
+  assert.throws(() => validateNativeRequest({method:'get_app_state', params:{max_nodes:10001}}), /Invalid native max_nodes/);
+});

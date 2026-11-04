@@ -1,40 +1,22 @@
 "use strict";
 
 const JS_IDENT = "[A-Za-z_$][\\w$]*";
-const BT = "`";
+const NOT_IDENT = "(?![\\w$])";
 const COMPILED_UI_MARKER = "codexLinuxCopilotReasoningEffortUi";
+const MODEL_LIST_MARKER = "codexLinuxCopilotReasoningEffortModelList";
 
-function currentCopilotWriterRegex() {
-  return new RegExp(
-    `(${JS_IDENT}=async\\((${JS_IDENT}),(${JS_IDENT}),${JS_IDENT},${JS_IDENT}\\)=>\\{[\\s\\S]{0,1000}?` +
-      `if\\((${JS_IDENT})\\)return await (${JS_IDENT})\\((${JS_IDENT}),${BT}copilot-default-model${BT},\\2,` +
-      `\\{throwOnFailure:!0\\}\\)),!0`,
-  );
-}
+// rspack chunks have no stable filenames, so every owner is found by content.
+const PERSISTENCE_NEEDLES = ["setDefaultModelAndReasoningEffort:", ".setDefaultModelConfig("];
+const MODEL_LIST_NEEDLES = ['description:"medium effort"', "supportedReasoningEfforts"];
+const DROPDOWN_NEEDLES = ["reasoningEffortDisabled:", "?.disabledReason!=null"];
+const SLASH_NEEDLES = [
+  'id:"composer.reasoningSlashCommand.title"',
+  "requiresEmptyComposer",
+  'authMethod==="copilot"',
+];
 
-function matchesCopilotReasoningEffortSettingsContract(source) {
-  const cleanReader = new RegExp(
-    `function ${JS_IDENT}\\(\\)\\{let ${JS_IDENT}=\\(0,${JS_IDENT}\\.c\\)\\(3\\),${JS_IDENT}=${JS_IDENT}\\(\\),` +
-      `\\{data:${JS_IDENT},isLoading:${JS_IDENT}\\}=${JS_IDENT}\\(${BT}copilot-default-model${BT}\\)` +
-      `[\\s\\S]{0,400}?reasoningEffort:${BT}medium${BT}`,
-  );
-  const patchedReader = source.includes("copilot-default-reasoning-effort`),codexCopilotModelValue=");
-  const patchedWriter = source.includes("`copilot-default-reasoning-effort`,");
-  return (cleanReader.test(source) || patchedReader) &&
-    (currentCopilotWriterRegex().test(source) || patchedWriter);
-}
-
-function matchesCopilotReasoningEffortModelListContract(source) {
-  const clean = new RegExp(
-    `${JS_IDENT}=\\(${JS_IDENT}===${BT}copilot${BT}\\?\\[${JS_IDENT}\\.find\\([^)]*\\)\\?\\?` +
-      `\\{reasoningEffort:${BT}medium${BT},description:${BT}medium effort${BT}\\}\\]:${JS_IDENT}\\)\\.filter\\(`,
-  );
-  const patched = new RegExp(`${JS_IDENT}=\\[\\.\\.\\.${JS_IDENT}\\]\\.filter\\(\\(\\{reasoningEffort:`);
-  return clean.test(source) || patched.test(source);
-}
-
-function matchesCopilotReasoningEffortUiContract(source) {
-  return analyzeCopilotReasoningEffortUiContract(source).state !== "invalid";
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function findAllMatches(source, regex) {
@@ -42,48 +24,115 @@ function findAllMatches(source, regex) {
   return [...source.matchAll(new RegExp(regex.source, flags))];
 }
 
-function findCompiledNamedFunctionOwner(source, index) {
-  const declaration = new RegExp(`function ${JS_IDENT}\\([^)]*\\)\\{`, "g");
-  let ownerStart = null;
-  for (const match of source.matchAll(declaration)) {
-    if (match.index > index) break;
-    ownerStart = match.index;
-  }
-  if (ownerStart == null) return null;
-
-  const nextDeclaration = new RegExp(`\\}function ${JS_IDENT}\\(`, "g");
-  nextDeclaration.lastIndex = index;
-  const ownerEnd = nextDeclaration.exec(source);
-  if (ownerEnd == null) return null;
-
-  return {
-    start: ownerStart,
-    end: ownerEnd.index + 1,
-  };
+function spliceMatch(source, match, replacement) {
+  return source.slice(0, match.index) + replacement + source.slice(match.index + match[0].length);
 }
 
-function analyzeCompiledCopilotReasoningEffortUiContract(source) {
-  if (
-    !source.includes("composer.reasoningSlashCommand.title") ||
-    !source.includes("reasoningEffortDisabled:") ||
-    !source.includes("authMethod===`copilot`")
-  ) {
-    return null;
-  }
+function warn(message, skipDescription) {
+  console.warn(`WARN: ${message} - skipping ${skipDescription}`);
+}
 
+// --- Persistence owner (validation only) ------------------------------------
+
+// Upstream persists Copilot model and effort selections through its model
+// settings hook. The hook is copied into every composer surface chunk; each
+// copy must still write the default through setDefaultModelConfig and route
+// both the "default" and "current" scopes through the same writer.
+function matchesCopilotModelAndReasoningPersistenceContract(source) {
+  const exportedMatches = findAllMatches(source, new RegExp(
+    `setDefaultModelAndReasoningEffort:${JS_IDENT},` +
+      `setModelAndReasoningEffortForNextTurn:${JS_IDENT},` +
+      `setModelAndReasoningEffort:${JS_IDENT},modelSettings:${JS_IDENT}`,
+  ));
+  if (exportedMatches.length !== 1) return false;
+
+  const match = exportedMatches[0];
+  const ownerRegion = source.slice(Math.max(0, match.index - 6_000), match.index + match[0].length);
+  const defaultWrites = findAllMatches(
+    ownerRegion,
+    new RegExp(`\\.setDefaultModelConfig\\(${JS_IDENT},${JS_IDENT},${JS_IDENT}\\.profile\\)`),
+  );
+  const defaultWrappers = findAllMatches(
+    ownerRegion,
+    new RegExp(`=>(${JS_IDENT})\\(${JS_IDENT},${JS_IDENT},"default"\\)`),
+  );
+  const currentWrappers = findAllMatches(
+    ownerRegion,
+    new RegExp(`=>(${JS_IDENT})\\(${JS_IDENT},${JS_IDENT},"current",${JS_IDENT}\\)`),
+  );
+  return defaultWrites.length === 1 &&
+    defaultWrappers.length === 1 &&
+    currentWrappers.length === 1 &&
+    defaultWrappers[0][1] === currentWrappers[0][1];
+}
+
+function validateCopilotModelAndReasoningPersistence(source) {
+  if (!matchesCopilotModelAndReasoningPersistenceContract(source)) {
+    warn(
+      "Could not find current model-and-reasoning persistence owner",
+      "Copilot reasoning effort persistence validation",
+    );
+  }
+  return source;
+}
+
+// --- Model catalog ------------------------------------------------------------
+
+function modelListState(source) {
+  const clean = findAllMatches(source, new RegExp(
+    `(?<result>${JS_IDENT})=\\("copilot"===${JS_IDENT}\\?\\[(?<efforts>${JS_IDENT})\\.find\\(` +
+      `(${JS_IDENT})=>"medium"===\\3\\.reasoningEffort\\)\\?\\?` +
+      `\\{reasoningEffort:"medium",description:"medium effort"\\}\\]:\\k<efforts>\\)\\.filter\\(`,
+  ));
+  const patched = findAllMatches(source, new RegExp(
+    `${JS_IDENT}=/\\*${MODEL_LIST_MARKER}\\*/\\[\\.\\.\\.${JS_IDENT}\\]\\.filter\\(`,
+  ));
+  if (clean.length === 1 && patched.length === 0) return { kind: "current", match: clean[0] };
+  if (clean.length === 0 && patched.length === 1) return { kind: "patched" };
+  return { kind: clean.length + patched.length === 0 ? "missing" : "invalid" };
+}
+
+function matchesCopilotReasoningEffortModelListContract(source) {
+  const { kind } = modelListState(source);
+  return kind === "current" || kind === "patched";
+}
+
+function applyCopilotReasoningEffortModelListPatch(source) {
+  const state = modelListState(source);
+  if (state.kind === "patched") return source;
+  if (state.kind === "current") {
+    const { result, efforts } = state.match.groups;
+    // Copilot keeps every effort the model advertises instead of a single
+    // synthetic "medium" entry; the upstream enabled-effort filter still runs.
+    return spliceMatch(
+      source,
+      state.match,
+      `${result}=/*${MODEL_LIST_MARKER}*/[...${efforts}].filter(`,
+    );
+  }
+  warn(
+    state.kind === "invalid"
+      ? "Found ambiguous Copilot model reasoning effort filters"
+      : "Could not find current Copilot model reasoning effort filter",
+    "Copilot reasoning effort model list patch",
+  );
+  return source;
+}
+
+// --- Composer reasoning effort dropdown --------------------------------------
+
+function analyzeCompiledCopilotReasoningEffortUiContract(source) {
   const modelExpression =
     `${JS_IDENT}\\?\\.find\\(${JS_IDENT}=>\\{let\\{model:${JS_IDENT}\\}=${JS_IDENT};` +
     `return ${JS_IDENT}\\.model===${JS_IDENT}\\}\\)\\?\\.disabledReason!=null`;
-  const cleanCombined = new RegExp(
-    `(?<disabled>${JS_IDENT})=(?<host>${JS_IDENT})\\?\\.authMethod===${BT}copilot${BT}\\|\\|` +
+  const cleanMatches = findAllMatches(source, new RegExp(
+    `(?<disabled>${JS_IDENT})=(?<host>${JS_IDENT})\\?\\.authMethod==="copilot"\\|\\|` +
       `(?<modelExpression>${modelExpression})`,
-  );
-  const patchedCombined = new RegExp(
+  ));
+  const patchedMatches = findAllMatches(source, new RegExp(
     `(?<disabled>${JS_IDENT})=/\\*${COMPILED_UI_MARKER}\\*/(?<modelExpression>${modelExpression})`,
-  );
-  const cleanCombinedMatches = findAllMatches(source, cleanCombined);
-  const patchedCombinedMatches = findAllMatches(source, patchedCombined);
-  const combinedMatches = [...cleanCombinedMatches, ...patchedCombinedMatches];
+  ));
+  const combinedMatches = [...cleanMatches, ...patchedMatches];
   if (combinedMatches.length !== 1) {
     return {
       state: "invalid",
@@ -93,246 +142,158 @@ function analyzeCompiledCopilotReasoningEffortUiContract(source) {
     };
   }
 
+  // The combined gate must reach the dropdown through one later
+  // `dropdown=<locked>||<combined>||...` assignment in the same composer.
   const combinedMatch = combinedMatches[0];
-  const owner = findCompiledNamedFunctionOwner(source, combinedMatch.index);
-  if (owner == null) {
+  const after = source.slice(combinedMatch.index + combinedMatch[0].length, combinedMatch.index + 60_000);
+  const dropdownGates = findAllMatches(after, new RegExp(
+    `[,;](?<dropdown>${JS_IDENT})=${JS_IDENT}\\|\\|` +
+      `${escapeRegExp(combinedMatch.groups.disabled)}${NOT_IDENT}`,
+  ));
+  const consumers = dropdownGates.filter((gate) => findAllMatches(
+    after.slice(gate.index, gate.index + 20_000),
+    new RegExp(`reasoningEffortDisabled:${escapeRegExp(gate.groups.dropdown)}${NOT_IDENT}`),
+  ).length === 1);
+  if (dropdownGates.length !== 1 || consumers.length !== 1) {
     return {
       state: "invalid",
-      warning: "Could not find current compiled Copilot reasoning effort composer owner",
-    };
-  }
-  const ownerAfterCombined = source.slice(combinedMatch.index, owner.end);
-  const dropdownGate = new RegExp(
-    `(?<dropdown>${JS_IDENT})=${JS_IDENT}\\|\\|${combinedMatch.groups.disabled}` +
-      `[\\s\\S]{0,7000}?reasoningEffortDisabled:\\k<dropdown>`,
-  );
-  const dropdownGateMatches = findAllMatches(ownerAfterCombined, dropdownGate);
-  if (dropdownGateMatches.length !== 1) {
-    return {
-      state: "invalid",
-      warning: dropdownGateMatches.length === 0
-        ? "Could not find current compiled Copilot reasoning effort dropdown gate"
-        : "Found duplicate current compiled Copilot reasoning effort dropdown gates",
+      warning: dropdownGates.length > 1
+        ? "Found duplicate current compiled Copilot reasoning effort dropdown gates"
+        : "Could not find current compiled Copilot reasoning effort dropdown gate",
     };
   }
 
-  const titleIndex = source.indexOf("composer.reasoningSlashCommand.title");
-  const slashStart = Math.max(0, titleIndex - 2_000);
-  const slashEnd = Math.min(source.length, titleIndex + 3_000);
-  const slashSource = source.slice(slashStart, slashEnd);
-  const cleanSlash = new RegExp(
-    `(?<enabled>${JS_IDENT})=(?<requires>${JS_IDENT})&&(?<ready>${JS_IDENT})&&!` +
-      `(?<copilot>${JS_IDENT})&&!0,(?<dependencies>${JS_IDENT});`,
-  );
-  const patchedSlash = new RegExp(
-    `(?<enabled>${JS_IDENT})=(?<requires>${JS_IDENT})&&(?<ready>${JS_IDENT})&&!0` +
-      `/\\*${COMPILED_UI_MARKER}\\*/,(?<dependencies>${JS_IDENT});`,
-  );
-  const cleanSlashMatches = findAllMatches(slashSource, cleanSlash);
-  const patchedSlashMatches = findAllMatches(slashSource, patchedSlash);
-  const slashMatches = [...cleanSlashMatches, ...patchedSlashMatches];
-  if (slashMatches.length !== 1) {
-    return {
-      state: "invalid",
-      warning: slashMatches.length === 0
-        ? "Could not find current compiled Copilot reasoning slash command gate"
-        : "Found duplicate current compiled Copilot reasoning slash command gates",
-    };
-  }
+  return {
+    state: cleanMatches.length === 1 ? "pristine" : "patched",
+    combinedMatch,
+  };
+}
 
-  if (cleanSlashMatches.length === 1) {
-    const copilotVar = cleanSlashMatches[0].groups.copilot;
-    const copilotDeclaration = new RegExp(
-      `${copilotVar}=${JS_IDENT}\\?\\.authMethod===${BT}copilot${BT}`,
+function matchesCopilotReasoningEffortDropdownContract(source) {
+  return analyzeCompiledCopilotReasoningEffortUiContract(source).state !== "invalid";
+}
+
+function applyCopilotReasoningEffortDropdownPatch(source) {
+  const contract = analyzeCompiledCopilotReasoningEffortUiContract(source);
+  if (contract.state === "patched") return source;
+  if (contract.state === "pristine") {
+    const { disabled, modelExpression } = contract.combinedMatch.groups;
+    const patched = spliceMatch(
+      source,
+      contract.combinedMatch,
+      `${disabled}=/*${COMPILED_UI_MARKER}*/${modelExpression}`,
     );
-    if (!copilotDeclaration.test(slashSource)) {
-      return {
-        state: "invalid",
-        warning: "Could not find current compiled Copilot reasoning slash command auth gate",
-      };
-    }
+    if (analyzeCompiledCopilotReasoningEffortUiContract(patched).state === "patched") return patched;
+    contract.warning = "Compiled Copilot reasoning effort dropdown patch did not produce one coherent patched contract";
   }
+  warn(contract.warning, "Copilot reasoning effort dropdown patch");
+  return source;
+}
 
-  const pristine = cleanCombinedMatches.length === 1 && cleanSlashMatches.length === 1;
-  const patched = patchedCombinedMatches.length === 1 && patchedSlashMatches.length === 1;
-  if (!pristine && !patched) {
+// --- /reasoning slash command --------------------------------------------------
+
+function analyzeCompiledCopilotReasoningSlashContract(source) {
+  const clean = findAllMatches(source, new RegExp(
+    `let (?<enabled>${JS_IDENT})=(?<requires>${JS_IDENT})&&(?<ready>${JS_IDENT})&&!` +
+      `(?<copilot>${JS_IDENT})&&!0;`,
+  ));
+  const patched = findAllMatches(source, new RegExp(
+    `let (?<enabled>${JS_IDENT})=(?<requires>${JS_IDENT})&&(?<ready>${JS_IDENT})&&!0` +
+      `/\\*${COMPILED_UI_MARKER}\\*/;`,
+  ));
+  const commandOwned = (match) => new RegExp(
+    `\\{id:"reasoning",title:${JS_IDENT},[^{}]{0,200}requiresEmptyComposer:!1,` +
+      `[^{}]{0,200}enabled:${escapeRegExp(match.groups.enabled)}${NOT_IDENT}`,
+  ).test(source.slice(match.index, match.index + 2_000));
+  const authOwned = (match) => match.groups.copilot == null || new RegExp(
+    `[,;]${escapeRegExp(match.groups.copilot)}=${JS_IDENT}\\?\\.authMethod==="copilot"[,;]`,
+  ).test(source.slice(Math.max(0, match.index - 3_000), match.index));
+  const commandGates = [...clean, ...patched].filter(commandOwned);
+  const cleanOwned = clean.filter((match) => commandOwned(match) && authOwned(match));
+  const patchedOwned = patched.filter(commandOwned);
+  const matches = [...cleanOwned, ...patchedOwned];
+  if (matches.length !== 1) {
     return {
       state: "invalid",
-      warning: "Found mixed current compiled Copilot reasoning effort UI contract state",
+      warning: commandGates.length > 1
+        ? "Found duplicate current compiled Copilot reasoning slash command gates"
+        : commandGates.length === 1
+          ? "Could not find current compiled Copilot reasoning slash command auth gate"
+          : "Could not find current compiled Copilot reasoning slash command gate",
     };
   }
   return {
-    state: pristine ? "pristine" : "patched",
-    contract: "compiled",
-    combinedMatch,
-    slashMatch: slashMatches[0],
+    state: cleanOwned.length === 1 ? "pristine" : "patched",
+    slashMatch: matches[0],
   };
 }
 
-function analyzeCopilotReasoningEffortUiContract(source) {
-  const compiled = analyzeCompiledCopilotReasoningEffortUiContract(source);
-  return compiled ?? {
-    state: "invalid",
-    warning: "Could not find current compiled Copilot reasoning effort UI contract",
-  };
+function matchesCopilotReasoningSlashContract(source) {
+  return analyzeCompiledCopilotReasoningSlashContract(source).state !== "invalid";
 }
 
-function applyCopilotReasoningEffortSettingsPatch(currentSource) {
-  const copilotSavePatchMarker = "copilot-default-reasoning-effort`,";
-  const currentCopilotSaveRegex = currentCopilotWriterRegex();
-  if (
-    !currentSource.includes(copilotSavePatchMarker) &&
-    !currentCopilotSaveRegex.test(currentSource)
-  ) {
-    if (currentSource.includes("copilot-default-model")) {
-      console.warn(
-        "WARN: Could not find Copilot default model writer - skipping Copilot reasoning effort settings patch",
-      );
-    }
-    return currentSource;
-  }
-
-  let patchedSource = currentSource;
-
-  const copilotDefaultsPatchMarker = "copilot-default-reasoning-effort`),codexCopilotModelValue=";
-  const copilotDefaultsRegex =
-    /function ([A-Za-z_$][\w$]*)\(\)\{let ([A-Za-z_$][\w$]*)=\(0,([A-Za-z_$][\w$]*)\.c\)\(3\),([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(\),\{data:([A-Za-z_$][\w$]*),isLoading:([A-Za-z_$][\w$]*)\}=([A-Za-z_$][\w$]*)\(`copilot-default-model`\),([A-Za-z_$][\w$]*)=\6\?\?\4\.defaultModel,([A-Za-z_$][\w$]*);return \2\[0\]!==\7\|\|\2\[1\]!==\9\?\(\10=\{model:\9,reasoningEffort:`medium`,profile:null,isLoading:\7\},\2\[0\]=\7,\2\[1\]=\9,\2\[2\]=\10\):\10=\2\[2\],\10\}/;
-  if (patchedSource.includes(copilotDefaultsPatchMarker)) {
-    // Already patched.
-  } else if (copilotDefaultsRegex.test(patchedSource)) {
-    patchedSource = patchedSource.replace(
-      copilotDefaultsRegex,
-      (
-        _match,
-        functionName,
-        memoVar,
-        cacheModuleVar,
-        defaultsVar,
-        defaultsHookVar,
-        savedModelVar,
-        modelLoadingVar,
-        persistedStateHookVar,
-        _modelValueVar,
-        resultVar,
-      ) =>
-        `function ${functionName}(){let ${memoVar}=(0,${cacheModuleVar}.c)(5),${defaultsVar}=${defaultsHookVar}(),{data:${savedModelVar},isLoading:${modelLoadingVar}}=${persistedStateHookVar}(\`copilot-default-model\`),{data:codexCopilotReasoningEffort,isLoading:codexCopilotReasoningEffortLoading}=${persistedStateHookVar}(\`copilot-default-reasoning-effort\`),codexCopilotModelValue=${savedModelVar}??${defaultsVar}.defaultModel,codexCopilotReasoningEffortValue=codexCopilotReasoningEffort??\`medium\`,${resultVar};return ${memoVar}[0]!==${modelLoadingVar}||${memoVar}[1]!==codexCopilotReasoningEffortLoading||${memoVar}[2]!==codexCopilotModelValue||${memoVar}[3]!==codexCopilotReasoningEffortValue?(${resultVar}={model:codexCopilotModelValue,reasoningEffort:codexCopilotReasoningEffortValue,profile:null,isLoading:${modelLoadingVar}||codexCopilotReasoningEffortLoading},${memoVar}[0]=${modelLoadingVar},${memoVar}[1]=codexCopilotReasoningEffortLoading,${memoVar}[2]=codexCopilotModelValue,${memoVar}[3]=codexCopilotReasoningEffortValue,${memoVar}[4]=${resultVar}):${resultVar}=${memoVar}[4],${resultVar}}`,
+function applyCopilotReasoningSlashPatch(source) {
+  const contract = analyzeCompiledCopilotReasoningSlashContract(source);
+  if (contract.state === "patched") return source;
+  if (contract.state === "pristine") {
+    const { enabled, requires, ready } = contract.slashMatch.groups;
+    const patched = spliceMatch(
+      source,
+      contract.slashMatch,
+      `let ${enabled}=${requires}&&${ready}&&!0/*${COMPILED_UI_MARKER}*/;`,
     );
-  } else if (patchedSource.includes("copilot-default-model")) {
-    console.warn(
-      "WARN: Could not find Copilot default model reader - skipping Copilot reasoning effort default patch",
-    );
+    if (analyzeCompiledCopilotReasoningSlashContract(patched).state === "patched") return patched;
+    contract.warning = "Compiled Copilot reasoning slash command patch did not produce one coherent patched contract";
   }
-
-  if (patchedSource.includes(copilotSavePatchMarker)) {
-    // Already patched.
-  } else {
-    const currentMatch = patchedSource.match(currentCopilotSaveRegex);
-    if (currentMatch != null) {
-      const [, prefix, _modelArg, effortArg, _isCopilot, persistState, stateScope] = currentMatch;
-      patchedSource = patchedSource.replace(
-        currentCopilotSaveRegex,
-        `${prefix},await ${persistState}(${stateScope},${BT}copilot-default-reasoning-effort${BT},${effortArg},{throwOnFailure:!0}),!0`,
-      );
-    } else if (patchedSource.includes("copilot-default-model")) {
-      console.warn(
-        "WARN: Could not find Copilot default model writer - skipping Copilot reasoning effort persistence patch",
-      );
-    }
-  }
-
-  return patchedSource;
-}
-
-function applyCopilotReasoningEffortModelListPatch(currentSource) {
-  const currentCopilotReasoningFilterRegex =
-    /([A-Za-z_$][\w$]*)=\(([A-Za-z_$][\w$]*)===`copilot`\?\[([A-Za-z_$][\w$]*)\.find\([^)]*\)\?\?\{reasoningEffort:`medium`,description:`medium effort`\}\]:\3\)\.filter\(/g;
-  const patchedCurrentCopilotReasoningFilterRegex =
-    /[A-Za-z_$][\w$]*=\[\.\.\.[A-Za-z_$][\w$]*\]\.filter\(\(\{reasoningEffort:/;
-
-  if (currentCopilotReasoningFilterRegex.test(currentSource)) {
-    return currentSource.replace(
-      currentCopilotReasoningFilterRegex,
-      (_match, resultVar, _authMethodVar, effortsVar) => `${resultVar}=[...${effortsVar}].filter(`,
-    );
-  }
-  if (patchedCurrentCopilotReasoningFilterRegex.test(currentSource)) {
-    return currentSource;
-  }
-
-  if (currentSource.includes("reasoningEffort:`medium`") && currentSource.includes("supportedReasoningEfforts")) {
-    console.warn(
-      "WARN: Could not find current Copilot model reasoning effort filter - skipping Copilot reasoning effort model list patch",
-    );
-  }
-  return currentSource;
-}
-
-function applyCopilotReasoningEffortUiPatch(currentSource) {
-  const contract = analyzeCopilotReasoningEffortUiContract(currentSource);
-  if (contract.state === "invalid") {
-    console.warn(`WARN: ${contract.warning} - skipping current UI patch`);
-    return currentSource;
-  }
-  if (contract.state === "patched") {
-    return currentSource;
-  }
-
-  const combined = contract.combinedMatch.groups;
-  const slash = contract.slashMatch.groups;
-  let patchedSource = currentSource.replace(
-    contract.combinedMatch[0],
-    `${combined.disabled}=/*${COMPILED_UI_MARKER}*/${combined.modelExpression}`,
-  );
-  patchedSource = patchedSource.replace(
-    contract.slashMatch[0],
-    `${slash.enabled}=${slash.requires}&&${slash.ready}&&!0/*${COMPILED_UI_MARKER}*/,${slash.dependencies};`,
-  );
-  if (analyzeCopilotReasoningEffortUiContract(patchedSource).state === "patched") {
-    return patchedSource;
-  }
-  console.warn(
-    "WARN: Compiled Copilot reasoning effort UI patch did not produce one coherent patched contract - skipping current UI patch",
-  );
-  return currentSource;
+  warn(contract.warning, "Copilot reasoning slash command patch");
+  return source;
 }
 
 module.exports = {
   descriptors: [
     {
-      id: "settings",
-      name: "copilot-reasoning-effort-settings",
+      id: "persistence-contract",
+      name: "copilot-reasoning-effort-persistence-contract",
       phase: "webview-asset",
-      pattern: /^app-initial-[^.]+\.js$/,
-      assetMatch: matchesCopilotReasoningEffortSettingsContract,
-      missingDescription: "model settings bundle",
-      skipDescription: "Copilot reasoning effort settings patch",
-      apply: applyCopilotReasoningEffortSettingsPatch,
+      assetNeedles: PERSISTENCE_NEEDLES,
+      missingDescription: "current model-and-reasoning persistence owner",
+      skipDescription: "Copilot reasoning effort persistence validation",
+      apply: validateCopilotModelAndReasoningPersistence,
     },
     {
       id: "model-list",
       name: "copilot-reasoning-effort-model-list",
       phase: "webview-asset",
-      pattern: /^app-initial-[^.]+\.js$/,
-      assetMatch: matchesCopilotReasoningEffortModelListContract,
+      assetNeedles: MODEL_LIST_NEEDLES,
       missingDescription: "model list bundle",
       skipDescription: "Copilot reasoning effort model list patch",
       apply: applyCopilotReasoningEffortModelListPatch,
     },
     {
-      id: "ui",
-      name: "copilot-reasoning-effort-ui",
+      id: "ui-dropdown",
+      name: "copilot-reasoning-effort-ui-dropdown",
       phase: "webview-asset",
-      pattern: /^app-(?:initial|primary)-[^.]+\.js$/,
-      assetMatch: matchesCopilotReasoningEffortUiContract,
-      missingDescription: "current composer bundle",
-      skipDescription: "Copilot reasoning effort UI patch",
-      apply: applyCopilotReasoningEffortUiPatch,
+      assetNeedles: DROPDOWN_NEEDLES,
+      missingDescription: "current reasoning effort dropdown owner",
+      skipDescription: "Copilot reasoning effort dropdown patch",
+      apply: applyCopilotReasoningEffortDropdownPatch,
+    },
+    {
+      id: "ui-slash-command",
+      name: "copilot-reasoning-effort-ui-slash-command",
+      phase: "webview-asset",
+      assetNeedles: SLASH_NEEDLES,
+      missingDescription: "current reasoning slash command owner",
+      skipDescription: "Copilot reasoning slash command patch",
+      apply: applyCopilotReasoningSlashPatch,
     },
   ],
+  applyCopilotReasoningEffortDropdownPatch,
   applyCopilotReasoningEffortModelListPatch,
-  applyCopilotReasoningEffortSettingsPatch,
-  applyCopilotReasoningEffortUiPatch,
+  applyCopilotReasoningSlashPatch,
+  matchesCopilotModelAndReasoningPersistenceContract,
+  matchesCopilotReasoningEffortDropdownContract,
   matchesCopilotReasoningEffortModelListContract,
-  matchesCopilotReasoningEffortSettingsContract,
-  matchesCopilotReasoningEffortUiContract,
+  matchesCopilotReasoningSlashContract,
+  validateCopilotModelAndReasoningPersistence,
 };

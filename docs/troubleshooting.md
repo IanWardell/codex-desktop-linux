@@ -6,13 +6,19 @@ Run the verifier test suite and inspect the generated metadata:
 
 ```bash
 node --test scripts/lib/upstream-linux-package.test.js
-./install.sh --inspect --report-dir /tmp/codex-inspect
+./install.sh --inspect --report-dir "$HOME/.cache/codex-desktop-dev/inspect"
 ```
 
-Do not bypass a signature or hash failure. Confirm system time, HTTPS access to
+Default builds stop on a signature or hash failure. Confirm system time, HTTPS access to
 `persistent.oaistatic.com`, `gpgv`, the pinned key fingerprint, and sufficient
 disk space. An explicit package must match host architecture and be named
 `chatgpt` in control metadata.
+For local inputs, the error identifies whether signed metadata could not be
+fetched/verified or the package does not match the current signed stable release,
+and preserves the underlying download, signature, size, hash, or control error.
+For an intentional unverified local build, see the explicit
+`--skip-oai-official-sig-verification` in
+[Build and packaging](build-and-packaging.md#build-the-application-tree).
 
 ## The app does not launch
 
@@ -112,6 +118,46 @@ parallel sessions.
 
 In the desktop menu, the custom build is **ChatGPT Community** with a blue `C`;
 the unqualified **ChatGPT** entry is OpenAI's package.
+
+## Sign-in fails with Cloudflare WARP
+
+The browser callback may show:
+
+```text
+Token exchange failed: error sending request for url (https://auth.openai.com/oauth/token)
+Error code: token_exchange_failed
+```
+
+[Issue #1557](https://github.com/ilysenko/codex-desktop-linux/issues/1557)
+reports this failure on Fedora 44 with bundled codex-cli 0.160.1 while
+Cloudflare WARP runs in `DnsOverHttps` mode. On the reporter's machine, sign-in
+succeeded with WARP disconnected and failed again with WARP connected.
+The error alone does not establish a DNS failure or its exact cause.
+
+If your network permits temporarily disconnecting WARP, try the workaround
+reported in that issue:
+
+1. Disconnect WARP:
+
+   ```bash
+   warp-cli disconnect
+   ```
+
+2. Retry and complete sign-in in **ChatGPT Community**.
+3. Reconnect WARP after the sign-in attempt, even if it still fails:
+
+   ```bash
+   warp-cli connect
+   ```
+
+The bundled CLI and sign-in implementation come from the official OpenAI
+package. The reporter filed the underlying connection problem in
+[openai/codex#51405](https://github.com/openai/codex/issues/51405).
+
+If the workaround does not help, include the application, bundled CLI, and
+WARP versions, the WARP mode, whether sign-in works with WARP disconnected,
+and relevant connection error messages in a follow-up report. Remove tokens
+and personal information from any shared diagnostics.
 
 ## AppImage opens from Flatpak Chrome but the extension cannot connect
 
@@ -217,10 +263,39 @@ codex-update-manager status
 systemctl --user status codex-update-manager.service
 ```
 
-`WaitingForAppExit` is expected: close all ChatGPT/Codex desktop processes. For
-a failed privileged install, run `codex-update-manager install-ready` after
+`WaitingForAppExit` means the updater detected its configured managed executable
+through exact `/proc/<pid>/exe` path matching, by default
+`/opt/codex-desktop/ChatGPT`. Close that app and use
+`codex-update-manager diagnose --json` to inspect `appExecutable` and
+`appRunning`; `status --json` shows persisted state. A custom
+`app_executable_path` changes the monitored path. The guard does not infer
+other installations from their process name or shared profile.
+
+Official and Community apps must still avoid concurrent use of their default
+shared profile unless `community-profile-isolation` is enabled; see
+[updater recovery](updater.md#recovery). For a failed privileged install, run
+`codex-update-manager install-ready` after
 fixing the reported package-manager issue. Roll back with
 `codex-update-manager rollback`.
+
+A release check that fails during metadata retrieval, download, or build sends
+one desktop notification. Repeated failures for the same candidate stay silent,
+so a stalled updater should be diagnosed rather than waited out.
+
+If the failure log reports `npx is required to patch app.asar` (or the older
+`npx: command not found`), the build host has `node` without npm/npx — typically
+the Debian/Ubuntu `nodejs` package alone, or a version-manager (nvm/fnm) Node
+that is not visible to the systemd user service. Install npm
+(`sudo apt install npm`) or run `systemctl --user edit codex-update-manager` and
+add the following lines in the editor, replacing the example Node path with
+your own:
+
+```ini
+[Service]
+Environment=PATH=/home/<user>/.local/share/fnm/node-versions/<ver>/installation/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+```
+
+Restart the service with `systemctl --user restart codex-update-manager.service`.
 
 Collect a useful updater report with:
 

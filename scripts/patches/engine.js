@@ -21,6 +21,7 @@ const {
   linuxTargetSummary,
 } = require("../lib/linux-target-context.js");
 const {
+  listWebviewScriptAssets,
   patchAssetFiles,
   patchUniqueAssetFile,
 } = require("./lib/assets.js");
@@ -346,6 +347,95 @@ function applyMainBundlePatchDescriptors(source, descriptors, context, report) {
   return { patchedSource: patched, warnings, coreWarnings, requiredCoreWarnings };
 }
 
+// Applies main-process descriptors to the rspack chunk set. Each descriptor
+// is tried against every chunk; only the chunks it actually changes keep the
+// result. A descriptor that changes no chunk reports the diagnostics of the
+// chunks it tried, so a moved or removed anchor still fails closed.
+function applyMainProcessChunkPatchDescriptors(chunks, descriptors, context, report) {
+  const sources = chunks.map(({ name, source }) => ({ name, source }));
+  for (const descriptor of descriptors.filter((patch) => patch.phase === PHASE_MAIN_BUNDLE)) {
+    if (!descriptorAppliesTo(descriptor, context)) {
+      recordDescriptorPatch(report, descriptor, PATCH_STATUS_SKIPPED_TARGET, null, context);
+      continue;
+    }
+    if (!descriptorEnabled(descriptor, context)) {
+      recordDescriptorPatch(report, descriptor, PATCH_STATUS_SKIPPED_DISABLED, null, context);
+      continue;
+    }
+
+    // Collect each chunk's warnings silently; only the outcome's warnings are
+    // printed below, so a miss on unrelated chunks does not flood build logs.
+    const attempts = sources.map((chunk) => {
+      const originalWarn = console.warn;
+      console.warn = () => {};
+      let result;
+      try {
+        result = runDescriptorApply(
+          descriptor,
+          () => descriptor.apply(chunk.source, context),
+          chunk.source,
+        );
+      } finally {
+        console.warn = originalWarn;
+      }
+      return { chunk, result, changed: result.error == null && result.value !== chunk.source };
+    });
+    const changed = attempts.filter((attempt) => attempt.changed);
+    if (changed.length > 0) {
+      const warnings = changed.flatMap((attempt) => attempt.result.warnings);
+      for (const warning of warnings) console.warn(warning);
+      for (const attempt of changed) {
+        attempt.chunk.source = attempt.result.value;
+      }
+      context.reportWarnings = warnings;
+      recordDescriptorPatch(
+        report,
+        descriptor,
+        patchStatusFromDescriptorChange(descriptor, true, warnings),
+        warnings[0] ?? null,
+        context,
+        {
+          ...(strategyMetadata(changed.flatMap((attempt) => attempt.result.strategies)) ?? {}),
+          chunks: changed.map((attempt) => attempt.chunk.name),
+        },
+      );
+      delete context.reportWarnings;
+      continue;
+    }
+
+    // Nothing changed. A clean no-op on some chunk means the contract is
+    // already satisfied; otherwise report the first diagnostic.
+    if (attempts.some((attempt) => attempt.result.error == null && attempt.result.warnings.length === 0)) {
+      recordDescriptorPatch(
+        report,
+        descriptor,
+        patchStatusFromDescriptorChange(descriptor, false, []),
+        null,
+        context,
+      );
+      continue;
+    }
+    const integrity = attempts.find((attempt) => isPatchIntegrityError(attempt.result.error));
+    const failed = integrity ?? attempts.find((attempt) => attempt.result.error != null);
+    const warnings = attempts.flatMap((attempt) => attempt.result.warnings);
+    if (failed != null && warnings.length === 0) {
+      console.warn(`WARN: ${describePatchError(descriptor, failed.result.error)}`);
+      context.reportWarnings = [`WARN: ${describePatchError(descriptor, failed.result.error)}`];
+      recordDescriptorError(report, descriptor, failed.result.error, context, failed.result.strategies);
+      delete context.reportWarnings;
+      rethrowPatchIntegrityError(failed.result.error);
+      continue;
+    }
+    const reason = `${descriptor.id} matched no main-process chunk` +
+      (warnings[0] == null ? "" : `: ${warnings[0].replace(/^WARN:\s*/, "")}`);
+    console.warn(`WARN: ${reason}`);
+    context.reportWarnings = [`WARN: ${reason}`];
+    recordDescriptorPatch(report, descriptor, descriptorFailureStatus(descriptor), reason, context);
+    delete context.reportWarnings;
+  }
+  return sources;
+}
+
 function defaultWebviewMissingWarning(extractedDir, descriptor) {
   const missingDescription = descriptor.missingDescription ?? "webview asset bundle";
   const skipDescription = descriptor.skipDescription ?? descriptor.id;
@@ -387,8 +477,44 @@ function recordAssetDescriptorPatch(report, descriptor, patchResult, warnings, c
   );
 }
 
+// Indexes which webview script assets contain each needle, reading every
+// asset once per patch run instead of once per descriptor. Files rewritten
+// by a descriptor are re-indexed before the next descriptor runs.
+function createWebviewNeedleIndex(extractedDir, needles) {
+  const assetsDir = path.join(extractedDir, "webview", "assets");
+  const unique = [...new Set(needles)];
+  const hits = new Map(unique.map((needle) => [needle, new Set()]));
+  const indexAsset = (assetName) => {
+    const source = fs.readFileSync(path.join(assetsDir, assetName), "utf8");
+    for (const needle of unique) {
+      if (source.includes(needle)) hits.get(needle).add(assetName);
+      else hits.get(needle).delete(assetName);
+    }
+  };
+  if (unique.length > 0) {
+    for (const assetName of listWebviewScriptAssets(extractedDir)) indexAsset(assetName);
+  }
+  return {
+    candidates(descriptorNeedles) {
+      const [first, ...rest] = descriptorNeedles;
+      return [...hits.get(first)].filter((assetName) => rest.every((needle) => hits.get(needle).has(assetName)));
+    },
+    refresh(assetNames) {
+      if (unique.length === 0) return;
+      for (const assetName of assetNames ?? []) indexAsset(assetName);
+    },
+  };
+}
+
 function applyWebviewAssetPatchDescriptors(extractedDir, descriptors, context, report) {
-  for (const descriptor of descriptors.filter((patch) => patch.phase === PHASE_WEBVIEW_ASSET)) {
+  const webviewDescriptors = descriptors.filter((patch) => patch.phase === PHASE_WEBVIEW_ASSET);
+  const active = webviewDescriptors.filter((descriptor) =>
+    descriptorAppliesTo(descriptor, context) && descriptorEnabled(descriptor, context));
+  const index = createWebviewNeedleIndex(
+    extractedDir,
+    active.flatMap((descriptor) => descriptor.assetNeedles ?? []),
+  );
+  for (const descriptor of webviewDescriptors) {
     if (!descriptorAppliesTo(descriptor, context)) {
       recordDescriptorPatch(report, descriptor, PATCH_STATUS_SKIPPED_TARGET, null, context);
       continue;
@@ -398,10 +524,15 @@ function applyWebviewAssetPatchDescriptors(extractedDir, descriptors, context, r
       continue;
     }
 
-    const pattern = descriptor.assetPattern ?? descriptor.pattern;
-    if (pattern == null) {
-      throw new Error(`Webview asset patch '${descriptor.id}' must define assetPattern or pattern`);
+    const pattern = descriptor.assetPattern ?? descriptor.pattern ?? null;
+    const needles = descriptor.assetNeedles ?? null;
+    if (pattern == null && needles == null) {
+      throw new Error(`Webview asset patch '${descriptor.id}' must define assetNeedles, assetPattern or pattern`);
     }
+    const candidates = needles == null
+      ? null
+      : index.candidates(needles).filter((assetName) =>
+        pattern == null || patternMatchesAsset(pattern, assetName));
     const missingWarning = descriptor.missingWarning ??
       defaultWebviewMissingWarning(extractedDir, descriptor);
     const ambiguousWarning = descriptor.ambiguousWarning ??
@@ -409,7 +540,13 @@ function applyWebviewAssetPatchDescriptors(extractedDir, descriptors, context, r
     const { value: result, warnings, error, strategies } = runDescriptorApply(
       descriptor,
       () => descriptor.assetMatch == null
-        ? patchAssetFiles(extractedDir, pattern, (source) => descriptor.apply(source, context), missingWarning)
+        ? patchAssetFiles(
+          extractedDir,
+          pattern,
+          (source) => descriptor.apply(source, context),
+          missingWarning,
+          candidates,
+        )
         : patchUniqueAssetFile(
           extractedDir,
           pattern,
@@ -417,9 +554,11 @@ function applyWebviewAssetPatchDescriptors(extractedDir, descriptors, context, r
           (source) => descriptor.apply(source, context),
           missingWarning,
           ambiguousWarning,
+          candidates,
         ),
-      { matched: 0, changed: 0, assetName: null },
+      { matched: 0, changed: 0, assetName: null, changedAssets: [] },
     );
+    index.refresh(result?.changedAssets);
     context.reportWarnings = warnings;
     if (error != null) {
       warnings.push(`WARN: ${describePatchError(descriptor, error)}`);
@@ -431,6 +570,11 @@ function applyWebviewAssetPatchDescriptors(extractedDir, descriptors, context, r
     }
     delete context.reportWarnings;
   }
+}
+
+function patternMatchesAsset(pattern, assetName) {
+  pattern.lastIndex = 0;
+  return pattern.test(assetName.slice(assetName.lastIndexOf("/") + 1));
 }
 
 function applyExtractedAppPatchDescriptors(extractedDir, descriptors, context, report, phase) {
@@ -481,6 +625,7 @@ module.exports = {
   SKIPPED_TARGET: PATCH_STATUS_SKIPPED_TARGET,
   applyExtractedAppPatchDescriptors,
   applyMainBundlePatchDescriptors,
+  applyMainProcessChunkPatchDescriptors,
   applyWebviewAssetPatchDescriptors,
   assertUniquePatchIds,
   descriptorAppliesTo,

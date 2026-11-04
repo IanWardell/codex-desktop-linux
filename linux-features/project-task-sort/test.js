@@ -11,14 +11,21 @@ const vm = require("node:vm");
 const {
   loadLinuxFeaturePatchDescriptors,
 } = require("../../scripts/lib/linux-features.js");
-const { patchUniqueAssetFile } = require("../../scripts/patches/lib/assets.js");
+const { applyWebviewAssetPatchDescriptors, normalizePatchDescriptors } = require("../../scripts/patches/engine.js");
+const { createPatchReport } = require("../../scripts/lib/patch-report.js");
 const {
   applyProjectTaskSortPatch,
+  matchesProjectTaskSortContract,
   descriptors,
 } = require("./patch.js");
 
-const currentProjectSource =
-  "function xe(e,t){switch(e.kind){case`local`:return e.conversation==null?e.pendingWorktree.createdAt:t===`updated_at`?e.conversation.recencyAt??e.conversation.updatedAt:e.conversation.createdAt;case`remote`:return((t===`updated_at`?e.task.updated_at??e.task.created_at:e.task.created_at??e.task.updated_at)??0)*1e3}}";
+// Current signed 26.1029.61003 shape: the project task sorter compiles its
+// timestamp selector as an inline function expression.
+const comparator =
+  'function(e,t){switch(e.kind){case"local":if(null==e.summary)return e.at;return"updated_at"===t?e.summary.recencyAt??e.summary.updatedAt:e.summary.createdAt;case"remote":return(("updated_at"===t?e.task.updated_at??e.task.created_at:e.task.created_at??e.task.updated_at)??0)*1e3}}';
+const currentProjectSource = `function u(e,t){return e.map((e,n)=>({task:e,timestamp:${comparator}(e,t),index:n}))}`;
+const chunk = (body) => "export const __rspack_esm_id=24191;export const __rspack_esm_ids=[24191];" +
+  `export const __webpack_modules__={YZnq(e,t,n){${body}n.d(t,{u:()=>u})}};`;
 
 function captureWarns(fn) {
   const originalWarn = console.warn;
@@ -39,6 +46,13 @@ function applyPatchTwice(source) {
   assert.equal(secondPass, patched);
   assert.deepEqual(warnings, []);
   return patched;
+}
+
+function timestampFunction(source = currentProjectSource) {
+  const patched = applyPatchTwice(source);
+  const context = {};
+  vm.runInNewContext(`${patched};globalThis.timestamp=(task,mode)=>u([task],mode)[0].timestamp`, context);
+  return context.timestamp;
 }
 
 function withFeatureConfig(enabled, fn) {
@@ -76,113 +90,118 @@ test("feature is disabled until selected", () => {
   });
 });
 
-test("patch recovers local UUIDv7 creation time", () => {
-  const patched = applyPatchTwice(currentProjectSource);
-
-  assert.ok(
-    patched.includes(
-      "e.conversation.createdAt??(/^local:[\\da-f]{8}-[\\da-f]{4}-7[\\da-f]{3}-[89ab][\\da-f]{3}-[\\da-f]{12}$/i.test(e.key)?Number.parseInt(e.key.slice(6).replaceAll(`-`,``).slice(0,12),16):e.conversation.recencyAt??e.conversation.updatedAt)",
-    ),
-  );
-
-  const context = {};
-  vm.runInNewContext(`${patched};globalThis.timestamp=xe`, context);
+test("populated local conversations recover Created time from UUIDv7 keys", () => {
+  const timestamp = timestampFunction();
   const older = {
     key: "local:019e0000-0000-7000-8000-000000000001",
     kind: "local",
-    conversation: { recencyAt: 400 },
+    at: 900,
+    summary: { recencyAt: 400 },
   };
   const newer = {
     key: "local:019f0000-0000-7000-8000-000000000002",
     kind: "local",
-    conversation: { recencyAt: 100 },
+    at: 1,
+    summary: { recencyAt: 100 },
   };
 
-  assert.ok(context.timestamp(newer, "created_at") > context.timestamp(older, "created_at"));
-  assert.equal(context.timestamp(older, "updated_at"), 400);
+  assert.ok(timestamp(newer, "created_at") > timestamp(older, "created_at"));
+  assert.equal(timestamp(older, "updated_at"), 400);
+});
+
+test("explicit, pending, legacy, invalid, and remote timestamps retain upstream behavior", () => {
+  const timestamp = timestampFunction();
+  const local = {
+    key: "local:019e0000-0000-7000-8000-000000000001",
+    kind: "local",
+    at: 900,
+    summary: { recencyAt: 400, updatedAt: 300 },
+  };
+
+  assert.equal(timestamp({ ...local, summary: { ...local.summary, createdAt: 123 } }, "created_at"), 123);
+  assert.equal(timestamp({ ...local, summary: null }, "created_at"), 900);
+  assert.equal(timestamp({ ...local, key: "local:legacy-id" }, "created_at"), 400);
   assert.equal(
-    context.timestamp({ ...older, conversation: { createdAt: 123, recencyAt: 400 } }, "created_at"),
-    123,
+    timestamp({ ...local, key: "local:019e0000-0000-7000-7000-000000000001" }, "created_at"),
+    400,
   );
   assert.equal(
-    context.timestamp(
-      { ...older, key: "local:legacy-id", conversation: { recencyAt: 500 } },
-      "created_at",
-    ),
-    500,
+    timestamp({ ...local, key: "local:019e0000-0000-7garbage" }, "created_at"),
+    400,
   );
-  assert.equal(
-    context.timestamp(
-      { ...older, key: "local:019e0000-0000-7garbage", conversation: { recencyAt: 600 } },
-      "created_at",
-    ),
-    600,
-  );
-  assert.equal(
-    context.timestamp(
-      {
-        ...older,
-        key: "local:019e0000-0000-7000-7000-000000000001",
-        conversation: { recencyAt: 700 },
-      },
-      "created_at",
-    ),
-    700,
-  );
+
   const remote = { kind: "remote", task: { created_at: 10, updated_at: 20 } };
-  assert.equal(context.timestamp(remote, "created_at"), 10_000);
-  assert.equal(context.timestamp(remote, "updated_at"), 20_000);
+  assert.equal(timestamp(remote, "created_at"), 10_000);
+  assert.equal(timestamp(remote, "updated_at"), 20_000);
 });
 
-test("drift leaves the asset byte-identical", () => {
-  const source = currentProjectSource.replace(
-    "e.pendingWorktree.createdAt",
-    "e.pendingWorktree.createdTimestamp",
+test("semantic comparator matching is independent of minified aliases", () => {
+  const renamed = currentProjectSource
+    .replace("function(e,t){switch", "function createdComparator(task,mode){switch")
+    .replaceAll("e.summary", "task.summary").replaceAll("e.at", "task.at").replaceAll("e.task", "task.task")
+    .replace("switch(e.kind)", "switch(task.kind)")
+    .replaceAll("===t?", "===mode?");
+  const timestamp = timestampFunction(renamed);
+  assert.equal(
+    timestamp({
+      key: "local:019e0000-0000-7000-8000-000000000001",
+      kind: "local",
+      summary: {},
+    }, "created_at"),
+    Number.parseInt("019e00000000", 16),
   );
-  const { value, warnings } = captureWarns(() => applyProjectTaskSortPatch(source));
-
-  assert.equal(value, source);
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /project task creation timestamp insertion point/);
 });
 
-test("mixed patched and clean helpers are rejected byte-identically", () => {
-  const mixed = `${applyProjectTaskSortPatch(currentProjectSource)}${currentProjectSource}`;
-  const { value, warnings } = captureWarns(() => applyProjectTaskSortPatch(mixed));
-
-  assert.equal(value, mixed);
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /project task creation timestamp insertion point/);
+test("drift and duplicate semantic comparators fail closed byte-identically", () => {
+  const drifted = currentProjectSource.replace("return e.at", "return e.pendingWorktree.createdAt");
+  for (const source of [
+    drifted,
+    `${currentProjectSource}${currentProjectSource}`,
+    `${currentProjectSource}${drifted}`,
+    `${applyProjectTaskSortPatch(currentProjectSource)}${currentProjectSource}`,
+  ]) {
+    const { value, warnings } = captureWarns(() => applyProjectTaskSortPatch(source));
+    assert.equal(value, source);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /one unique current project task timestamp comparator/);
+    assert.equal(matchesProjectTaskSortContract(source), false);
+  }
 });
 
-test("descriptor targets and patches the current project chunk", () => {
+test("descriptor locates one semantic rspack chunk and rejects missing or ambiguous chunks", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "project-task-sort-assets-"));
   try {
     const assetsDir = path.join(tempDir, "webview", "assets");
-    const assetPath = path.join(
-      assetsDir,
-      "app-initial-Bd3Z1bES.js",
-    );
-    fs.mkdirSync(assetsDir, { recursive: true });
-    fs.writeFileSync(assetPath, currentProjectSource);
+    fs.mkdirSync(path.join(assetsDir, "async"), { recursive: true });
+    const target = path.join(assetsDir, "async", "24191.7b05d5cf83.js");
+    fs.writeFileSync(target, chunk(currentProjectSource));
+    fs.writeFileSync(path.join(assetsDir, "async", "1.0000000000.js"), chunk("function other(){}"));
+    const run = () => {
+      const report = createPatchReport();
+      const { warnings } = captureWarns(() =>
+        applyWebviewAssetPatchDescriptors(tempDir, normalizePatchDescriptors(descriptors), {}, report));
+      return { report: report.patches[0], warnings };
+    };
 
-    const result = patchUniqueAssetFile(
-      tempDir,
-      descriptors[0].pattern,
-      descriptors[0].assetMatch,
-      descriptors[0].apply,
-      "missing",
-      "ambiguous",
-    );
+    let result = run();
+    assert.equal(result.report.status, "applied");
+    assert.equal(result.report.assetName, "async/24191.7b05d5cf83.js");
+    assert.equal(fs.readFileSync(target, "utf8"), chunk(applyProjectTaskSortPatch(currentProjectSource)));
+    assert.equal(run().report.status, "already-applied");
 
-    assert.deepEqual(result, { matched: 1, changed: 1, assetName: "app-initial-Bd3Z1bES.js" });
-    assert.notEqual(fs.readFileSync(assetPath, "utf8"), currentProjectSource);
-    assert.equal(
-      descriptors[0].pattern.test(
-        "projects-index-page-DjNy92Xe.js",
-      ),
-      false,
-    );
+    fs.writeFileSync(target, chunk(currentProjectSource));
+    const duplicate = path.join(assetsDir, "async", "2.0000000000.js");
+    fs.writeFileSync(duplicate, chunk(currentProjectSource));
+    result = run();
+    assert.notEqual(result.report.status, "applied");
+    assert.equal(fs.readFileSync(target, "utf8"), chunk(currentProjectSource));
+    assert.equal(fs.readFileSync(duplicate, "utf8"), chunk(currentProjectSource));
+
+    fs.rmSync(duplicate);
+    fs.rmSync(target);
+    result = run();
+    assert.notEqual(result.report.status, "applied");
+    assert.equal(result.warnings.length, 1);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

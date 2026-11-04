@@ -94,8 +94,16 @@
                 'CURL_GNUTLS_3'
           '';
         });
+        # The primary runtime's headless LibreOffice links libcurl.so.4 with
+        # CURL_OPENSSL_4 symbol versions, while its Git links
+        # libcurl-gnutls.so.4. The stock curl must precede the GnuTLS-compat
+        # build so libcurl.so.4 resolves to OpenSSL versions and only the
+        # distinct libcurl-gnutls.so.4 name reaches the compat build.
         workspaceRuntimeLibraries = runtimeLibraries ++ [
           pkgs.fontconfig
+          pkgs.freetype
+          pkgs.lcms2.out
+          pkgs.curl.out
           curlWithGnuTlsCompat.out
         ];
         workspaceRuntimeLibraryPath = lib.concatStringsSep ":" [
@@ -114,7 +122,8 @@
           ++ lib.optionals (
             lib.elem "read-aloud" featureIds || lib.elem "read-aloud-mcp" featureIds
           ) [ pkgs.alsa-utils ]
-          ++ lib.optionals (lib.elem "computer-use-linux" featureIds) [ pkgs.glib ];
+          ++ lib.optionals (lib.elem "computer-use-linux" featureIds) [ pkgs.glib pkgs.fontconfig ]
+          ++ lib.optionals (lib.elem "account-switcher" featureIds) [ pkgs.libsecret ];
         runtimePathFor = featureIds:
           lib.makeBinPath (lib.unique (
             baseRuntimePackages ++ featureRuntimePackages featureIds
@@ -244,6 +253,41 @@
           readelf --version-info ${curlWithGnuTlsCompat.out}/lib/libcurl.so.4 \
             | grep -F 'Name: CURL_GNUTLS_3'
         '';
+        documentRuntimeProbe = pkgs.runCommandCC "codex-document-runtime-probe" {
+          nativeBuildInputs = [ pkgs.binutils pkgs.gnugrep pkgs.patchelf pkgs.pkg-config ];
+          buildInputs = [ pkgs.curl pkgs.freetype pkgs.lcms2 ];
+        } ''
+          mkdir -p "$out/bin"
+          printf '%s\n' \
+            '#include <stdio.h>' \
+            '#include <curl/curl.h>' \
+            '#include <ft2build.h>' \
+            '#include FT_FREETYPE_H' \
+            '#include <lcms2.h>' \
+            'int main(void) {' \
+            '  FT_Library library;' \
+            '  if (curl_version() == NULL) return 1;' \
+            '  if (FT_Init_FreeType(&library) != 0) return 2;' \
+            '  FT_Done_FreeType(library);' \
+            '  if (cmsGetEncodedCMMversion() == 0) return 3;' \
+            '  puts("document-runtime-ok");' \
+            '  return 0;' \
+            '}' \
+            > probe.c
+          "$CC" -o "$out/bin/document-runtime-probe" probe.c \
+            $(pkg-config --cflags --libs libcurl freetype2 lcms2)
+          patchelf --remove-rpath "$out/bin/document-runtime-probe"
+          patchelf --set-interpreter "${genericRuntimeInterpreter}" \
+            "$out/bin/document-runtime-probe"
+          patchelf --print-needed "$out/bin/document-runtime-probe" \
+            | grep -Fx libcurl.so.4
+          patchelf --print-needed "$out/bin/document-runtime-probe" \
+            | grep -Fx libfreetype.so.6
+          patchelf --print-needed "$out/bin/document-runtime-probe" \
+            | grep -Fx liblcms2.so.2
+          readelf --version-info "$out/bin/document-runtime-probe" \
+            | grep -F CURL_OPENSSL_4
+        '';
         gsettingsSchemaPackages = with pkgs; [ gsettings-desktop-schemas gtk3 ];
         gsettingsSchemaRoot = package:
           lib.removeSuffix "/glib-2.0/schemas" (pkgs.glib.getSchemaPath package);
@@ -298,7 +342,7 @@
               ++ lib.optionals readAloudEnabled [ "codex-read-aloud-linux" ]
               ++ lib.optionals recordReplayBackendEnabled [ "codex-record-replay-linux" ];
             expectedBinaries =
-              lib.optionals computerUseEnabled [ "codex-computer-use-linux" "codex-computer-use-cosmic" ]
+              lib.optionals computerUseEnabled [ "codex-computer-use-linux" "codex-computer-use-cosmic" "codex-computer-use-indicator" ]
               ++ lib.optionals readAloudEnabled [ "codex-read-aloud-linux" ]
               ++ lib.optionals recordReplayBackendEnabled [ "codex-record-replay-linux" ];
           in
@@ -326,6 +370,13 @@
           version = "0.1.0";
           src = ./global-dictation-linux;
           cargoLock.lockFile = ./global-dictation-linux/Cargo.lock;
+          doCheck = false;
+        };
+        petKwinHelper = staticCratesBuildRustPackage {
+          pname = "codex-pet-kwin";
+          version = "0.1.0";
+          src = ./linux-features/pet-overlay/kwin-helper;
+          cargoLock.lockFile = ./linux-features/pet-overlay/kwin-helper/Cargo.lock;
           doCheck = false;
         };
         mcpReaperHelper = staticCratesBuildRustPackage {
@@ -484,8 +535,7 @@
               node "$source_dir/nix/elf-runtime.cjs" validate-upstream \
                 --root "$upstream_contract_root/usr/lib/chatgpt" \
                 --arch ${officialPackage.architecture}
-              substituteInPlace "$source_dir/scripts/lib/asar-patch.sh" \
-                --replace-fail "npx --yes @electron/asar" "${pkgs.asar}/bin/asar"
+              export CODEX_ASAR_BIN="${pkgs.asar}/bin/asar"
               export CODEX_INSTALL_TRANSACTION_ACTIVE=1
               export CODEX_INSTALL_DIR="$out/opt/codex-desktop"
               export CODEX_LINUX_FEATURES_CONFIG="${featuresConfig}"
@@ -497,6 +547,7 @@
               ${lib.optionalString (lib.elem "computer-use-linux" effectiveFeatureIds) ''
               export CODEX_COMPUTER_USE_BINARY_SOURCE="${workspaceHelpers}/bin/codex-computer-use-linux"
               export CODEX_COMPUTER_USE_COSMIC_BINARY_SOURCE="${workspaceHelpers}/bin/codex-computer-use-cosmic"
+              export CODEX_COMPUTER_USE_INDICATOR_BINARY_SOURCE="${workspaceHelpers}/bin/codex-computer-use-indicator"
               ''}
               ${lib.optionalString (lib.elem "read-aloud-mcp" effectiveFeatureIds) ''
               export CODEX_LINUX_READ_ALOUD_MCP_SOURCE="${workspaceHelpers}/bin/codex-read-aloud-linux"
@@ -504,8 +555,11 @@
               ${lib.optionalString recordReplayBackendEnabled ''
               export CODEX_RECORD_REPLAY_LINUX_SOURCE="${workspaceHelpers}/bin/codex-record-replay-linux"
               ''}
-              ${lib.optionalString (lib.elem "global-dictation" effectiveFeatureIds) ''
+              ${lib.optionalString (lib.elem "global-dictation" effectiveFeatureIds || lib.elem "wayland-global-shortcuts" effectiveFeatureIds) ''
               export CODEX_GLOBAL_DICTATION_LINUX_SOURCE="${globalDictationHelper}/bin/codex-global-dictation-linux"
+              ''}
+              ${lib.optionalString (lib.elem "pet-overlay" effectiveFeatureIds) ''
+              export CODEX_PET_KWIN_SOURCE="${petKwinHelper}/bin/codex-pet-kwin"
               ''}
               ${lib.optionalString (lib.elem "mcp-helper-reaper" effectiveFeatureIds) ''
               export CODEX_MCP_HELPER_REAPER_SOURCE="${mcpReaperHelper}/bin/codex-mcp-helper-reaper"
@@ -513,7 +567,9 @@
               ${lib.optionalString watchboundEnabled ''
               export CODEX_WATCHBOUND_PACKAGE_ROOT="${watchboundPackage}/lib/node_modules"
               ''}
-              bash "$source_dir/install.sh" "${upstreamDeb}"
+              # Nix verified the signed-release pin's fixed-output hash; the
+              # sandbox cannot fetch live APT metadata during this build.
+              bash "$source_dir/install.sh" --skip-oai-official-sig-verification "${upstreamDeb}"
 
               app="$out/opt/codex-desktop"
               test -d "$app"
@@ -543,7 +599,7 @@
                 /^\[Desktop Action InstallReadyUpdate\]$/ { skip = 1; next }
                 /^\[/ { skip = 0 }
                 skip { next }
-                /^Actions=/ { print "Actions=new-window;"; next }
+                /^Actions=/ { next }
                 { print }
               ' "$source_dir/packaging/linux/codex-desktop.desktop" \
                 > "$out/share/applications/codex-desktop.desktop"
@@ -572,7 +628,7 @@
             passthru = {
               linuxFeatureIds = userFeatureIds;
               effectiveLinuxFeatureIds = effectiveFeatureIds;
-              inherit upstreamDeb;
+              inherit upstreamDeb workspaceRuntimeLibraries;
               upstreamVersion = codexVersion;
               upstreamArchitecture = officialPackage.architecture;
             };
@@ -589,12 +645,18 @@
         remoteMobile = codexDesktop.override { linuxFeatureIds = [ "remote-mobile-control" ]; };
         computerUse = codexDesktop.override { linuxFeatureIds = [ "computer-use-linux" ]; };
         chronicleSkysight = codexDesktop.override { linuxFeatureIds = [ "chronicle-skysight" ]; };
+        # Maximal profiles keep the historical shared-profile feature set.
+        # Community profile isolation and account switching intentionally
+        # conflict with shared-app-server-socket; enable them separately.
+        maximalSharedProfileFeatureIds = lib.filter (
+          featureId: !(lib.elem featureId [ "community-profile-isolation" "account-switcher" ])
+        ) nixLinuxFeatures.supportedFeatureIds;
         maximalDirectoryFeatureIds = lib.filter (
           featureId: featureId != "shallow-repository-watches"
-        ) nixLinuxFeatures.supportedFeatureIds;
+        ) maximalSharedProfileFeatureIds;
         maximalShallowFeatureIds = lib.filter (
           featureId: featureId != "directory-only-working-tree-watch"
-        ) nixLinuxFeatures.supportedFeatureIds;
+        ) maximalSharedProfileFeatureIds;
         maximalDirectory = codexDesktop.override {
           linuxFeatureIds = maximalDirectoryFeatureIds;
         };
@@ -620,7 +682,7 @@
           lib.concatMapStringsSep "\n" toString (
             [
               sourceRoot upstreamDeb installedLauncher installerWorkspaceHelpers
-              globalDictationHelper mcpReaperHelper watchboundPackage
+              globalDictationHelper petKwinHelper mcpReaperHelper watchboundPackage pkgs.asar
               pkgs.stdenv pkgs.stdenv.cc pkgs.bash pkgs.nodejs pkgs.patchelf
             ]
             ++ runtimeLibraries
@@ -664,7 +726,7 @@
         installer = pkgs.writeShellApplication {
           name = "codex-desktop-installer";
           runtimeInputs = baseRuntimePackages ++ [
-            pkgs.dpkg pkgs.gnupg pkgs.makeWrapper pkgs.nix pkgs.patchelf
+            pkgs.asar pkgs.dpkg pkgs.gnupg pkgs.makeWrapper pkgs.nix pkgs.patchelf
           ] ++ featureRuntimePackages nixLinuxFeatures.supportedFeatureIds;
           text = ''
             set -euo pipefail
@@ -745,9 +807,11 @@
             all_helpers=${installerWorkspaceHelpers}
             export CODEX_COMPUTER_USE_BINARY_SOURCE="$all_helpers/bin/codex-computer-use-linux"
             export CODEX_COMPUTER_USE_COSMIC_BINARY_SOURCE="$all_helpers/bin/codex-computer-use-cosmic"
+            export CODEX_COMPUTER_USE_INDICATOR_BINARY_SOURCE="$all_helpers/bin/codex-computer-use-indicator"
             export CODEX_LINUX_READ_ALOUD_MCP_SOURCE="$all_helpers/bin/codex-read-aloud-linux"
             export CODEX_RECORD_REPLAY_LINUX_SOURCE="$all_helpers/bin/codex-record-replay-linux"
             export CODEX_GLOBAL_DICTATION_LINUX_SOURCE="${globalDictationHelper}/bin/codex-global-dictation-linux"
+            export CODEX_PET_KWIN_SOURCE="${petKwinHelper}/bin/codex-pet-kwin"
             export CODEX_MCP_HELPER_REAPER_SOURCE="${mcpReaperHelper}/bin/codex-mcp-helper-reaper"
             export CODEX_WATCHBOUND_PACKAGE_ROOT="${watchboundPackage}/lib/node_modules"
             upstream_contract_root="$(mktemp -d)"
@@ -756,7 +820,9 @@
               --root "$upstream_contract_root/usr/lib/chatgpt" \
               --arch ${officialPackage.architecture}
             rm -rf -- "$upstream_contract_root"
-            ${pkgs.bash}/bin/bash ${sourceRoot}/install.sh ${upstreamDeb} "$@"
+            export CODEX_ASAR_BIN="${pkgs.asar}/bin/asar"
+            # The fixed-output upstreamDeb has already passed Nix hash verification.
+            ${pkgs.bash}/bin/bash ${sourceRoot}/install.sh --skip-oai-official-sig-verification ${upstreamDeb} "$@"
 
             dynamic_linker="$(cat ${pkgs.stdenv.cc}/nix-support/dynamic-linker)"
             node ${sourceRoot}/nix/elf-runtime.cjs fix \
@@ -973,6 +1039,12 @@
                 ${pkgs.nix-ld}/libexec/nix-ld \
                   ${genericRuntimeProbe}/bin/generic-runtime-probe
             )" = workspace-runtime-ok
+            test "$(
+              NIX_LD=${lib.escapeShellArg dynamicLinker} \
+              NIX_LD_LIBRARY_PATH=${lib.escapeShellArg workspaceRuntimeLibraryPath} \
+                ${pkgs.nix-ld}/libexec/nix-ld \
+                  ${documentRuntimeProbe}/bin/document-runtime-probe
+            )" = document-runtime-ok
             "$app/start.sh" --diagnose
             timeout 10 "$app/browser_crashpad_handler" --version
             "$app/resources/cua_node/bin/node" --version
@@ -984,7 +1056,7 @@
             timeout 10 "$app/${officialRuntimePaths.extensionHost}" --help >/dev/null
             "$app/resources/rg" --version
             ${lib.optionalString (system == "x86_64-linux") ''
-            test "$("$app/resources/plugins/openai-bundled/plugins/latex/bin/tectonic" --version)" = \
+            test "$("$app/resources/tectonic/tectonic" --version)" = \
               'Tectonic 0.17.0'
             ''}
             ${lib.optionalString verifyWatchbound ''
@@ -1016,7 +1088,8 @@
             node ${sourceRoot}/scripts/ci/validate-patch-report.js \
               "$app/.codex-linux/patch-report.json" \
               --require-enabled-feature nix-store-bundled-marketplace-permissions \
-              --require-applied feature:nix-store-bundled-marketplace-permissions:bundled-marketplace-staging-copy-permissions
+              --require-applied feature:nix-store-bundled-marketplace-permissions:bundled-marketplace-staging-copy-permissions \
+              --require-applied feature:nix-store-bundled-marketplace-permissions:executor-plugin-copy-permissions
             ''}
             test -x ${pkgs.pipewire}/lib/alsa-lib/libasound_module_pcm_pipewire.so
             ! grep -q 'LD_LIBRARY_PATH=' ${package}/bin/codex-desktop
@@ -1038,6 +1111,9 @@
           test "$(${nixosBwrap}/bin/bwrap \
             --unshare-user --unshare-net --ro-bind / / --dev /dev --proc /proc \
             -- ${genericRuntimeProbe}/bin/generic-runtime-probe)" = workspace-runtime-ok
+          test "$(${nixosBwrap}/bin/bwrap \
+            --unshare-user --unshare-net --ro-bind / / --dev /dev --proc /proc \
+            -- ${documentRuntimeProbe}/bin/document-runtime-probe)" = document-runtime-ok
           ${pkgs.xvfb}/bin/Xvfb "$DISPLAY" -screen 0 1280x800x24 >"$HOME/xvfb.log" 2>&1 &
           xvfb_pid=$!
           trap 'kill "$xvfb_pid" 2>/dev/null || true' EXIT
@@ -1147,7 +1223,7 @@
             --patchelf ${pkgs.patchelf}/bin/patchelf
           "$CODEX_INSTALL_DIR/start.sh" --diagnose
           if [ ${officialPackage.architecture} = amd64 ]; then
-            test "$("$CODEX_INSTALL_DIR/resources/plugins/openai-bundled/plugins/latex/bin/tectonic" --version)" = \
+            test "$("$CODEX_INSTALL_DIR/resources/tectonic/tectonic" --version)" = \
               'Tectonic 0.17.0'
           fi
           first_chatgpt="$(stat -c %i "$CODEX_INSTALL_DIR/ChatGPT")"
@@ -1205,6 +1281,8 @@
                   environment = { CODEX_NIX_VM = true; NULL_VALUE = null; };
                 };
               };
+              # Mirrors a host whose login shell exports NIX_LD_LIBRARY_PATH.
+              programs.nix-ld.enable = true;
               users.manageLingering = true;
               users.users.tester = {
                 isNormalUser = true;
@@ -1221,6 +1299,15 @@
               machine.succeed("test -f /etc/systemd/user/codex-remote-control.service")
               machine.succeed("grep -q 'CODEX_NIX_VM=true' /etc/systemd/user/codex-remote-control.service")
               machine.succeed("grep -q 'After=network.target' /etc/systemd/user/codex-remote-control.service")
+              # The system nix-ld path must load what the primary runtime's
+              # LibreOffice needs, because Codex's shell snapshot restores the
+              # host NIX_LD_LIBRARY_PATH inside the sandbox.
+              machine.succeed(
+                  "test \"$(NIX_LD_LIBRARY_PATH=/run/current-system/sw/share/nix-ld/lib"
+                  " NIX_LD=/run/current-system/sw/share/nix-ld/lib/ld.so"
+                  " ${pkgs.nix-ld}/libexec/nix-ld ${documentRuntimeProbe}/bin/document-runtime-probe)\""
+                  " = document-runtime-ok"
+              )
               machine.succeed("grep -q 'CODEX_REMOTE_CONTROL_DAEMON_AUTOSTART_DISABLED' /etc/set-environment")
               machine.succeed("grep -Fq 'CODEX_REMOTE_CONTROL_APP_SERVER_PROXY_SOCKET=\"$HOME/.codex/app-server-control/app-server-control.sock\"' /etc/set-environment")
               machine.wait_for_unit("user@1000.service")

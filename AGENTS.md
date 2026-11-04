@@ -13,16 +13,22 @@ manager that rebuilds from the signed stable APT repository.
 - Support only the latest signed stable OpenAI Linux package on `amd64` and
   `arm64`. Remove obsolete drift paths in the same change.
 - Trust `InRelease` through the pinned repository key, then verify `Packages`
-  and package SHA-256 values. `latest` URLs are never a trust root.
+  and package SHA-256 values by default, including explicitly supplied local
+  packages. `latest` URLs are never a trust root. A local-package build may
+  skip this official verification for that invocation only via
+  `--skip-oai-official-sig-verification` only; retain structural checks and
+  record the skip in build provenance. With no flag, all builds verify without
+  prompting or reading user input, including interactive local builds. Never
+  silently fall back to a skip after verification failure.
 - Never execute upstream maintainer scripts. Extract the data payload only.
-- A clean build with no enabled ASAR feature must preserve `resources/app.asar`
-  byte-for-byte.
+- A clean build with no enabled ASAR feature and no required core patch must
+  preserve `resources/app.asar` byte-for-byte.
 - Keep the output identity `codex-desktop` under `/opt/codex-desktop`; do not
   install the upstream APT source, key, package identity, or maintainer scripts.
 - Keep the user-facing desktop name **ChatGPT Community** and its distinct
   community icon; `ChatGPT` without the qualifier identifies the upstream app.
-- The default core patch registry is empty. A core patch requires a reproduced
-  launch/work blocker and a required regression test.
+- The core patch registry contains only reproduced launch/work blockers with
+  required regression tests; otherwise it stays empty.
 - Experimental or workflow-specific behavior belongs in `linux-features/` and
   remains disabled in committed configuration.
 - Known retired feature IDs are ignored; arbitrary unknown IDs remain errors.
@@ -39,8 +45,8 @@ manager that rebuilds from the signed stable APT repository.
   `scripts/patch-linux-window-ui.js`, `scripts/lib/patch-report.js`.
 - Packaging: `scripts/build-*.sh`, `scripts/lib/package-common.sh`,
   `packaging/`.
-- Updater: `updater/src/`; minimal rebuild payload:
-  `packaging/update-builder/`.
+- Updater: `updater/src/`; minimal rebuild payload assembled by
+  `stage_update_builder_bundle()` in `scripts/lib/package-common.sh`.
 - Signed-release automation:
   `scripts/automation/upstream-linux-package-watchdog/`.
 - Nix: `flake.nix`, `nix/upstream-linux-packages.json`, `nix/*.nix`.
@@ -72,8 +78,10 @@ feature `stage.sh`.
 - The compact wrapper sets desktop identity, loads declarative feature hooks,
   and forwards arguments/URIs. Upstream owns single-instance, deep links, tray,
   windows, and lifecycle.
-- The custom and official packages may coexist, but both use the upstream
-  `Codex` user profile and must not be run concurrently.
+- The custom and official packages may coexist. By default both use the
+  upstream `Codex` user profile and must not run concurrently; the optional
+  `community-profile-isolation` feature owns the explicit separate-profile and
+  Community-CLI exception.
 - Legacy bundled Browser/Chrome cache migration must be narrow and
   fingerprinted: never wipe arbitrary plugin caches or user-authored plugins.
 - AppImage never adds `--no-sandbox` automatically. Native packages adapt the
@@ -88,6 +96,21 @@ Generated/local paths include `codex-app/`, `codex-app-next/`,
 `.codex-app.candidate-*`, `dist/`, `dist-next/`, `target/`,
 `linux-features/features.json`, `linux-features/local/`, updater state under
 XDG config/state/cache, and launcher state under XDG state/cache.
+
+## Scratch space
+
+`/tmp` on the maintainer machine is RAM-backed tmpfs. Multi-gigabyte scratch
+there (Cargo targets, extracted payloads, app copies, validation runs) has
+exhausted memory and triggered OOM kills.
+
+- Never put Cargo targets, extracted packages, app copies, or build/validation
+  output under `/tmp`. Use the repository `target/` for Cargo and
+  `${XDG_CACHE_HOME:-$HOME/.cache}/codex-desktop-dev/` for other scratch.
+- Before running `install.sh`, `make`, or `scripts/build-*.sh`, export
+  `TMPDIR="${XDG_CACHE_HOME:-$HOME/.cache}/codex-desktop-dev/tmp"` (create it
+  first) so their `mktemp -d` work directories land on disk.
+- Delete your scratch directories when the task finishes; do not leave
+  extracted apps, backups, or targets behind.
 
 ## Commands and validation
 
@@ -106,7 +129,12 @@ make appimage
 builds, packages, and installs for the current distribution.
 `make bootstrap-native` installs build dependencies first and then performs the
 same native installation. A local `UPSTREAM_DEB` is structural input, not a
-replacement trust root for the signed repository.
+replacement trust root for the signed repository. It avoids the package-body
+download; default verification still uses signed stable metadata. The explicit
+local exception above does not add compatibility support for older packages.
+Nix build/installer entrypoints pass that exception for their fixed-output
+input, whose pinned hash Nix has already verified; they do not claim fresh APT
+signature verification. Native updater rebuilds keep default verification.
 
 Run the relevant subset, and use `./scripts/ci-local.sh all` for broad changes:
 
@@ -122,7 +150,7 @@ nix flake check
 
 Package/update/launcher/framework changes are cross-format unless explicitly
 scoped. When changing payloads, inspect all supported output formats. Refresh
-Nix pins through `scripts/ci/update-official-linux-pins.sh`, never by inventing
+Nix pins through `scripts/ci/update-nix-hashes.sh`, never by inventing
 hashes.
 
 ## Change expectations

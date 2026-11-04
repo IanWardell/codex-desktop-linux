@@ -14,53 +14,86 @@ const {
   applyCodexMicroFeatureGatePatch,
   descriptors,
   findCodexMicroFeatureGateAssets,
+  findCodexMicroServiceBundle,
   matchesCodexMicroFeatureGateContract,
   patchCodexMicroFeatureGateAssets,
   patchCodexMicroHotplugSource,
+  patchCodexMicroService,
 } = require("./patch.js");
 
-const [appShellContract, settingsContract, debugPanelContract] =
-  CODEX_MICRO_GATE_CONTRACTS;
+const [
+  appShellContract,
+  sidebarContract,
+  dictationContract,
+  composerContract,
+  settingsContract,
+] = CODEX_MICRO_GATE_CONTRACTS;
 
-function appShellSource(gates = 5) {
+function gate(namespace = "N") {
+  return `(0,${namespace}.Zj)("3207467860")`;
+}
+
+function appShellSource(gates = 2) {
   return [
-    "const onboarding=`codex-micro-onboarding-host-current.js`",
-    "const bridge=`codex-micro-bridge-current.js`",
-    "const firstRoute=`/settings/codex-micro`",
-    "const secondRoute=`/settings/codex-micro`",
+    'const onboarding={id:"codex-micro-onboarding"}',
+    "const service=D.appServices.codexMicro",
     ...Array.from(
       { length: gates },
-      (_, index) => `const gate${index}=gg(\`3207467860\`)`,
+      (_, index) => `const gate${index}=${gate()}`,
     ),
   ].join(";");
+}
+
+function sidebarSource() {
+  return [
+    'const active=h.pathname.startsWith("/settings/codex-micro")',
+    'const open=()=>{p("/settings/codex-micro")}',
+    "const status=c.codexMicro",
+    `const enabled=${gate("n3")}`,
+  ].join(";");
+}
+
+function dictationSource(namespace = "Q") {
+  return [
+    "const sounds=o.Szl.dictationSoundsEnabled",
+    "const props={onDictationTranscriptInsert:insert,waveformVariant:eZ}",
+    `const enabled=${gate(namespace)}`,
+  ].join(";");
+}
+
+function composerSource() {
+  return `const request={surface:"composer"},mode={effectiveMode:"code"},enabled=${gate("t_")}`;
 }
 
 function settingsVisibilitySource() {
   return [
     'const sections={"codex-micro":true}',
-    "function visible(section){switch(section){case`codex-micro`:return gg(`3207467860`)}}",
+    `function visible(section){let enabled=${gate("I")};switch(section){case"codex-micro":return enabled}}`,
   ].join(";");
 }
 
-function debugPanelSource() {
-  return [
-    "const message=`codexMicro.onboarding.debugStatus`",
-    "const enabled=gg(`3207467860`)",
-  ].join(";");
-}
+const GATE_FIXTURES = {
+  "async/216127.shell.js": () => appShellSource(),
+  "async/91641.sidebar.js": () => sidebarSource(),
+  "async/4317.dictation.js": () => dictationSource("Q"),
+  "async/637431.dictation.js": () => dictationSource("W"),
+  "async/589850.composer.js": () => composerSource(),
+  "async/61039.settings.js": () => settingsVisibilitySource(),
+};
 
 function createExtractedApp(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-micro-test-"));
   const assets = path.join(root, "webview", "assets");
-  fs.mkdirSync(assets, { recursive: true });
-  fs.writeFileSync(path.join(assets, "shell.js"), appShellSource(), "utf8");
+  fs.mkdirSync(path.join(assets, "async"), { recursive: true });
+  for (const [name, source] of Object.entries(GATE_FIXTURES)) {
+    fs.writeFileSync(path.join(assets, name), source(), "utf8");
+  }
+  fs.writeFileSync(path.join(assets, "async", "1.unrelated.js"), "const unrelated=true", "utf8");
   fs.writeFileSync(
-    path.join(assets, "settings.js"),
-    settingsVisibilitySource(),
+    path.join(assets, "async", "2.route-only.js"),
+    'const route="/settings/codex-micro"',
     "utf8",
   );
-  fs.writeFileSync(path.join(assets, "debug.js"), debugPanelSource(), "utf8");
-  fs.writeFileSync(path.join(assets, "unrelated.js"), "const unrelated=true", "utf8");
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return { assets, root };
 }
@@ -75,8 +108,10 @@ test("official Linux node-hid is reused without a native binding descriptor", ()
 test("Codex Micro feature gate patches every current callsite", () => {
   const currentContracts = [
     [appShellSource(), appShellContract],
+    [sidebarSource(), sidebarContract],
+    [dictationSource(), dictationContract],
+    [composerSource(), composerContract],
     [settingsVisibilitySource(), settingsContract],
-    [debugPanelSource(), debugPanelContract],
   ];
 
   let patchedCallsites = 0;
@@ -102,20 +137,22 @@ test("Codex Micro feature gate patches every current callsite", () => {
       patched,
     );
   }
-  assert.equal(patchedCallsites, 7);
+  assert.equal(patchedCallsites, 6);
+  for (const [source, contract] of currentContracts) {
+    const owners = CODEX_MICRO_GATE_CONTRACTS.filter((expected) =>
+      expected.anchor(source));
+    assert.deepEqual(owners, [contract]);
+  }
 });
 
 test("Codex Micro feature gate rejects incomplete or drifted contracts", () => {
   const marker = `!0/*${CODEX_MICRO_GATE_MARKER}*/`;
   const cases = {
-    incomplete: appShellSource(4),
-    member: appShellSource().replace(
-      "gg(`3207467860`)",
-      "gates.gg(`3207467860`)",
-    ),
-    duplicate: `${appShellSource()};const extra=\`3207467860\``,
-    mixed: appShellSource()
-      .replace("gg(`3207467860`)", marker),
+    incomplete: appShellSource(1),
+    member: appShellSource().replace(gate(), `gates${gate()}`),
+    legacyTemplate: appShellSource().replace(gate(), "gg(`3207467860`)"),
+    duplicate: `${appShellSource()};const extra="3207467860"`,
+    mixed: appShellSource().replace(gate(), marker),
     malformedPatched: applyCodexMicroFeatureGatePatch(
       appShellSource(),
       appShellContract,
@@ -136,19 +173,20 @@ test("Codex Micro feature gate rejects incomplete or drifted contracts", () => {
   }
 });
 
-test("Codex Micro feature gate discovers and patches all current semantic bundles", (t) => {
+test("Codex Micro feature gate discovers and patches every rspack copy", (t) => {
   const { assets, root } = createExtractedApp(t);
+  const owners = Object.keys(GATE_FIXTURES).sort();
   const discovery = findCodexMicroFeatureGateAssets(root);
   assert.equal(discovery.reason, null);
   assert.deepEqual(
-    discovery.matches.map(({ assetName }) => assetName).sort(),
-    ["debug.js", "settings.js", "shell.js"],
+    discovery.matches.map(({ assetName }) => assetName),
+    owners,
   );
 
   const result = patchCodexMicroFeatureGateAssets(root);
   assert.equal(result.matched, 1);
-  assert.equal(result.changed, 3);
-  const patched = ["debug.js", "settings.js", "shell.js"]
+  assert.equal(result.changed, owners.length);
+  const patched = owners
     .map((name) => fs.readFileSync(path.join(assets, name), "utf8"))
     .join(";");
   assert.equal(patched.includes(CODEX_MICRO_GATE_ID), false);
@@ -160,26 +198,57 @@ test("Codex Micro feature gate discovers and patches all current semantic bundle
     matched: 1,
     changed: 0,
     reason: null,
-    targets: ["shell.js", "settings.js", "debug.js"],
+    targets: owners,
   });
 });
 
 test("Codex Micro feature gate fails closed on an extra current callsite", (t) => {
   const { assets, root } = createExtractedApp(t);
   fs.writeFileSync(
-    path.join(assets, "drift.js"),
-    "const unexpected=gg(`3207467860`)",
+    path.join(assets, "async", "3.drift.js"),
+    `const unexpected=${gate()}`,
     "utf8",
   );
   const result = patchCodexMicroFeatureGateAssets(root);
   assert.equal(result.matched, 0);
   assert.equal(result.changed, 0);
-  assert.match(result.reason, /Found 4 Codex Micro feature-gate bundles/);
+  assert.match(result.reason, /async\/3\.drift\.js matches 0 semantic contracts/);
   assert.equal(
-    fs.readFileSync(path.join(assets, "shell.js"), "utf8"),
+    fs.readFileSync(path.join(assets, "async", "216127.shell.js"), "utf8"),
     appShellSource(),
   );
 });
+
+test("Codex Micro feature gate fails closed when a semantic owner disappears", (t) => {
+  const { assets, root } = createExtractedApp(t);
+  fs.rmSync(path.join(assets, "async", "589850.composer.js"));
+  const result = patchCodexMicroFeatureGateAssets(root);
+  assert.equal(result.matched, 0);
+  assert.match(result.reason, /Found 0 current Codex Micro composer gate bundles/);
+});
+
+test(
+  "signed upstream webview exposes every Codex Micro gate owner",
+  { skip: process.env.CODEX_SIGNED_EXTRACTED_APP == null },
+  () => {
+    const discovery = findCodexMicroFeatureGateAssets(
+      process.env.CODEX_SIGNED_EXTRACTED_APP,
+    );
+    assert.equal(discovery.reason, null);
+    for (const expected of CODEX_MICRO_GATE_CONTRACTS) {
+      assert.ok(discovery.matches.some((match) => match.expected === expected));
+    }
+    for (const match of discovery.matches) {
+      assert.equal(match.contract.state, "unpatched");
+      const patched = applyCodexMicroFeatureGatePatch(match.source, match.expected);
+      assert.equal(patched.includes(CODEX_MICRO_GATE_ID), false);
+      assert.equal(
+        patched.split(CODEX_MICRO_GATE_MARKER).length - 1,
+        match.expected.gateCount,
+      );
+    }
+  },
+);
 
 test("Linux hot-plug watcher is narrow and idempotent", () => {
   const source = [
@@ -193,3 +262,109 @@ test("Linux hot-plug watcher is narrow and idempotent", () => {
   assert.match(result.source, /\/dev/);
   assert.equal(patchCodexMicroHotplugSource(result.source).changed, 0);
 });
+
+function codexMicroServiceChunk() {
+  return [
+    '"use strict";exports.ids=[683],exports.modules={55006(t,e,i){',
+    "i.d(e,{CodexMicroService:()=>U});var a=i(4482);",
+    "function u(t){return g().watch(t)}",
+    "function g(){let p=[`hid-topology-watcher.node`,`hid_topology_watcher.node`];return p}",
+    "async function f(){return await g().findCodexMicroInterfaces()}",
+    "class U{scan(){this.scheduleTopologyFallbackScan()}}",
+    "}};",
+  ].join("");
+}
+
+function createMainProcessChunks(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-micro-chunks-"));
+  const buildDir = path.join(root, ".vite", "build");
+  fs.mkdirSync(buildDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(buildDir, "early-bootstrap.js"),
+    '"use strict";var m={4482(e){e.exports=require("electron")}};',
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(buildDir, "early-bootstrap-916-0123456789abcdef.js"),
+    '"use strict";exports.ids=[916],exports.modules={1(e,t,n){n.e(683).then(n.bind(n,55006))}};',
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(buildDir, "early-bootstrap-683-fedcba9876543210.js"),
+    codexMicroServiceChunk(),
+    "utf8",
+  );
+  // The worker build is not a main-process chunk and must be ignored.
+  fs.writeFileSync(
+    path.join(buildDir, "worker.js"),
+    codexMicroServiceChunk(),
+    "utf8",
+  );
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  return { buildDir, root };
+}
+
+test("Linux hot-plug watcher patches only the owning rspack chunk", (t) => {
+  const { buildDir, root } = createMainProcessChunks(t);
+  const discovery = findCodexMicroServiceBundle(root);
+  assert.equal(discovery.reason, null);
+  assert.equal(
+    path.basename(discovery.target),
+    "early-bootstrap-683-fedcba9876543210.js",
+  );
+
+  const result = patchCodexMicroService(root);
+  assert.equal(result.matched, 1);
+  assert.equal(result.changed, 1);
+  assert.equal(
+    result.target,
+    path.join(".vite", "build", "early-bootstrap-683-fedcba9876543210.js"),
+  );
+  const patched = fs.readFileSync(
+    path.join(buildDir, "early-bootstrap-683-fedcba9876543210.js"),
+    "utf8",
+  );
+  assert.equal(patched.split(CODEX_MICRO_HOTPLUG_MARKER).length - 1, 1);
+  assert.match(patched, /require\(`node:fs`\)\.watch\(`\/dev`/);
+  assert.equal(
+    fs.readFileSync(path.join(buildDir, "worker.js"), "utf8"),
+    codexMicroServiceChunk(),
+  );
+
+  const again = patchCodexMicroService(root);
+  assert.equal(again.matched, 1);
+  assert.equal(again.changed, 0);
+});
+
+test("Linux hot-plug watcher fails closed on duplicate service chunks", (t) => {
+  const { buildDir, root } = createMainProcessChunks(t);
+  fs.writeFileSync(
+    path.join(buildDir, "early-bootstrap-87-00112233445566aa.js"),
+    codexMicroServiceChunk(),
+    "utf8",
+  );
+  const result = patchCodexMicroService(root);
+  assert.equal(result.matched, 0);
+  assert.match(result.reason, /Found 2 current Codex Micro service bundles/);
+});
+
+test(
+  "signed upstream main process exposes exactly one Codex Micro watcher chunk",
+  { skip: process.env.CODEX_SIGNED_EXTRACTED_APP == null },
+  () => {
+    const root = process.env.CODEX_SIGNED_EXTRACTED_APP;
+    const discovery = findCodexMicroServiceBundle(root);
+    assert.equal(discovery.reason, null);
+    assert.match(
+      path.basename(discovery.target),
+      /^early-bootstrap-\d+-[0-9a-f]+\.js$/,
+    );
+    assert.equal(discovery.result.changed, 1);
+    assert.doesNotThrow(() => new Function(
+      "exports",
+      "require",
+      "__filename",
+      discovery.result.source,
+    ));
+  },
+);

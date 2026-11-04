@@ -4,6 +4,15 @@ The flake downloads the official architecture-specific Linux package pinned in
 `nix/upstream-linux-packages.json`, verifies its hash through Nix, extracts the
 ELF payload, and wraps it with the required Nix libraries.
 
+The derivation and directory installer pass
+`--skip-oai-official-sig-verification` to the shared installer for that fixed
+input. Nix has already checked its pinned hash; sandboxed builds do not fetch
+live APT metadata to repeat signature verification. Build provenance records
+`signatureVerification: "skipped"` for this step. Pins are refreshed through
+signed metadata as described below. Ordinary local `.deb` builds outside these
+Nix entrypoints verify by default without prompting; only the explicit flag
+selects an unverified local build.
+
 These inputs are official Linux `.deb` files. Nix wraps the official runtime
 directly instead of replacing Electron or rebuilding upstream native modules.
 The derivation audits every ELF in that payload. Target-architecture glibc
@@ -13,8 +22,10 @@ alone. Electron needs one additional fix: `patchelf` normally moves its
 interpreter metadata beyond the first 2 KiB, where the bundled libc detector
 can no longer see it. The derivation relocates that metadata into verified
 `patchelf` padding so the detector selects glibc without using Electron's
-unsafe report fallback. These checks run against both official architectures
-and keep `resources/app.asar` byte-for-byte identical to upstream.
+unsafe report fallback. These checks run against both official architectures.
+Builds apply the required core compatibility patch to `resources/app.asar`;
+the official ELF and native-module payload stays byte-for-byte intact. Optional
+ASAR features remain disabled unless explicitly selected.
 
 ```bash
 nix run github:ilysenko/codex-desktop-linux
@@ -120,14 +131,25 @@ On NixOS the launcher includes a package-local Bubblewrap adapter on `PATH` for
 the Codex Linux command sandbox. The adapter preserves the sandbox policy and
 adds the packaged `nix-ld` interpreter and runtime libraries inside that mount
 namespace. Generic Linux Git, Node.js, Python, and pnpm runtimes downloaded into
-the user cache therefore work in sandboxed workspace commands without enabling
-the system-wide `programs.nix-ld` module. Other Nix systems keep the normal
+the user cache, and the primary runtime's bundled headless LibreOffice, therefore
+work in sandboxed workspace commands without enabling the system-wide
+`programs.nix-ld` module. Other Nix systems keep the normal
 launcher path and use their system Bubblewrap integration.
 
 The adapter uses the generic loader symlink that NixOS provides through
 `environment.stub-ld` by default. A system that explicitly disables both that
 stub and `programs.nix-ld` keeps the packaged Bubblewrap integration, but its
 generic cached runtimes remain unavailable.
+
+With `programs.nix-ld` enabled, the login shell exports `NIX_LD` and
+`NIX_LD_LIBRARY_PATH`. Codex snapshots that shell and sources the snapshot
+before every sandboxed command, which restores the host values over the ones
+the adapter set. Cached generic runtimes then resolve libraries through the
+system nix-ld path. The NixOS module therefore adds the package's workspace
+runtime libraries to `programs.nix-ld.libraries` whenever nix-ld is enabled.
+Home Manager cannot set that system option; add
+`programs.codexDesktopLinux`'s package `passthru.workspaceRuntimeLibraries`
+to `programs.nix-ld.libraries` in the NixOS configuration instead.
 
 The wrapper uses the NixOS OpenGL driver path when it is present and retains
 Mesa as a fallback. Proprietary drivers on non-NixOS distributions may still
@@ -177,7 +199,7 @@ nix build .#checks.$(nix eval --impure --raw --expr builtins.currentSystem).nix-
 Pins are updated from signed OpenAI APT metadata:
 
 ```bash
-scripts/ci/update-official-linux-pins.sh
+scripts/ci/update-nix-hashes.sh
 ```
 
 The automation checks both architectures. Do not hand-invent or bypass hashes.

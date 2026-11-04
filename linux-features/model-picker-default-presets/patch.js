@@ -1,5 +1,9 @@
 "use strict";
 
+const {
+  findMatchingBrace,
+} = require("../../scripts/patches/lib/minified-js.js");
+
 const CATALOG_PATCH_MARKER = "codexLinuxModelPickerDefaultPresets";
 const CATALOG_PRESET_OPTIONS_KEY = "codexLinuxDefaultPresetOptions";
 const SLIDER_PATCH_MARKER = "codex-linux-model-picker-default-presets-slider-minimum";
@@ -8,12 +12,10 @@ const LOCAL_COMPOSER_CONFIG_MARKER =
   "codex-linux-model-picker-default-presets-local-composer-config";
 const LOCAL_COMPOSER_RESOLVER_MARKER =
   "codex-linux-model-picker-default-presets-local-composer-resolver";
-const LOCAL_DRAFT_SELECTION_MARKER =
-  "codex-linux-model-picker-default-presets-local-draft-selection";
 const EXISTING_CHAT_OPTIMISTIC_MARKER =
   "codex-linux-model-picker-default-presets-existing-chat-optimistic-selection";
 const EXISTING_CHAT_PRESET_IDS_KEY = "codexLinuxExistingChatDefaultPresetIds";
-const JS_ASSET_PATTERN = /\.js$/;
+const IDENT = "[A-Za-z_$][\\w$]*";
 const EFFORT_TO_THINKING_EFFORT = Object.freeze({
   none: "zero",
   low: "min",
@@ -26,6 +28,16 @@ const EFFORT_TO_THINKING_EFFORT = Object.freeze({
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function identifierSpellingPattern(identifier) {
+  return [...identifier].map((character) => {
+    const hex = character.codePointAt(0).toString(16)
+      .replace(/[a-f]/gu, (digit) => `[${digit}${digit.toUpperCase()}]`);
+    const fixedHex = character.codePointAt(0).toString(16).padStart(4, "0")
+      .replace(/[a-f]/gu, (digit) => `[${digit}${digit.toUpperCase()}]`);
+    return `(?:${escapeRegExp(character)}|\\\\u${fixedHex}|\\\\u\\{0*${hex}\\})`;
+  }).join("");
 }
 const THINKING_EFFORT_TO_EFFORT = Object.freeze(
   Object.fromEntries(
@@ -151,24 +163,57 @@ function codexLinuxModelPickerDefaultPresets(catalog, configured) {
 }
 
 function functionSections(source) {
-  const starts = [];
-  const pattern = /function [A-Za-z_$][\w$]*\(/g;
-  let match;
-  while ((match = pattern.exec(source)) != null) {
-    starts.push(match.index);
+  const sections = [];
+  const pattern = /function [A-Za-z_$][\w$]*\([^)]*\)\{/g;
+  for (const match of source.matchAll(pattern)) {
+    const open = match.index + match[0].length - 1;
+    const close = findMatchingBrace(source, open);
+    if (close !== -1) {
+      sections.push({
+        end: close + 1,
+        source: source.slice(match.index, close + 1),
+        start: match.index,
+      });
+    }
   }
-  return starts.map((start, index) => ({
-    end: starts[index + 1] ?? source.length,
-    source: source.slice(start, starts[index + 1] ?? source.length),
-    start,
-  }));
+  return sections;
+}
+
+// rspack chunks register `__webpack_modules__={id(e,t,n){...},...}`; minified
+// helper names repeat across module factories, so related functions are looked
+// up only inside the factory that owns a matched section.
+function enclosingModuleFactory(source, index) {
+  const registry = "__webpack_modules__={";
+  const registryStart = source.indexOf(registry);
+  if (registryStart < 0 || source.indexOf(registry, registryStart + 1) >= 0) return null;
+  const entry = /(?:"[^"\\]*"|[\w$]+)\([^()]*\)\{/y;
+  let cursor = registryStart + registry.length;
+  while (cursor < source.length && source[cursor] !== "}") {
+    entry.lastIndex = cursor;
+    const match = entry.exec(source);
+    if (match == null) return null;
+    const open = cursor + match[0].length - 1;
+    const close = findMatchingBrace(source, open);
+    if (close < 0) return null;
+    if (index > open && index < close) {
+      return { end: close + 1, source: source.slice(cursor, close + 1), start: cursor };
+    }
+    cursor = close + 1;
+    if (source[cursor] === ",") cursor += 1;
+  }
+  return null;
 }
 
 function uniqueFunctionWithMarkers(source, markers) {
   const matches = functionSections(source).filter((section) =>
     markers.every((marker) => section.source.includes(marker)),
   );
-  return matches.length === 1 ? matches[0] : null;
+  const leafMatches = matches.filter((candidate) =>
+    !matches.some((other) =>
+      other !== candidate && other.start > candidate.start && other.end < candidate.end
+    )
+  );
+  return leafMatches.length === 1 ? leafMatches[0] : null;
 }
 
 function catalogNormalizerSection(source) {
@@ -180,13 +225,43 @@ function catalogNormalizerSection(source) {
   ]);
 }
 
+const CATALOG_OPTION_LIST_MARKERS = Object.freeze([
+  "internalOptions??[]",
+  "versionOptions?.flatMap(",
+]);
+const CATALOG_SELECTION_MARKERS = Object.freeze([
+  "defaultThinkingEffortByModelSlug",
+  ".thinkingEffort??null)===",
+]);
+
+// The selection resolver builds the flattened catalog option list inline; the
+// patch target is the function that owns that option array.
 function catalogSelectionResolverSection(source) {
-  return uniqueFunctionWithMarkers(source, [
-    "internalOptions??[]",
-    "versionOptions?.flatMap(",
-    "defaultThinkingEffortByModelSlug",
-    "thinkingEffort!=null",
+  const inline = uniqueFunctionWithMarkers(source, [
+    ...CATALOG_OPTION_LIST_MARKERS,
+    ...CATALOG_SELECTION_MARKERS,
   ]);
+  const optionList = uniqueFunctionWithMarkers(source, CATALOG_OPTION_LIST_MARKERS);
+  return inline != null && optionList != null && optionList.start === inline.start
+    ? inline
+    : null;
+}
+
+// The flattened option array starts with the catalog's public options and
+// includes its internal options.
+function catalogOptionArrayStart(section, catalogParameter) {
+  const head = `[...${catalogParameter}?.options??[]`;
+  const start = section.indexOf(head);
+  if (start < 0 || section.indexOf(head, start + 1) >= 0) {
+    return -1;
+  }
+  const end = matchingSquareBracket(section, start);
+  const internal = section.indexOf(`...${catalogParameter}?.internalOptions??[]`, start);
+  return end > 0 && internal > start && internal < end ? start : -1;
+}
+
+function sectionsOverlap(left, right) {
+  return left.start < right.end && right.start < left.end;
 }
 
 function matchingSquareBracket(source, openingIndex) {
@@ -201,11 +276,85 @@ function matchingSquareBracket(source, openingIndex) {
   return -1;
 }
 
+function stringLiteralEnd(source, openingIndex) {
+  const quote = source[openingIndex];
+  for (let index = openingIndex + 1; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === "\\") {
+      index += 1;
+      continue;
+    }
+    if (character === quote) return index;
+    if (quote === "`" && character === "$" && source[index + 1] === "{") {
+      const closing = matchingCurlyBrace(source, index + 1);
+      if (closing < 0) return -1;
+      index = closing;
+    }
+  }
+  return -1;
+}
+
+function matchingCurlyBrace(source, openingIndex) {
+  let depth = 0;
+  for (let index = openingIndex; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === "'" || character === '"' || character === "`") {
+      const closing = stringLiteralEnd(source, index);
+      if (closing < 0) return -1;
+      index = closing;
+      continue;
+    }
+    if (character === "{") depth += 1;
+    if (character === "}") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function returnsObjectLiteralAt(section, objectIndex) {
+  const preceding = section.slice(0, objectIndex).trimEnd();
+  return preceding.endsWith("return") || preceding.endsWith(",");
+}
+
+// Upstream both nests object returns inside the catalog normalizer and returns
+// the catalog through a comma expression, so no textual "return{" anchor is
+// stable. The catalog object is the literal that closes the function body;
+// wrapping anything else unbalances the bundle and blanks the renderer.
+function catalogReturnObjectIndex(section, closingIndex) {
+  if (closingIndex < 1) return -1;
+  for (let index = closingIndex - 2; index >= 0; index -= 1) {
+    if (section[index] !== "{") continue;
+    if (matchingCurlyBrace(section, index) !== closingIndex - 1) continue;
+    return returnsObjectLiteralAt(section, index) ? index : -1;
+  }
+  return -1;
+}
+
+function parsesStandalone(section) {
+  try {
+    new Function(section);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// A patch that turns a parseable section into an unparseable one takes the
+// whole renderer down with a blank window, so fail closed instead.
+function keepsSectionParseable(original, patched) {
+  return !parsesStandalone(original) || parsesStandalone(patched);
+}
+
 function catalogPatchContract(source) {
   const markerCount = source.split(CATALOG_PATCH_MARKER).length - 1;
   const presetOptionsCount = source.split(CATALOG_PRESET_OPTIONS_KEY).length - 1;
   const normalizer = catalogNormalizerSection(source);
-  const resolver = catalogSelectionResolverSection(source);
+  const found = catalogSelectionResolverSection(source);
+  const resolver = found != null && normalizer != null && sectionsOverlap(normalizer, found)
+    ? null
+    : found;
   if (markerCount === 0 && presetOptionsCount === 0) {
     return normalizer == null || resolver == null ? "drifted" : "current";
   }
@@ -214,7 +363,7 @@ function catalogPatchContract(source) {
     presetOptionsCount === 2 &&
     normalizer != null &&
     resolver != null &&
-    normalizer.source.includes(`return ${CATALOG_PATCH_MARKER}({`) &&
+    normalizer.source.includes(`${CATALOG_PATCH_MARKER}({`) &&
     resolver.source.includes(`?.${CATALOG_PRESET_OPTIONS_KEY}??[]`)
   ) {
     return "applied";
@@ -247,10 +396,9 @@ function applyCatalogPatch(source, context = {}) {
 
   const normalizer = catalogNormalizerSection(source);
   const resolver = catalogSelectionResolverSection(source);
-  const returnMarker = ";return{";
-  const returnIndex = normalizer.source.indexOf(returnMarker);
   const closingIndex = normalizer.source.lastIndexOf("}");
-  if (returnIndex < 0 || closingIndex <= returnIndex) {
+  const returnIndex = catalogReturnObjectIndex(normalizer.source, closingIndex);
+  if (returnIndex < 0) {
     warn(
       "Could not locate the ChatGPT model catalog return object",
       "model picker Default catalog patch",
@@ -261,9 +409,13 @@ function applyCatalogPatch(source, context = {}) {
   const resolverSignature = /^function [A-Za-z_$][\w$]*\(([A-Za-z_$][\w$]*)[,)]/u.exec(
     resolver.source,
   );
-  const resolverOptionsStart = resolver.source.indexOf("=[", resolverSignature?.[0].length ?? 0) + 1;
-  const resolverOptionsEnd = matchingSquareBracket(resolver.source, resolverOptionsStart);
-  if (resolverSignature == null || resolverOptionsStart <= 0 || resolverOptionsEnd < 0) {
+  const resolverOptionsStart = resolverSignature == null
+    ? -1
+    : catalogOptionArrayStart(resolver.source, resolverSignature[1]);
+  const resolverOptionsEnd = resolverOptionsStart < 0
+    ? -1
+    : matchingSquareBracket(resolver.source, resolverOptionsStart);
+  if (resolverOptionsStart < 0 || resolverOptionsEnd < 0) {
     warn(
       "Could not locate the ChatGPT model selection option array",
       "model picker Default catalog patch",
@@ -273,8 +425,8 @@ function applyCatalogPatch(source, context = {}) {
 
   const patchedNormalizer =
     normalizer.source.slice(0, returnIndex) +
-    `;return ${CATALOG_PATCH_MARKER}({` +
-    normalizer.source.slice(returnIndex + returnMarker.length, closingIndex) +
+    ` ${CATALOG_PATCH_MARKER}(` +
+    normalizer.source.slice(returnIndex, closingIndex) +
     ",codexLinuxDefaultPresetsConfigured)" +
     normalizer.source.slice(closingIndex);
   const catalogParameter = resolverSignature[1];
@@ -282,6 +434,17 @@ function applyCatalogPatch(source, context = {}) {
     resolver.source.slice(0, resolverOptionsEnd) +
     `,...${catalogParameter}?.${CATALOG_PRESET_OPTIONS_KEY}??[]` +
     resolver.source.slice(resolverOptionsEnd);
+  if (
+    !keepsSectionParseable(normalizer.source, patchedNormalizer) ||
+    !keepsSectionParseable(resolver.source, patchedResolver)
+  ) {
+    warn(
+      "Patched ChatGPT model catalog section no longer parses",
+      "model picker Default catalog patch",
+    );
+    return source;
+  }
+
   const replacements = [
     { ...normalizer, source: patchedNormalizer },
     { ...resolver, source: patchedResolver },
@@ -294,11 +457,19 @@ function applyCatalogPatch(source, context = {}) {
       patchedSource.slice(replacement.end);
   }
   const helperIndex = Math.min(normalizer.start, resolver.start);
-  return (
+  patchedSource =
     patchedSource.slice(0, helperIndex) +
     catalogRuntimeHelper(presets) +
-    patchedSource.slice(helperIndex)
-  );
+    patchedSource.slice(helperIndex);
+  // Re-read the result so a mis-scanned section cannot ship a mixed bundle.
+  if (catalogPatchContract(patchedSource) !== "applied") {
+    warn(
+      "Patched ChatGPT model catalog contract is incomplete",
+      "model picker Default catalog patch",
+    );
+    return source;
+  }
+  return patchedSource;
 }
 
 function sliderResolverSection(source) {
@@ -310,75 +481,277 @@ function sliderResolverSection(source) {
   ]);
 }
 
-function powerSelectionResolverSection(source) {
+// The merged picker builds its Default option from the catalog slider settings
+// alone whenever the catalog provides any; version options keep their own
+// model list. The configured presets replace the catalog slider settings, so
+// this owner must keep using them exclusively for Default.
+function defaultOptionBuilderSection(source) {
   return uniqueFunctionWithMarkers(source, [
-    ".sliderSettings?.filter(",
-    "isTppConversation:",
-    "selectionMode:",
-    "powerSettings:",
+    "includeSyntheticDefault:",
+    "paidModelFallbackEnabled:",
+    ".sliderSettings?.length?",
+    "defaultOption:",
   ]);
 }
 
-function firstFunctionParameter(section) {
-  return /^function [A-Za-z_$][\w$]*\(([A-Za-z_$][\w$]*)[,)]/u.exec(
-    section?.source ?? "",
-  )?.[1] ?? null;
-}
-
-function upstreamDefaultSliderCondition(section) {
-  const catalogParameter = firstFunctionParameter(section);
-  if (catalogParameter == null) return null;
-  const pattern =
-    /([A-Za-z_$][\w$]*)&&([A-Za-z_$][\w$]*)===([`'"])default\3&&([A-Za-z_$][\w$]*)\.length>0\?\4:/gu;
-  const matches = [...section.source.matchAll(pattern)];
-  if (matches.length !== 1) return null;
-  return {
-    catalogParameter,
-    match: matches[0][0],
-    selectionMode: matches[0][2],
-    sliderSettings: matches[0][4],
-    tppMode: matches[0][1],
-  };
-}
-
-function upstreamSliderFilterCondition(section, defaultCondition) {
-  const quotedDefault = "([`'\"])default\\1";
-  const pattern = new RegExp(
-    `${defaultCondition.tppMode}&&${defaultCondition.selectionMode}===${quotedDefault}\\|\\|`,
-    "gu",
+function upstreamDefaultSelectionContract(source) {
+  const section = defaultOptionBuilderSection(source);
+  const catalogParameter = new RegExp(`^function ${IDENT}\\((${IDENT}),\\{`, "u")
+    .exec(section?.source ?? "")?.[1];
+  if (catalogParameter == null) return "drifted";
+  const catalog = escapeRegExp(catalogParameter);
+  const sliderSettings = uniqueMatch(
+    section.source,
+    new RegExp(
+      `(${IDENT})=${catalog}\\?\\.sliderSettings\\?\\.length\\?${catalog}\\.sliderSettings:${IDENT}\\(`,
+      "gu",
+    ),
+  )?.[1];
+  if (sliderSettings == null) return "drifted";
+  const defaultOption = uniqueMatch(
+    section.source,
+    new RegExp(
+      `defaultOption:${IDENT}\\|\\|${IDENT}\\?\\{\\.\\.\\.(${IDENT})\\(${catalog},${IDENT},` +
+        `${escapeRegExp(sliderSettings)}\\),isDefault:!0\\}:void 0`,
+      "gu",
+    ),
   );
-  const matches = [...section.source.matchAll(pattern)];
-  return matches.length === 1 ? matches[0][0] : null;
+  if (defaultOption == null) return "drifted";
+  // The option builder lives in the same rspack module factory and must expose
+  // its third argument as the power settings.
+  const moduleFactory = enclosingModuleFactory(source, section.start);
+  const builders = functionSections(moduleFactory?.source ?? "").filter((candidate) =>
+    candidate.source.startsWith(`function ${defaultOption[1]}(`)
+  );
+  if (builders.length !== 1) return "drifted";
+  const builder = new RegExp(
+    `^function ${escapeRegExp(defaultOption[1])}\\(${IDENT},${IDENT},(${IDENT})\\)\\{`,
+    "u",
+  ).exec(builders[0].source);
+  return builder != null && builders[0].source.endsWith(`powerSettings:${builder[1]}}}`)
+    ? "current"
+    : "drifted";
+}
+
+function upstreamDefaultSelectionAssetMatch(source, _assetName, context = {}) {
+  return normalizePresets(context).length > 0 &&
+    upstreamDefaultSelectionContract(source) === "current";
+}
+
+function upstreamResetEffectSection(source) {
+  return uniqueFunctionWithMarkers(source, [
+    "fallbackPowerSelection:",
+    "isModelSettingsLoading:",
+    "onReset:",
+    "resetContextKey:",
+    "selectedPowerSelectionWithXHigh:",
+    ".useEffectEvent)(",
+  ]);
+}
+
+function upstreamResetEffectAliases(section) {
+  const properties = [
+    "fallbackPowerSelection",
+    "isModelSettingsLoading",
+    "onReset",
+    "resetContextKey",
+    "selectedPowerSelectionWithXHigh",
+  ];
+  const destructurings = [
+    ...(section?.source ?? "").matchAll(
+      new RegExp(`\\{([^{}]+)\\}=${IDENT}(?=,|;)`, "gu"),
+    ),
+  ].filter((match) =>
+    properties.every((property) =>
+      new RegExp(`(?:^|,)${property}:${IDENT}(?=,|$)`, "u").test(match[1]),
+    )
+  );
+  if (destructurings.length !== 1) return null;
+  const aliases = {};
+  for (const property of properties) {
+    const match = new RegExp(`(?:^|,)${property}:(${IDENT})(?=,|$)`, "u").exec(
+      destructurings[0][1],
+    );
+    if (match == null) return null;
+    aliases[property] = match[1];
+  }
+  return aliases;
+}
+
+function uniqueMatch(source, pattern) {
+  const matches = [...source.matchAll(pattern)];
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function upstreamResetEffectContract(source) {
+  const section = upstreamResetEffectSection(source);
+  if (section == null) return "drifted";
+  const aliases = upstreamResetEffectAliases(section);
+  if (aliases == null) return "drifted";
+  const {
+    fallbackPowerSelection: fallback,
+    isModelSettingsLoading: loading,
+    onReset,
+    resetContextKey: resetContext,
+    selectedPowerSelectionWithXHigh: selected,
+  } = aliases;
+
+  const resolution = uniqueMatch(
+    section.source,
+    new RegExp(
+      `(${IDENT})=(?:${IDENT}|\\(0,${IDENT}\\.${IDENT}\\))\\(\\{[^{}]{0,1200}?canInitializePowerPicker:(${IDENT}),` +
+        `[^{}]{0,1200}?fallbackPowerSelection:${fallback},` +
+        `[^{}]{0,1200}?menuView:(${IDENT}),` +
+        `[^{}]{0,1200}?selectedPowerSelection:${selected},` +
+        `[^{}]{0,1200}?showXHighInSimplePicker:(${IDENT})[^{}]{0,1200}?\\}\\)`,
+      "gu",
+    ),
+  );
+  if (resolution == null) return "drifted";
+  const resolved = resolution[1];
+  const canInitialize = resolution[2];
+  const menuView = resolution[3];
+  const showXHigh = resolution[4];
+  const selection = uniqueMatch(
+    section.source,
+    new RegExp(`(?:let\\s+|,)(${IDENT})=${resolved}(?=,)`, "gu"),
+  )?.[1];
+  if (selection == null) return "drifted";
+  const selectedId = uniqueMatch(
+    section.source,
+    new RegExp(`(${IDENT})=${selection}\\?\\.id\\?\\?null`, "gu"),
+  )?.[1];
+  if (selectedId == null) return "drifted";
+  const resetScope = uniqueMatch(
+    section.source,
+    new RegExp(
+      `(${IDENT})=null==${selectedId}\\?null:\\x60\\$\\{${resetContext}\\}:` +
+        `\\$\\{${selectedId}\\}\\x60`,
+      "gu",
+    ),
+  )?.[1];
+  if (resetScope == null) return "drifted";
+  const resetCallback = uniqueMatch(
+    section.source,
+    new RegExp(
+      `(${IDENT})=(${IDENT})=>\\{${selection}\\?\\.id===\\2&&${onReset}\\(${selection}\\)\\}`,
+      "gu",
+    ),
+  )?.[1];
+  if (resetCallback == null) return "drifted";
+  const resetEvent = uniqueMatch(
+    section.source,
+    new RegExp(
+      `(${IDENT})=\\(0,${IDENT}\\.useEffectEvent\\)\\(${resetCallback}\\)`,
+      "gu",
+    ),
+  )?.[1];
+  const resetRef = uniqueMatch(
+    section.source,
+    new RegExp(`(${IDENT})=\\(0,${IDENT}\\.useRef\\)\\(null\\)`, "gu"),
+  )?.[1];
+  if (resetEvent == null || resetRef == null) return "drifted";
+
+  const effect = uniqueMatch(
+    section.source,
+    new RegExp(
+      `(${IDENT})=\\(\\)=>\\{if\\(!${loading}\\)\\{if\\(!(${IDENT})\\)\\{` +
+        `${resetRef}\\.current=null;return\\}` +
+        `null!=${selectedId}&&null!=${resetScope}&&` +
+        `${resetRef}\\.current!==${resetScope}&&\\(${resetRef}\\.current=${resetScope},` +
+        `${resetEvent}\\(${selectedId}\\)\\)\\}\\}`,
+      "gu",
+    ),
+  );
+  if (effect == null) return "drifted";
+  const active = effect[2];
+  const pickerReady = uniqueMatch(
+    section.source,
+    new RegExp(
+      `(${IDENT})=!${showXHigh}&&${canInitialize}&&([\\x60'"])simple\\2===${menuView}(?=,|;)`,
+      "gu",
+    ),
+  );
+  if (pickerReady == null || pickerReady[1] !== active) return "drifted";
+  const dependencies = uniqueMatch(
+    section.source,
+    new RegExp(
+      `(${IDENT})=\\[${selectedId},${resetScope},${active},${loading}\\]`,
+      "gu",
+    ),
+  );
+  if (dependencies == null || effect.index >= dependencies.index) return "drifted";
+  const effectRegistration = uniqueMatch(
+    section.source,
+    new RegExp(
+      `\\(0,${IDENT}\\.useEffect\\)\\(${effect[1]},${dependencies[1]}\\)`,
+      "gu",
+    ),
+  );
+  if (
+    effectRegistration == null ||
+    dependencies.index >= effectRegistration.index
+  ) {
+    return "drifted";
+  }
+  const auditedScope = section.source;
+  const activeOccurrences = [
+    ...auditedScope.matchAll(
+      new RegExp(`(?<![\\w$])${identifierSpellingPattern(active)}(?![\\w$])`, "gu"),
+    ),
+  ].map((match) => match.index);
+  const effectPredicateIndex =
+    effect.index + effect[0].indexOf(`{if(!${active})`) + "{if(!".length;
+  const dependencyIndex =
+    dependencies.index + dependencies[0].indexOf(`,${active},`) + 1;
+  const allowedActiveOccurrences = new Set([
+    pickerReady.index,
+    effectPredicateIndex,
+    dependencyIndex,
+  ]);
+  // Compiler-cache reads are allowed only when the very next token is one the
+  // signed bundle uses after them. Listing the allowed tokens (instead of the
+  // forbidden ones) rejects assignments, updates, comments, and line breaks.
+  const cacheReadSuffix = "(?=,|\\|\\|(?!=)|\\?(?![?.=]))";
+  for (const match of auditedScope.matchAll(
+    new RegExp(
+      `${IDENT}\\[\\d+\\](?:!==|=)(${escapeRegExp(active)})${cacheReadSuffix}`,
+      "gu",
+    ),
+  )) {
+    allowedActiveOccurrences.add(
+      match.index + match[0].length - active.length,
+    );
+  }
+  if (
+    pickerReady.index >= effect.index ||
+    activeOccurrences.length !== allowedActiveOccurrences.size ||
+    activeOccurrences.some((index) => !allowedActiveOccurrences.has(index))
+  ) {
+    return "drifted";
+  }
+  return "current";
+}
+
+function upstreamResetEffectAssetMatch(source, _assetName, context = {}) {
+  return normalizePresets(context).length > 0 &&
+    upstreamResetEffectContract(source) === "current";
 }
 
 function sliderPatchContract(source) {
   const markerCount = source.split(SLIDER_PATCH_MARKER).length - 1;
-  const localMarkerCount = source.split(LOCAL_DEFAULT_PATCH_MARKER).length - 1;
   const sliderSection = sliderResolverSection(source);
-  const powerSection = powerSelectionResolverSection(source);
-  const catalogParameter = firstFunctionParameter(powerSection);
-  if (markerCount === 0 && localMarkerCount === 0) {
-    if (sliderSection == null || powerSection == null) return "drifted";
-    const defaultCondition = upstreamDefaultSliderCondition(powerSection);
-    return (sliderSection.source.match(/\.length>=3/g) ?? []).length === 2 &&
-      defaultCondition != null &&
-      upstreamSliderFilterCondition(powerSection, defaultCondition) != null
-      ? "current"
-      : "drifted";
+  if (markerCount === 0) {
+    return sliderSection != null &&
+      (sliderSection.source.match(/\.length>=3/g) ?? []).length === 2
+      ? "current" : "drifted";
   }
   if (
     markerCount === 1 &&
-    localMarkerCount === 1 &&
     sliderSection != null &&
-    powerSection != null &&
     sliderSection.source.includes(`/*${SLIDER_PATCH_MARKER}*/`) &&
-    powerSection.source.includes(`/*${LOCAL_DEFAULT_PATCH_MARKER}*/`) &&
     (sliderSection.source.match(/\.length>=codexLinuxDefaultPresetMinimum\(/g) ?? []).length === 2 &&
-    !sliderSection.source.includes(".length>=3") &&
-    powerSection.source.includes(
-      `let codexLinuxHasDefaultPresets=${catalogParameter}?.${CATALOG_PRESET_OPTIONS_KEY}!=null`,
-    ) &&
-    (powerSection.source.match(/codexLinuxHasDefaultPresets/g) ?? []).length === 3
+    !sliderSection.source.includes(".length>=3")
   ) {
     return "applied";
   }
@@ -408,17 +781,6 @@ function applySliderMinimumPatch(source, context = {}) {
   }
 
   const sliderSection = sliderResolverSection(source);
-  const powerSection = powerSelectionResolverSection(source);
-  const defaultCondition = upstreamDefaultSliderCondition(powerSection);
-  const filterCondition =
-    defaultCondition == null ? null : upstreamSliderFilterCondition(powerSection, defaultCondition);
-  if (defaultCondition == null || filterCondition == null) {
-    warn(
-      "Could not locate the local Default power-selection branch",
-      "model picker Default slider patch",
-    );
-    return source;
-  }
   const configuredIds = presets.map(
     ({ modelSlug, thinkingEffort }) =>
       `${modelSlug}:${THINKING_EFFORT_TO_EFFORT[thinkingEffort]}`,
@@ -434,47 +796,14 @@ function applySliderMinimumPatch(source, context = {}) {
       /([A-Za-z_$][\w$]*)\.length>=3/g,
       "$1.length>=codexLinuxDefaultPresetMinimum($1)",
     );
-  const configuredDefaultCondition =
-    `codexLinuxHasDefaultPresets&&${defaultCondition.selectionMode}===\`default\``;
-  let patchedPowerSection = powerSection.source
-    .replace(filterCondition, `${configuredDefaultCondition}||`)
-    .replace(
-      defaultCondition.match,
-      `${configuredDefaultCondition}&&${defaultCondition.sliderSettings}.length>0?${defaultCondition.sliderSettings}:`,
-    );
-  const bodyOpening = patchedPowerSection.lastIndexOf(
-    "){",
-    patchedPowerSection.indexOf(".sliderSettings"),
-  ) + 1;
-  if (bodyOpening <= 0 || patchedPowerSection[bodyOpening] !== "{") {
-    warn(
-      "Could not locate the power-selection resolver body",
-      "model picker Default slider patch",
-    );
-    return source;
-  }
-  patchedPowerSection =
-    patchedPowerSection.slice(0, bodyOpening + 1) +
-    `/*${LOCAL_DEFAULT_PATCH_MARKER}*/let codexLinuxHasDefaultPresets=${defaultCondition.catalogParameter}?.${CATALOG_PRESET_OPTIONS_KEY}!=null;` +
-    patchedPowerSection.slice(bodyOpening + 1);
-  const replacements = [
-    { ...sliderSection, source: patchedSliderSection },
-    { ...powerSection, source: patchedPowerSection },
-  ].sort((left, right) => right.start - left.start);
-  let patchedSource = source;
-  for (const replacement of replacements) {
-    patchedSource =
-      patchedSource.slice(0, replacement.start) +
-      replacement.source +
-      patchedSource.slice(replacement.end);
-  }
-  return patchedSource;
+  return source.slice(0, sliderSection.start) + patchedSliderSection +
+    source.slice(sliderSection.end);
 }
 
 function localComposerResolverSection(source) {
   return uniqueFunctionWithMarkers(source, [
     "sliderModelsConfig:",
-    "includeUltraInSlider:",
+    "removeXHigh:",
     "stripGptPrefix:",
     ".presets){",
   ]);
@@ -604,68 +933,55 @@ function localComposerRuntime(config) {
 }
 
 const LOCAL_COMPOSER_FALLBACK_PATTERN =
-  /([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)==null\?void 0:`\$\{\4\.model\}:\$\{\4\.defaultReasoningEffort\}`\)/gu;
+  /([A-Za-z_$][\w$]*)=(\(0,[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*\))\(([A-Za-z_$][\w$]*),null==([A-Za-z_$][\w$]*)\?void 0:`\$\{\4\.model\}:\$\{\4\.defaultReasoningEffort\}`\)/gu;
+// The composer picks the slider config from one of two ChatGPT-gated sources.
+const LOCAL_COMPOSER_CONFIG_PATTERN =
+  /sliderModelsConfig:([A-Za-z_$][\w$]*\?[A-Za-z_$][\w$]*:[A-Za-z_$][\w$]*)(?=[,}])/gu;
+const LOCAL_COMPOSER_SELECTION_PATTERN = new RegExp(
+  `async function (?<handler>[A-Za-z_$][\\w$]*)\\((?<model>[A-Za-z_$][\\w$]*),(?<effort>[A-Za-z_$][\\w$]*)\\)\\{` +
+    `let (?<normalized>[A-Za-z_$][\\w$]*)=(?<normalizer>[A-Za-z_$][\\w$]*)\\(\\k<model>\\);` +
+    `await ?\\(null==(?<delegate>[A-Za-z_$][\\w$]*)\\?(?<base>[A-Za-z_$][\\w$]*)\\(\\k<normalized>,\\k<effort>\\):` +
+    `\\k<delegate>\\.setModelAndReasoningEffort\\(\\k<normalized>,\\k<effort>\\)\\)\\}`,
+  "gu",
+);
+
+function localComposerResetContext(section) {
+  const matches = [
+    ...(section?.source ?? "").matchAll(
+      /resetContextKey:JSON\.stringify\(\[([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\.cwd\]\)/gu,
+    ),
+  ];
+  if (matches.length !== 1) return null;
+  const [, conversation, hostId, cwdOwner] = matches[0];
+  return { conversation, cwdOwner, hostId };
+}
 
 function localComposerConfigContract(source) {
   const markerCount = source.split(LOCAL_COMPOSER_CONFIG_MARKER).length - 1;
-  const draftMarkerCount = source.split(LOCAL_DRAFT_SELECTION_MARKER).length - 1;
   const section = localComposerSection(source);
-  if (markerCount === 0 && draftMarkerCount === 0) {
+  if (markerCount === 0) {
     if (section == null) return "drifted";
-    const configMatches = section.source.match(/sliderModelsConfig:[A-Za-z_$][\w$]*/g) ?? [];
+    const configMatches = section.source.match(LOCAL_COMPOSER_CONFIG_PATTERN) ?? [];
     const fallbackMatches = section.source.match(LOCAL_COMPOSER_FALLBACK_PATTERN) ?? [];
-    const selectionMatches =
-      section.source.match(
-        /[A-Za-z_$][\w$]*\?\.selectModelAndReasoningEffort\?\?[A-Za-z_$][\w$]*/g,
-      ) ?? [];
-    const resetContextMatches =
-      section.source.match(
-        /resetContextKey:JSON\.stringify\(\[[A-Za-z_$][\w$]*,[A-Za-z_$][\w$]*\.hostId,[A-Za-z_$][\w$]*\.cwd\]\)/g,
-      ) ?? [];
+    const selectionMatches = section.source.match(LOCAL_COMPOSER_SELECTION_PATTERN) ?? [];
     return configMatches.length === 1 &&
       fallbackMatches.length === 2 &&
       selectionMatches.length === 1 &&
-      resetContextMatches.length === 1
+      localComposerResetContext(section) != null
       ? "current"
       : "drifted";
   }
   if (
     markerCount === 1 &&
-    draftMarkerCount === 1 &&
     section != null &&
     section.source.includes(":codexLinuxLocalDefaultPresetConfig") &&
     (section.source.match(/codexLinuxLocalDefaultPresetFallback\(/g) ?? []).length === 2 &&
-    (section.source.match(/codexLinuxLocalDefaultPresetSelection\(/g) ?? []).length === 1 &&
-    section.source.includes(`/*${LOCAL_DRAFT_SELECTION_MARKER}*/`)
+    (section.source.match(/codexLinuxLocalDefaultPresetSelection\(/g) ?? []).length === 0 &&
+    (section.source.match(LOCAL_COMPOSER_SELECTION_PATTERN) ?? []).length === 1
   ) {
     return "applied";
   }
   return "mixed";
-}
-
-function optimisticSelectionCleanupSection(source) {
-  const candidates = functionSections(source).filter(
-    (section) =>
-      section.source.includes('.target[0]==="default"') &&
-      section.source.includes(".selection") &&
-      optimisticSelectionCleanupTarget(section) != null,
-  );
-  return candidates.length === 1 ? candidates[0] : null;
-}
-
-function optimisticSelectionCleanupTarget(section) {
-  const signature =
-    /^function [A-Za-z_$][\w$]*\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)/u.exec(
-      section?.source ?? "",
-    );
-  if (signature == null) return null;
-  const [, store, entry] = signature;
-  const pattern = new RegExp(
-    `${store}\\.get\\(([A-Za-z_$][\\w$]*),${entry}\\.target\\)===${entry}\\.selection&&${store}\\.set\\(\\1,${entry}\\.target,null\\)`,
-    "gu",
-  );
-  const matches = [...section.source.matchAll(pattern)];
-  return matches.length === 1 ? matches[0] : null;
 }
 
 function modelSettingsStateSection(source) {
@@ -678,26 +994,25 @@ function modelSettingsStateSection(source) {
   ]);
 }
 
-function modelSettingsSelectionTarget(section) {
+function modelSettingsOptimisticTarget(section) {
   const source = section?.source ?? "";
-  const pattern =
-    /return [A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*,([A-Za-z_$][\w$]*),\{model:([A-Za-z_$][\w$]*),reasoningEffort:([A-Za-z_$][\w$]*),serviceTier:([A-Za-z_$][\w$]*)\},\(\)=>[A-Za-z_$][\w$]*\(/gu;
+  const id = "[A-Za-z_$][\\w$]*";
+  const pattern = new RegExp(
+    `(?<selection>${id})=\\{model:(?<model>${id}),reasoningEffort:(?<effort>${id}),` +
+      `serviceTier:(?<serviceTier>[^;}]+)\\};[\\s\\S]{0,400}?` +
+      `(?<store>${id})\\.set\\((?<atom>${id}(?:\\.${id})?),(?<target>${id}),\\k<selection>\\),[\\s\\S]{0,800}?` +
+      `\\.finally\\(\\(\\)=>\\{(?<cleanup>\\k<store>\\.get\\(\\k<atom>,\\k<target>\\)===` +
+      `\\k<selection>&&\\k<store>\\.set\\(\\k<atom>,\\k<target>,null\\))\\}\\)`,
+    "gu",
+  );
   const matches = [...source.matchAll(pattern)];
-  if (matches.length !== 1) return null;
-  const [match, target, model, effort] = matches[0];
-  return {
-    effort,
-    match,
-    model,
-    serviceTier: matches[0][4],
-    target,
-  };
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function chatGptAuthVariable(section) {
   const matches = [
     ...(section?.source ?? "").matchAll(
-      /([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*\?\.authMethod===`chatgpt`/gu,
+      /([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*\?\.authMethod===(["'`])chatgpt\2(?=[,;])/gu,
     ),
   ];
   return matches.length === 1 ? matches[0][1] : null;
@@ -715,11 +1030,10 @@ function existingChatPresetRuntime(presets) {
 function existingChatOptimisticContract(source) {
   const markerCount = source.split(EXISTING_CHAT_OPTIMISTIC_MARKER).length - 1;
   const presetIdsCount = source.split(EXISTING_CHAT_PRESET_IDS_KEY).length - 1;
-  const cleanup = optimisticSelectionCleanupSection(source);
   const modelState = modelSettingsStateSection(source);
   if (markerCount === 0 && presetIdsCount === 0) {
-    if (cleanup == null || modelState == null) return "drifted";
-    return modelSettingsSelectionTarget(modelState) != null &&
+    if (modelState == null) return "drifted";
+    return modelSettingsOptimisticTarget(modelState) != null &&
       chatGptAuthVariable(modelState) != null
       ? "current"
       : "drifted";
@@ -727,9 +1041,8 @@ function existingChatOptimisticContract(source) {
   if (
     markerCount === 2 &&
     presetIdsCount === 2 &&
-    cleanup != null &&
     modelState != null &&
-    cleanup.source.includes(".selection?.codexLinuxKeepOptimisticSelection!==!0") &&
+    modelState.source.includes(".codexLinuxKeepOptimisticSelection!==!0&&") &&
     modelState.source.includes(`&&${EXISTING_CHAT_PRESET_IDS_KEY}.has(`)
   ) {
     return "applied";
@@ -750,51 +1063,31 @@ function applyExistingChatOptimisticPatch(source, context = {}) {
     return source;
   }
 
-  const cleanup = optimisticSelectionCleanupSection(source);
   const modelState = modelSettingsStateSection(source);
-  const cleanupTarget = optimisticSelectionCleanupTarget(cleanup);
-  const selectionTarget = modelSettingsSelectionTarget(modelState);
+  const optimisticTarget = modelSettingsOptimisticTarget(modelState);
   const chatGptAuth = chatGptAuthVariable(modelState);
-  const entry =
-    /^function [A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*,([A-Za-z_$][\w$]*)\)/u.exec(
-      cleanup.source,
-    )?.[1];
-  if (
-    cleanupTarget == null ||
-    selectionTarget == null ||
-    chatGptAuth == null ||
-    entry == null
-  ) {
+  if (optimisticTarget == null || chatGptAuth == null) {
     return source;
   }
 
-  const patchedCleanup = cleanup.source.replace(
-    cleanupTarget[0],
-    `${entry}.selection?.codexLinuxKeepOptimisticSelection!==!0&&${cleanupTarget[0]}/*${EXISTING_CHAT_OPTIMISTIC_MARKER}*/`,
-  );
+  const { groups } = optimisticTarget;
   const patchedModelState = modelState.source.replace(
-    selectionTarget.match,
-    selectionTarget.match.replace(
-      `serviceTier:${selectionTarget.serviceTier}`,
-      `serviceTier:${selectionTarget.serviceTier},codexLinuxKeepOptimisticSelection:${chatGptAuth}&&${selectionTarget.target}[0]===\`conversation\`&&${EXISTING_CHAT_PRESET_IDS_KEY}.has(${selectionTarget.model}+\`:\`+${selectionTarget.effort})/*${EXISTING_CHAT_OPTIMISTIC_MARKER}*/`,
-    ),
+    optimisticTarget[0],
+    optimisticTarget[0]
+      .replace(
+        `serviceTier:${groups.serviceTier}`,
+        `serviceTier:${groups.serviceTier},codexLinuxKeepOptimisticSelection:${chatGptAuth}&&${groups.target}[0]===\`conversation\`&&${EXISTING_CHAT_PRESET_IDS_KEY}.has(${groups.model}+\`:\`+${groups.effort})/*${EXISTING_CHAT_OPTIMISTIC_MARKER}*/`,
+      )
+      .replace(
+        groups.cleanup,
+        `${groups.selection}.codexLinuxKeepOptimisticSelection!==!0&&${groups.cleanup}/*${EXISTING_CHAT_OPTIMISTIC_MARKER}*/`,
+      ),
   );
-  const replacements = [
-    { ...cleanup, source: patchedCleanup },
-    { ...modelState, source: patchedModelState },
-  ].sort((left, right) => right.start - left.start);
-  let patchedSource = source;
-  for (const replacement of replacements) {
-    patchedSource =
-      patchedSource.slice(0, replacement.start) +
-      replacement.source +
-      patchedSource.slice(replacement.end);
-  }
-  const helperIndex = Math.min(cleanup.start, modelState.start);
-  patchedSource =
-    patchedSource.slice(0, helperIndex) +
+  const patchedSource =
+    source.slice(0, modelState.start) +
     existingChatPresetRuntime(presets) +
-    patchedSource.slice(helperIndex);
+    patchedModelState +
+    source.slice(modelState.end);
   if (existingChatOptimisticContract(patchedSource) !== "applied") {
     warn(
       "Could not apply the complete existing-chat optimistic model-selection contract",
@@ -818,60 +1111,31 @@ function applyLocalComposerConfigPatch(source, context = {}) {
     return source;
   }
   const section = localComposerSection(source);
-  const configMatch = /sliderModelsConfig:([A-Za-z_$][\w$]*)/u.exec(section.source);
+  const configMatches = [...section.source.matchAll(LOCAL_COMPOSER_CONFIG_PATTERN)];
+  const configMatch = configMatches.length === 1 ? configMatches[0] : null;
   const fallbackMatches = [...section.source.matchAll(LOCAL_COMPOSER_FALLBACK_PATTERN)];
-  const selectionMatch =
-    /([A-Za-z_$][\w$]*)\?\.selectModelAndReasoningEffort\?\?([A-Za-z_$][\w$]*)/u.exec(
-      section.source,
-    );
-  const resetContextMatch =
-    /resetContextKey:JSON\.stringify\(\[([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\.hostId,\2\.cwd\]\)/u.exec(
-      section.source,
-    );
-  const reactAlias = /\(0,([A-Za-z_$][\w$]*)\.useRef\)\(/u.exec(section.source)?.[1];
+  const selectionMatches = [...section.source.matchAll(LOCAL_COMPOSER_SELECTION_PATTERN)];
+  const resetContext = localComposerResetContext(section);
   if (
     configMatch == null ||
     fallbackMatches.length !== 2 ||
-    selectionMatch == null ||
-    resetContextMatch == null ||
-    reactAlias == null
+    selectionMatches.length !== 1 ||
+    resetContext == null
   ) {
     return source;
   }
-  const configVariable = configMatch[1];
-  const defaultSelectionsVariable = fallbackMatches[1][3];
-  const [selectionExpression, draftSelectionVariable, baseSelectionVariable] = selectionMatch;
-  const [, conversationVariable, hostVariable] = resetContextMatch;
+  const configExpression = `(${configMatch[1]})`;
   let patchedSection = section.source.replace(
     configMatch[0],
-    `sliderModelsConfig:${configVariable}==null?${configVariable}:codexLinuxLocalDefaultPresetConfig`,
-  );
-  const selectionOffset = patchedSection.indexOf(selectionExpression);
-  const selectionDeclaration = new RegExp(
-    `,([A-Za-z_$][\\w$]*)=function\\(([A-Za-z_$][\\w$]*),([A-Za-z_$][\\w$]*)\\)\\{return\\(${escapeRegExp(selectionExpression)}\\)`,
-    "u",
-  );
-  const selectionDeclarationMatch = selectionDeclaration.exec(patchedSection);
-  if (selectionOffset < 0 || selectionDeclarationMatch == null) return source;
-  const [, selectHandlerVariable] = selectionDeclarationMatch;
-  const draftRuntime =
-    `;let codexLinuxLocalDraftDefaultRef=(0,${reactAlias}.useRef)(null),` +
-    `codexLinuxLocalDraftDefaultScope=${conversationVariable}==null?JSON.stringify([${hostVariable}.hostId,${hostVariable}.cwd]):null,` +
-    `codexLinuxLocalDraftDefaultSelection=${configVariable}==null?null:codexLinuxLocalDefaultPresetSelection(${defaultSelectionsVariable}),` +
-    `codexLinuxLocalDraftSelect=(codexLinuxModel,codexLinuxEffort,codexLinuxCallback)=>(${draftSelectionVariable}?.selectModelAndReasoningEffort??${baseSelectionVariable})(codexLinuxModel,codexLinuxEffort,codexLinuxCallback,${configVariable}!=null&&${conversationVariable}==null&&codexLinuxLocalDefaultPresetIds.has(\`${"${codexLinuxModel}:${codexLinuxEffort}"}\`)?{persistAsDefault:!1}:void 0);` +
-    `(0,${reactAlias}.useEffect)(()=>{if(codexLinuxLocalDraftDefaultScope==null){codexLinuxLocalDraftDefaultRef.current=null;return}codexLinuxLocalDraftDefaultSelection==null||codexLinuxLocalDraftDefaultRef.current===codexLinuxLocalDraftDefaultScope||(codexLinuxLocalDraftDefaultRef.current=codexLinuxLocalDraftDefaultScope,codexLinuxLocalDraftSelect(codexLinuxLocalDraftDefaultSelection.model,codexLinuxLocalDraftDefaultSelection.reasoningEffort,()=>{}))},[codexLinuxLocalDraftDefaultScope,codexLinuxLocalDraftDefaultSelection?.id]);` +
-    `let ${selectHandlerVariable}=function`;
-  patchedSection = patchedSection.replace(
-    selectionDeclaration,
-    draftRuntime +
-      selectionDeclarationMatch[0]
-        .slice(selectionDeclarationMatch[0].indexOf("("))
-        .replace(`return(${selectionExpression})`, "codexLinuxLocalDraftDefaultRef.current=codexLinuxLocalDraftDefaultScope;return codexLinuxLocalDraftSelect") +
-      `/*${LOCAL_DRAFT_SELECTION_MARKER}*/`,
+    () =>
+      `sliderModelsConfig:${configExpression}==null?${configExpression}:codexLinuxLocalDefaultPresetConfig`,
   );
   patchedSection = patchedSection.replace(
     LOCAL_COMPOSER_FALLBACK_PATTERN,
-    `$1=$2($3,codexLinuxLocalDefaultPresetFallback(${configVariable}!=null,$3,$4==null?void 0:\`${"${$4.model}:${$4.defaultReasoningEffort}"}\`))`,
+    (_match, result, resolver, selections, upstreamDefault) =>
+      `${result}=${resolver}(${selections},codexLinuxLocalDefaultPresetFallback(` +
+      `${configExpression}!=null,${selections},null==${upstreamDefault}?void 0:` +
+      `\`\${${upstreamDefault}.model}:\${${upstreamDefault}.defaultReasoningEffort}\`))`,
   );
   const patchedSource =
     source.slice(0, section.start) +
@@ -899,11 +1163,35 @@ function sliderAssetMatch(source, _assetName, context = {}) {
 
 const descriptors = [
   {
+    id: "model-picker-default-presets-upstream-default-selection",
+    phase: "webview-asset",
+    order: 20_797,
+    ciPolicy: "optional",
+    assetNeedles: ["includeSyntheticDefault:", "paidModelFallbackEnabled:", ".sliderSettings?.length?"],
+    enabled: (context = {}) => normalizePresets(context).length > 0,
+    assetMatch: upstreamDefaultSelectionAssetMatch,
+    missingDescription: "upstream merged model picker Default-selection bundle",
+    skipDescription: "model picker upstream Default-selection compatibility audit",
+    apply: (source) => source,
+  },
+  {
+    id: "model-picker-default-presets-upstream-reset-effect",
+    phase: "webview-asset",
+    order: 20_797.5,
+    ciPolicy: "optional",
+    assetNeedles: ["resetContextKey:", "selectedPowerSelectionWithXHigh:", "fallbackPowerSelection:", "onReset:"],
+    enabled: (context = {}) => normalizePresets(context).length > 0,
+    assetMatch: upstreamResetEffectAssetMatch,
+    missingDescription: "upstream model picker reset-effect bundle",
+    skipDescription: "model picker upstream reset-effect compatibility audit",
+    apply: (source) => source,
+  },
+  {
     id: "model-picker-default-presets-catalog",
     phase: "webview-asset",
     order: 20_798,
     ciPolicy: "optional",
-    pattern: JS_ASSET_PATTERN,
+    assetNeedles: [".slider_settings.flatMap(", "workspaceModelPolicy"],
     assetMatch: catalogAssetMatch,
     missingDescription: "ChatGPT model catalog normalizer bundle",
     skipDescription: "model picker Default catalog patch",
@@ -918,7 +1206,7 @@ const descriptors = [
     phase: "webview-asset",
     order: 20_799,
     ciPolicy: "optional",
-    pattern: JS_ASSET_PATTERN,
+    assetNeedles: ["show_xhigh_in_simple_picker", "powerSelectionsWithXHigh"],
     enabled: (context = {}) => normalizePresets(context).length > 0,
     assetMatch: sliderAssetMatch,
     missingDescription: "ChatGPT model picker slider resolver bundle",
@@ -930,7 +1218,7 @@ const descriptors = [
     phase: "webview-asset",
     order: 20_800,
     ciPolicy: "optional",
-    pattern: JS_ASSET_PATTERN,
+    assetNeedles: ["removeXHigh:", "sliderModelsConfig:", "stripGptPrefix:"],
     enabled: (context = {}) => normalizePresets(context).length > 0,
     assetMatch: (source) => localComposerResolverContract(source) !== "drifted",
     missingDescription: "local composer slider config resolver bundle",
@@ -942,9 +1230,12 @@ const descriptors = [
     phase: "webview-asset",
     order: 20_801,
     ciPolicy: "optional",
-    pattern: JS_ASSET_PATTERN,
+    assetNeedles: [
+      "No conversation available for next-turn model update",
+      "setModelAndReasoningEffortForNextTurn:",
+      "hasManagedNewThreadSettings:",
+    ],
     enabled: (context = {}) => normalizePresets(context).length > 0,
-    assetMatch: (source) => existingChatOptimisticContract(source) !== "drifted",
     missingDescription: "existing-chat model settings state bundle",
     skipDescription: "model picker Default existing-chat selection patch",
     apply: applyExistingChatOptimisticPatch,
@@ -954,7 +1245,12 @@ const descriptors = [
     phase: "webview-asset",
     order: 20_802,
     ciPolicy: "optional",
-    pattern: JS_ASSET_PATTERN,
+    assetNeedles: [
+      "composer.mode.local.model.custom",
+      "sliderModelsConfig:",
+      "setDefaultModelAndReasoningEffort",
+      "modelsForPicker(",
+    ],
     enabled: (context = {}) => normalizePresets(context).length > 0,
     assetMatch: (source) => localComposerConfigContract(source) !== "drifted",
     missingDescription: "local composer model picker bundle",
@@ -970,10 +1266,8 @@ module.exports = {
   EXISTING_CHAT_OPTIMISTIC_MARKER,
   LOCAL_COMPOSER_CONFIG_MARKER,
   LOCAL_COMPOSER_RESOLVER_MARKER,
-  LOCAL_DRAFT_SELECTION_MARKER,
   LOCAL_DEFAULT_PATCH_MARKER,
   THINKING_EFFORT_TO_EFFORT,
-  JS_ASSET_PATTERN,
   SLIDER_PATCH_MARKER,
   applyCatalogPatch,
   applyExistingChatOptimisticPatch,
@@ -991,4 +1285,8 @@ module.exports = {
   localComposerResolverContract,
   sliderAssetMatch,
   sliderPatchContract,
+  upstreamDefaultSelectionAssetMatch,
+  upstreamDefaultSelectionContract,
+  upstreamResetEffectAssetMatch,
+  upstreamResetEffectContract,
 };

@@ -7,12 +7,16 @@ const {
   applyLinuxComputerUseAvatarCursorBridgePatch,
   applyLinuxComputerUseFeaturePatch,
   applyLinuxComputerUseHostPlatformPatch,
-  applyLinuxNativeDesktopAppsHandlerPatch,
   matchesLinuxComputerUseHostPlatformContract,
 } = require("../../scripts/patches/impl/computer-use.js");
 
-const { applyNativeSettingsAvailabilityPatch, applyNativeSettingsVisibilityPatch } = require("./settings.js");
+const {
+  NATIVE_SETTINGS_VISIBILITY_NEEDLES,
+  applyNativeSettingsAvailabilityPatch,
+  applyNativeSettingsVisibilityPatch,
+} = require("./settings.js");
 const { applyUnifiedComputerUsePatch } = require("./unified.js");
+const { applyNativeApplicationsPatch } = require("./native-applications.js");
 
 module.exports = [
   mainBundlePatch({
@@ -42,18 +46,17 @@ module.exports = [
     apply: applyLinuxComputerUsePluginGatePatch,
   }),
   mainBundlePatch({
-    id: "native-desktop-apps",
-    phase: "main-bundle",
+    id: "native-applications",
     order: 20_130,
-    ciPolicy: "optional",
-    apply: applyLinuxNativeDesktopAppsHandlerPatch,
+    apply: applyNativeApplicationsPatch,
   }),
   webviewAssetPatch({
     id: "ui-availability",
     phase: "webview-asset",
     order: 20_140,
     ciPolicy: "optional",
-    pattern: /^computer-use-settings-[^.]+\.js$/,
+    // The Settings → Computer use page owner.
+    assetNeedles: ["settings.computerUse.subtitle", "computerUseAvailability:"],
     missingDescription: "Computer Use availability bundle",
     skipDescription: "Linux Computer Use UI availability patch",
     apply: applyNativeSettingsAvailabilityPatch,
@@ -63,17 +66,20 @@ module.exports = [
     phase: "webview-asset",
     order: 20_150,
     ciPolicy: "optional",
-    pattern: /^app-initial-[^.]+\.js$/,
+    assetNeedles: ['featureName:"computer_use"', "isHostCompatiblePlatform:"],
     assetMatch: matchesLinuxComputerUseHostPlatformContract,
-    missingDescription: "current Computer Use host-platform app-initial contract",
+    missingDescription: "current Computer Use host-platform contract",
     skipDescription: "Linux Computer Use host-platform patch",
     apply: applyLinuxComputerUseHostPlatformPatch,
   }),
   webviewAssetPatch({
     id: "native-settings-visibility",
     order: 20_160,
-    pattern: /^app-primary-[^.]+\.js$/,
+    // rspack duplicates the Plugins presentation module into several lazy
+    // chunks; every copy must hide the native component, so no assetMatch.
+    assetNeedles: NATIVE_SETTINGS_VISIBILITY_NEEDLES,
     missingDescription: "Plugins presentation filter",
+    skipDescription: "Linux native Settings visibility patch",
     apply: applyNativeSettingsVisibilityPatch,
   }),
 ];

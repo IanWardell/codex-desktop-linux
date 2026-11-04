@@ -6,37 +6,59 @@ const path = require("node:path");
 const {
   extractedAppPatch,
 } = require("../../scripts/patches/descriptor.js");
+const {
+  findMainProcessChunks,
+  listWebviewScriptAssets,
+} = require("../../scripts/patches/lib/assets.js");
 
 const CODEX_MICRO_GATE_ID = "3207467860";
 const CODEX_MICRO_ROUTE = "/settings/codex-micro";
 const CODEX_MICRO_GATE_MARKER = "codexLinuxCodexMicroGateOverride";
 const CODEX_MICRO_HOTPLUG_MARKER = "codexLinuxCodexMicroHotplug";
 const JS_IDENT = "[A-Za-z_$][\\w$]*";
-const CODEX_MICRO_SERVICE_PATTERN =
-  /^service-[A-Za-z0-9_-]+\.js$/;
+// Each contract names one upstream module that reads the Codex Micro gate.
+// rspack may emit the same module into more than one lazily loaded chunk, so a
+// contract may own several byte-different copies; every copy is patched.
 const CODEX_MICRO_GATE_CONTRACTS = [
   {
-    description: "Codex Micro app-shell gates",
-    gateCount: 5,
+    description: "Codex Micro app-shell onboarding gates",
+    gateCount: 2,
+    routeCount: 0,
+    anchor: (source) =>
+      source.includes('"codex-micro-onboarding"')
+      && source.includes("appServices.codexMicro"),
+  },
+  {
+    description: "Codex Micro sidebar settings entry gate",
+    gateCount: 1,
     routeCount: 2,
     anchor: (source) =>
-      source.includes("codex-micro-onboarding-host-")
-      && source.includes("codex-micro-bridge-"),
+      source.includes(`"${CODEX_MICRO_ROUTE}"`)
+      && source.includes("codexMicro"),
+  },
+  {
+    description: "Codex Micro dictation gate",
+    gateCount: 1,
+    routeCount: 0,
+    anchor: (source) =>
+      source.includes("onDictationTranscriptInsert")
+      && source.includes("dictationSoundsEnabled"),
+  },
+  {
+    description: "Codex Micro composer gate",
+    gateCount: 1,
+    routeCount: 0,
+    anchor: (source) =>
+      source.includes('surface:"composer"')
+      && source.includes("effectiveMode:"),
   },
   {
     description: "Codex Micro settings-visibility gate",
     gateCount: 1,
     routeCount: 0,
     anchor: (source) =>
-      source.includes("case`codex-micro`:return")
+      source.includes('case"codex-micro":return')
       && source.includes('"codex-micro":'),
-  },
-  {
-    description: "Codex Micro debug-panel gate",
-    gateCount: 1,
-    routeCount: 0,
-    anchor: (source) =>
-      source.includes("codexMicro.onboarding.debugStatus"),
   },
 ];
 const WATCH_TOPOLOGY_FUNCTION = new RegExp(
@@ -54,13 +76,14 @@ function codexMicroFeatureGateContract(source, expected) {
     return null;
   }
 
-  const routeLiteral = `\`${CODEX_MICRO_ROUTE}\``;
+  const routeLiteral = `"${CODEX_MICRO_ROUTE}"`;
   if (occurrenceCount(source, routeLiteral) !== expected.routeCount) {
     return null;
   }
 
+  // rspack/SWC shape: `(0,n.Zj)("3207467860")`.
   const directGate = new RegExp(
-    `(^|[^A-Za-z0-9_$.])(${JS_IDENT})\\(\`${CODEX_MICRO_GATE_ID}\`\\)`,
+    `(^|[^A-Za-z0-9_$.])\\(0,${JS_IDENT}\\.${JS_IDENT}\\)\\("${CODEX_MICRO_GATE_ID}"\\)`,
     "g",
   );
   const patchedGate = new RegExp(
@@ -109,7 +132,8 @@ function applyCodexMicroFeatureGatePatch(source, expected) {
   }
   if (
     typeof source === "string"
-    && source.includes(`\`${CODEX_MICRO_ROUTE}\``)
+    && (source.includes(CODEX_MICRO_GATE_ID)
+      || source.includes(CODEX_MICRO_GATE_MARKER))
   ) {
     console.warn(
       "WARN: Current Codex Micro feature-gate contract is incomplete or drifted - " +
@@ -128,12 +152,13 @@ function findCodexMicroFeatureGateAssets(extractedDir) {
     };
   }
 
-  const candidates = fs.readdirSync(assetsDir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
-    .map((entry) => {
-      const assetPath = path.join(assetsDir, entry.name);
+  // rspack splits the renderer into thousands of lazily loaded chunks whose
+  // names carry no meaning; read each script once and keep gate owners only.
+  const candidates = listWebviewScriptAssets(extractedDir)
+    .map((assetName) => {
+      const assetPath = path.join(assetsDir, assetName);
       return {
-        assetName: entry.name,
+        assetName,
         assetPath,
         source: fs.readFileSync(assetPath, "utf8"),
       };
@@ -144,37 +169,38 @@ function findCodexMicroFeatureGateAssets(extractedDir) {
     );
 
   const matches = [];
-  for (const expected of CODEX_MICRO_GATE_CONTRACTS) {
-    const contractMatches = candidates
-      .filter(({ source }) => expected.anchor(source))
-      .map((candidate) => ({
-        ...candidate,
-        contract: codexMicroFeatureGateContract(candidate.source, expected),
-        expected,
-      }))
-      .filter(({ contract }) => contract != null);
-    if (contractMatches.length !== 1) {
+  for (const candidate of candidates) {
+    const owners = CODEX_MICRO_GATE_CONTRACTS
+      .filter((expected) => expected.anchor(candidate.source));
+    if (owners.length !== 1) {
       return {
         matches: null,
         reason:
-          `Found ${contractMatches.length} current ${expected.description} bundles`,
+          `Codex Micro feature-gate bundle ${candidate.assetName} matches ` +
+          `${owners.length} semantic contracts`,
       };
     }
-    matches.push(contractMatches[0]);
+    const [expected] = owners;
+    const contract = codexMicroFeatureGateContract(candidate.source, expected);
+    if (contract == null) {
+      return {
+        matches: null,
+        reason:
+          `Codex Micro feature-gate bundle ${candidate.assetName} drifted from ` +
+          `the current ${expected.description} contract`,
+      };
+    }
+    matches.push({ ...candidate, contract, expected });
   }
 
-  if (new Set(matches.map(({ assetName }) => assetName)).size !== matches.length) {
-    return {
-      matches: null,
-      reason: "Current Codex Micro feature-gate contracts overlap",
-    };
-  }
-  if (candidates.length !== matches.length) {
-    return {
-      matches: null,
-      reason:
-        `Found ${candidates.length} Codex Micro feature-gate bundles; expected ${matches.length}`,
-    };
+  for (const expected of CODEX_MICRO_GATE_CONTRACTS) {
+    const count = matches.filter((match) => match.expected === expected).length;
+    if (count === 0) {
+      return {
+        matches: null,
+        reason: `Found 0 current ${expected.description} bundles`,
+      };
+    }
   }
 
   const states = new Set(matches.map(({ contract }) => contract.state));
@@ -313,21 +339,19 @@ function applyCodexMicroHotplugPatch(source) {
 }
 
 function findCodexMicroServiceBundle(extractedDir) {
-  const buildDir = path.join(extractedDir, ".vite", "build");
-  if (!fs.existsSync(buildDir)) {
+  // The rspack main process lazily loads the CodexMicroService module from one
+  // of the numbered early-bootstrap chunks; search every chunk semantically.
+  const mainProcess = findMainProcessChunks(extractedDir);
+  if (mainProcess == null) {
     return {
       target: null,
       result: null,
-      reason: ".vite/build directory not found",
+      reason: "main-process early-bootstrap chunks not found",
     };
   }
 
-  const candidates = fs.readdirSync(buildDir, { withFileTypes: true })
-    .filter((entry) =>
-      entry.isFile() && CODEX_MICRO_SERVICE_PATTERN.test(entry.name),
-    )
-    .map((entry) => path.join(buildDir, entry.name))
-    .sort()
+  const candidates = mainProcess.chunks
+    .map((name) => path.join(mainProcess.buildDir, name))
     .map((bundlePath) => {
       const source = fs.readFileSync(bundlePath, "utf8");
       return {
@@ -393,7 +417,7 @@ module.exports = {
       phase: "extracted-app:pre-webview",
       order: 28_980,
       ciPolicy: "opt-in",
-      targetSummary: "current Codex Micro main-process service bundle",
+      targetSummary: "current Codex Micro main-process service chunk",
       apply: patchCodexMicroService,
       status: (result, warnings) => {
         if (result?.matched !== 1) {

@@ -17,6 +17,16 @@ PATH` byte tunnel and its existing WebSocket transport. Other local clients use
 the same stock proxy command to attach to the Unix socket and receive the normal
 WebSocket `/rpc` byte stream. Closing Desktop stops the authority.
 
+Only the host whose ID is `local` uses the shared authority. The upstream
+`durable` cloud host also has local kind metadata, but retains its own transport
+and never tries to claim this socket.
+
+The bundled CLI may publish the requested socket as a symlink to a private
+socket directory. Startup, attached CLI verification, and orphan cleanup
+validate the alias and its target, including ownership, directory permissions,
+and listener identity. Cleanup removes only the owned alias; the CLI owns the
+target socket. Unsafe targets and replaced aliases fail closed.
+
 The feature preserves the configuration overrides supplied by the official
 local transport. It forwards each opaque override as an ordered `-c` argument
 before the `app-server` subcommand when it starts the shared authority. It does
@@ -168,3 +178,14 @@ adapter, configuration-override callback, and `app-server proxy` command. The
 descriptor leaves an unknown bundle byte-identical and reports a warning. When
 the feature is enabled, candidate acceptance treats that warning as a failure
 and rejects the build instead of installing a partial patch.
+
+## Catalog subfeatures
+
+The community feature catalog lists these user-facing capabilities separately:
+
+- **Shared app-server authority** (`shared-authority`): Let ordinary app-server clients attach to Desktop's existing authority through its private Unix socket.
+- **Attached CLI** (`attached-cli`): Provide codex-desktop --cli for CLI commands attached to the running Desktop authority.
+
+These declarations use `enabledWhen: "parent"`: all are included whenever this
+feature is built. They add no independent configuration switches and do not
+report runtime activation, permissions, external dependencies or backend health.

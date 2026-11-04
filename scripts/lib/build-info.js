@@ -182,6 +182,16 @@ function packageProfile(target) {
   const ids = new Set([id, ...target.distro.idLike]);
   const versionMajor = target.distro.versionMajor;
 
+  if (ids.has("gentoo")) {
+    return {
+      id: "gentoo",
+      label: "Gentoo / Portage",
+      packageManager: "emerge",
+      format: "local ebuild",
+      notes: "Portage-managed prebuilt payload; manual updates with make bootstrap-native",
+    };
+  }
+
   if (ids.has("nixos") || ids.has("nix")) {
     return {
       id: "nix",
@@ -290,6 +300,7 @@ function buildInfo(options) {
       fileName: path.basename(packagePath),
       sizeBytes: fs.statSync(packagePath).size,
       sha256: sha256File(packagePath),
+      signatureVerification: metadata.signatureVerification ?? "unknown",
     },
     source: sourceInfo(repoDir, env),
     linuxTarget: linuxTargetInfo(target),

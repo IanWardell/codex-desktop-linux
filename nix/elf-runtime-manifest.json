@@ -3,8 +3,8 @@
   "architectures": {
     "amd64": {
       "machine": 62,
-      "targetInventoryCount": 38,
-      "targetInventorySha256": "6bd80f08aef5ceb20292fc07e5a11ddcc3101a7c15f866ada257571ea9fc5c32",
+      "targetInventoryCount": 36,
+      "targetInventorySha256": "8f40b0826005d6343c8024709fdc119349292e9d62e897d9662f7e3c18f56c33",
       "requiredDynamicExecutables": [
         "ChatGPT",
         "browser_crashpad_handler",
@@ -17,13 +17,13 @@
       "interpreterStrategies": {
         "ChatGPT": "relocate-within-detect-libc-range",
         "resources/cua_node/bin/node": "patchelf-rpath-first",
-        "resources/cua_node/lib/node_modules/@img/sharp-libvips-linux-x64/lib/libvips-cpp.so.8.18.6": "preserve-upstream"
+        "resources/cua_node/lib/node_modules/@img/sharp-libvips-linux-x64/lib/libvips-cpp.so.8.18.7": "preserve-upstream"
       }
     },
     "arm64": {
       "machine": 183,
-      "targetInventoryCount": 36,
-      "targetInventorySha256": "1821bd798e8939d05bf4593f819f88457c2f7213e98216b3bece3d073e8df59e",
+      "targetInventoryCount": 34,
+      "targetInventorySha256": "b8cf088324a3088f7946104b332793a9285a3d91485ab00e736275b907e362de",
       "requiredDynamicExecutables": [
         "ChatGPT",
         "browser_crashpad_handler",
@@ -40,6 +40,7 @@
     }
   },
   "forbiddenPaths": [
-    "chrome_crashpad_handler"
+    "chrome_crashpad_handler",
+    "resources/plugins/openai-bundled/plugins/latex/bin/tectonic"
   ]
 }

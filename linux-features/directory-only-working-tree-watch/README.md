@@ -17,19 +17,24 @@ coverage.
 
 ## Current OpenAI working-tree route
 
-OpenAI Desktop `26.901.20858` has a Linux-specific Parcel working-tree path in
-the official Linux package. That path calls `@parcel/watcher` directly instead of
+The current signed OpenAI Desktop package has a Linux-specific Parcel
+working-tree path. That path calls `@parcel/watcher` directly instead of
 the local `startFileWatch()` method this feature intercepts. The current route
-also forwards the caller's Git-ignore paths. When this feature
+also forwards the caller's Git-ignore paths; the current Git dependency exposes
+its ignore sources lazily (`getWatchIgnoreSources`) with
+`pruneIgnoredDirectories` enabled, so the repo watcher restarts the
+working-tree session when its pruned directory set changes. Every restart
+re-enters this feature's adapter, which recomputes its own Git exclusions;
+the forwarded paths are used only by the preserved Parcel fallback. When this feature
 is selected, its current-package patch reroutes that one local recursive
 working-tree request through `startFileWatch()`, where the exact recursive
 working-tree contract enters Watchbound. Remote watches and non-working-tree
 file watches retain their existing routes.
 
-Both Parcel references originate in the upstream app: `.vite/build/worker.js`
-contains the sole dynamic ``await import(`@parcel/watcher`)``, and the extracted
-app's `package.json` declares `"@parcel/watcher": "2.5.6"`. This feature adds
-neither reference. Qualified roots do not run Parcel; the preserved helper is
+Both Parcel references originate in the upstream app: the rspack worker build
+`.vite/build/worker.js` lazily loads its sole `require("@parcel/watcher")`
+external module, and the extracted app's `package.json` declares
+`"@parcel/watcher": "2.5.6"`. This feature adds neither reference. Qualified roots do not run Parcel; the preserved helper is
 invoked only when Watchbound cannot safely qualify the root.
 
 The Parcel route and the Watchbound adapter are alternative owners of the same
@@ -38,7 +43,8 @@ Watchbound. A permanently unqualified root uses the preserved upstream Parcel
 helper, while unknown qualification evidence is retried with bounded
 exponential backoff before taking that fallback. This feature requires exactly
 one raw Parcel route or one completed Watchbound route marker in the current
-`worker.js`. Missing, duplicate, or misplaced routes report enabled feature
+`worker.js`, plus exactly one local host in a numbered rspack main-process
+chunk (`early-bootstrap-<n>-<hash>.js`). Missing, duplicate, or misplaced routes report enabled feature
 drift and leave both current app bundles byte-identical rather than accepting
 an injected helper that the active call path bypasses.
 
@@ -99,7 +105,7 @@ interpreter, and runs the already-open descriptor as `/proc/self/fd/3
 admission snapshot and the public capability layer consumes the same evidence.
 The downstream report shim from #1336 is therefore removed; import refusal
 still degrades to the preserved Parcel route (worker) or original local watch
-(src bundle) instead of crashing.
+(bootstrap companion bundle) instead of crashing.
 
 The Nix `PT_INTERP` relocation from #1332 remains necessary for upstream
 `@parcel/watcher`, which still owns the disabled-feature and unqualified-root
@@ -107,10 +113,15 @@ fallback routes. Watchbound itself accepts the relocated interpreter without
 a consumer-side compatibility path.
 
 Build-time runtime qualification does not execute the upstream Electron
-binary. The extracted app's pinned Electron dependency must match the exact
-Electron version in the checked-in Watchbound artifact manifest, and an
-explicit target Node version must satisfy Watchbound's published `>=18.15.0`
-range. A mismatch rejects this enabled feature before package materialization.
+binary. When the extracted app declares an Electron dependency, its exact
+version must match the checked-in Watchbound artifact manifest. If that
+dependency metadata is absent, the package helper instead scans the official
+`ChatGPT` executable from the verified payload for Node's release URL anchor
+(`node.js/v<version>`). Exactly one anchor must exist, and its observed version
+must satisfy Watchbound's published `>=18.15.0` range. Missing or ambiguous
+runtime evidence, conflicting Electron declarations, or a mismatch with an
+explicit target Node version rejects this enabled feature before package
+materialization. The executable is read as data and is never run.
 
 Nix builds do not run npm or perform unpinned registry resolution. The flake
 pins Watchbound's `v2.1.2` source commit and archive digest, builds the selected

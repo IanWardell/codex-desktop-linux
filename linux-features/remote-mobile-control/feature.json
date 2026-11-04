@@ -3,8 +3,35 @@
   "title": "Experimental Remote Mobile Control",
   "description": "Opt-in Linux adaptation for experimental Remote host and outbound-control flows.",
   "defaultEnabled": false,
+  "gentoo": {
+    "supported": true,
+    "dependencies": {
+      "RDEPEND": ["sys-apps/util-linux"]
+    }
+  },
+  "catalogSubfeatures": [
+    {
+      "id": "mobile-host",
+      "title": "Mobile Remote host",
+      "description": "Adapt this Linux installation for experimental mobile Remote hosting, subject to account and pairing requirements.",
+      "enabledWhen": "parent"
+    },
+    {
+      "id": "outbound-control",
+      "title": "Control other devices",
+      "description": "Expose outbound Remote enrollment and connection discovery without bypassing account authorization.",
+      "enabledWhen": "parent"
+    }
+  ],
   "entrypoints": {
     "patchDescriptors": "./patch.js",
     "stageHook": "./stage.sh"
-  }
+  },
+  "resources": [
+    {
+      "source": "cold-start-hook.sh",
+      "target": ".codex-linux/cold-start.d/remote-mobile-control",
+      "mode": "0755"
+    }
+  ]
 }

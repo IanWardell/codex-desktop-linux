@@ -4,25 +4,29 @@ use cosmic_protocols::{
     toplevel_management::v1::client::zcosmic_toplevel_manager_v1,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::{HashMap, HashSet};
+use std::os::unix::io::{AsFd, AsRawFd};
+use std::time::{Duration, Instant};
 use wayland_client::{
     event_created_child,
     globals::{registry_queue_init, GlobalListContents},
-    protocol::{wl_registry, wl_seat},
+    protocol::{wl_output, wl_registry, wl_seat},
     Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1, ext_foreign_toplevel_list_v1,
 };
+use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_wlr::output_management::v1::client::{
     zwlr_output_head_v1, zwlr_output_manager_v1, zwlr_output_mode_v1,
 };
 
 const HELP: &str = "codex-computer-use-cosmic\n\nUsage:\n  codex-computer-use-cosmic probe\n  codex-computer-use-cosmic list-windows\n  codex-computer-use-cosmic focused-window\n  codex-computer-use-cosmic monitor-layout\n  codex-computer-use-cosmic activate-window --window-id <id>";
 const BACKEND: &str = "cosmic-wayland";
-const ACTIVATION_STATE_TTL: Duration = Duration::from_secs(5);
+/// Bounded waits keep the helper inside the main crate's 2s command timeout:
+/// ~0.8s for initial cosmic state + ~0.8s for post-activation verification.
+const INIT_STATE_TIMEOUT: Duration = Duration::from_millis(800);
+const ACTIVATE_VERIFY_TIMEOUT: Duration = Duration::from_millis(800);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WindowInfo {
@@ -39,7 +43,7 @@ struct WindowInfo {
     backend: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WindowBounds {
     x: Option<i32>,
     y: Option<i32>,
@@ -59,12 +63,6 @@ struct ProbeOutput {
 struct ActivationOutput {
     ok: bool,
     detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ActivationState {
-    window_id: u64,
-    timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -101,10 +99,12 @@ struct ToplevelRecord {
     app_id: Option<String>,
     focused: bool,
     hidden: bool,
+    geometries: HashMap<u32, WindowBounds>,
 }
 
 impl ToplevelRecord {
-    fn to_window(&self) -> Option<WindowInfo> {
+    fn to_window(&self, outputs: &HashMap<u32, OutputPosition>) -> Option<WindowInfo> {
+        self.foreign.as_ref()?;
         let identifier = self.identifier.as_deref()?;
         Some(WindowInfo {
             window_id: stable_window_id(identifier),
@@ -112,7 +112,7 @@ impl ToplevelRecord {
             app_id: self.app_id.clone().filter(|value| !value.trim().is_empty()),
             wm_class: None,
             pid: None,
-            bounds: None,
+            bounds: global_window_bounds(&self.geometries, outputs),
             workspace: None,
             focused: self.focused,
             hidden: self.hidden,
@@ -120,6 +120,40 @@ impl ToplevelRecord {
             backend: BACKEND.to_string(),
         })
     }
+}
+
+#[derive(Debug, Default)]
+struct OutputPosition {
+    // wl_output geometry is not a logical coordinate contract. Only xdg-output
+    // logical_position can translate COSMIC's output-relative window geometry.
+    logical: Option<(i32, i32)>,
+    done: bool,
+}
+
+fn global_window_bounds(
+    geometries: &HashMap<u32, WindowBounds>,
+    outputs: &HashMap<u32, OutputPosition>,
+) -> Option<WindowBounds> {
+    let mut bounds = None;
+    for (output_id, relative) in geometries {
+        let Some(output) = outputs.get(output_id).filter(|output| output.done) else {
+            continue;
+        };
+        let Some((x, y)) = output.logical else {
+            continue;
+        };
+        let global = WindowBounds {
+            x: Some(x.checked_add(relative.x?)?),
+            y: Some(y.checked_add(relative.y?)?),
+            width: relative.width,
+            height: relative.height,
+        };
+        if bounds.as_ref().is_some_and(|bounds| bounds != &global) {
+            return None;
+        }
+        bounds = Some(global);
+    }
+    bounds
 }
 
 #[derive(Default)]
@@ -132,9 +166,17 @@ struct AppData {
     records: Vec<ToplevelRecord>,
     by_foreign_id: HashMap<u32, usize>,
     by_cosmic_id: HashMap<u32, usize>,
+    /// Cosmic protocol ids that have delivered at least one initial `State`
+    /// event. cosmic-comp answers `get_cosmic_toplevel` asynchronously, so a
+    /// fixed number of roundtrips can finish before the state arrives and the
+    /// snapshot would report every window as unfocused.
+    cosmic_state_seen: HashSet<u32>,
     output_manager: Option<zwlr_output_manager_v1::ZwlrOutputManagerV1>,
     output_layout_ready: bool,
     output_manager_finished: bool,
+    xdg_output_manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
+    outputs: HashMap<u32, OutputPosition>,
+    toplevel_done: bool,
     output_heads: HashMap<u32, OutputHeadState>,
     output_modes: HashMap<u32, OutputModeState>,
 }
@@ -216,29 +258,11 @@ fn collect_windows() -> Result<Vec<WindowInfo>> {
 }
 
 fn focused_window() -> Result<Option<WindowInfo>> {
-    let snapshot = Snapshot::collect()?;
-    if let Some(window) = snapshot.windows().into_iter().find(|window| window.focused) {
-        clear_activation_state();
-        return Ok(Some(window));
-    }
+    Ok(protocol_focused_window(Snapshot::collect()?.windows()))
+}
 
-    let Some(state) = read_activation_state() else {
-        return Ok(None);
-    };
-
-    if state_is_stale(&state) {
-        clear_activation_state();
-        return Ok(None);
-    }
-
-    let mut window = snapshot
-        .windows()
-        .into_iter()
-        .find(|window| window.window_id == state.window_id);
-    if let Some(window) = window.as_mut() {
-        window.focused = true;
-    }
-    Ok(window)
+fn protocol_focused_window(windows: Vec<WindowInfo>) -> Option<WindowInfo> {
+    windows.into_iter().find(|window| window.focused)
 }
 
 fn monitor_layout() -> Result<Vec<MonitorInfo>> {
@@ -247,11 +271,16 @@ fn monitor_layout() -> Result<Vec<MonitorInfo>> {
 
 fn activate_window(window_id: u64) -> Result<ActivationOutput> {
     let mut snapshot = Snapshot::collect()?;
-    snapshot.activate(window_id)?;
-    write_activation_state(window_id)?;
+    let verified = snapshot.activate(window_id)?;
     Ok(ActivationOutput {
-        ok: true,
-        detail: format!("Requested COSMIC activation for window_id {window_id}."),
+        ok: verified,
+        detail: if verified {
+            format!("COSMIC activation verified focused for window_id {window_id}.")
+        } else {
+            format!(
+                "Requested COSMIC activation for window_id {window_id}, but focus was not observed before the verification deadline."
+            )
+        },
     })
 }
 
@@ -279,8 +308,26 @@ impl Snapshot {
         snapshot.app_data.output_manager = globals
             .bind::<zwlr_output_manager_v1::ZwlrOutputManagerV1, _, _>(&qh, 1..=4, ())
             .ok();
+        snapshot.app_data.xdg_output_manager = globals
+            .bind::<zxdg_output_manager_v1::ZxdgOutputManagerV1, _, _>(&qh, 1..=3, ())
+            .ok();
         globals.contents().with_list(|entries| {
             for global in entries {
+                if global.interface == "wl_output" {
+                    let output = globals.registry().bind::<wl_output::WlOutput, _, _>(
+                        global.name,
+                        global.version.min(4),
+                        &qh,
+                        (),
+                    );
+                    snapshot
+                        .app_data
+                        .outputs
+                        .insert(output.id().protocol_id(), OutputPosition::default());
+                    if let Some(manager) = snapshot.app_data.xdg_output_manager.as_ref() {
+                        manager.get_xdg_output(&output, &qh, output.id().protocol_id());
+                    }
+                }
                 if global.interface == "wl_seat" {
                     snapshot
                         .app_data
@@ -313,14 +360,104 @@ impl Snapshot {
                 .roundtrip(&mut self.app_data)
                 .context("Wayland roundtrip failed")?;
         }
+        // `get_cosmic_toplevel` handles are answered asynchronously: the
+        // roundtrips above can complete before cosmic-comp delivers the
+        // initial `State` events. Wait (bounded) for every known cosmic
+        // handle to report state so `focused` reflects the compositor.
+        let ready = self.wait_for_condition(INIT_STATE_TIMEOUT, |app_data| {
+            (app_data
+                .records
+                .iter()
+                .all(|record| record.foreign.is_none())
+                || app_data
+                    .toplevel_info
+                    .as_ref()
+                    .is_none_or(|info| info.version() < 2)
+                || app_data.toplevel_done)
+                // xdg-output and COSMIC use independent atomic batches. A
+                // toplevel done does not mean its output origin has arrived.
+                && (app_data.xdg_output_manager.is_none()
+                    || app_data.records.iter().filter(|record| record.foreign.is_some())
+                        .flat_map(|record| record.geometries.keys())
+                        .all(|output_id| app_data.outputs.get(output_id)
+                            .is_some_and(|output| output.logical.is_some() && output.done)))
+                && app_data.records.iter().all(|record| {
+                    record.foreign.is_none()
+                        || (record.identifier.is_some()
+                            && (record.cosmic.is_none()
+                                || record.cosmic.as_ref().is_some_and(|handle| {
+                                    app_data
+                                        .cosmic_state_seen
+                                        .contains(&handle.id().protocol_id())
+                                })))
+                })
+        })?;
+        if !ready {
+            bail!("COSMIC initial toplevel state did not arrive before the snapshot deadline");
+        }
         Ok(())
+    }
+
+    /// Dispatch Wayland events until `condition` holds or `budget` expires.
+    /// Uses `poll(2)` on the queue fd so a silent compositor cannot hang us;
+    /// returns `Ok(true)` when the condition held before the deadline.
+    fn wait_for_condition(
+        &mut self,
+        budget: Duration,
+        mut condition: impl FnMut(&AppData) -> bool,
+    ) -> Result<bool> {
+        let deadline = Instant::now() + budget;
+        loop {
+            self.event_queue
+                .dispatch_pending(&mut self.app_data)
+                .context("Wayland dispatch failed")?;
+            if condition(&self.app_data) {
+                return Ok(true);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            self.event_queue.flush().context("Wayland flush failed")?;
+            if let Some(guard) = self.event_queue.prepare_read() {
+                let fd = self.event_queue.as_fd();
+                let mut poll_fd = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+                // SAFETY: `poll_fd` is a valid single-element array; `poll`
+                // only reads it and writes `revents`.
+                let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+                if ready < 0 {
+                    let errno = std::io::Error::last_os_error();
+                    if errno.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(anyhow!("Wayland socket poll failed: {errno}"));
+                }
+                if ready == 0 {
+                    return Ok(false);
+                }
+                match guard.read() {
+                    Ok(_) => {}
+                    Err(wayland_client::backend::WaylandError::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => return Err(error).context("Wayland read failed"),
+                }
+            }
+        }
     }
 
     fn windows(&self) -> Vec<WindowInfo> {
         self.app_data
             .records
             .iter()
-            .filter_map(ToplevelRecord::to_window)
+            .filter_map(|record| record.to_window(&self.app_data.outputs))
             .collect()
     }
 
@@ -338,10 +475,13 @@ impl Snapshot {
             })
     }
 
-    fn monitor_layout(&self) -> Result<Vec<MonitorInfo>> {
+    fn monitor_layout(&mut self) -> Result<Vec<MonitorInfo>> {
         if self.app_data.output_manager.is_none() {
             bail!("COSMIC output management protocol is unavailable");
         }
+        self.wait_for_condition(INIT_STATE_TIMEOUT, |app_data| {
+            app_data.output_layout_ready || app_data.output_manager_finished
+        })?;
         if self.app_data.output_manager_finished || !self.app_data.output_layout_ready {
             bail!("COSMIC output management did not finish an atomic layout snapshot");
         }
@@ -349,7 +489,7 @@ impl Snapshot {
             .ok_or_else(|| anyhow!("COSMIC output management returned an incomplete layout"))
     }
 
-    fn activate(&mut self, window_id: u64) -> Result<()> {
+    fn activate(&mut self, window_id: u64) -> Result<bool> {
         if !self.can_activate_windows() {
             bail!("COSMIC activation capability is unavailable");
         }
@@ -381,9 +521,28 @@ impl Snapshot {
             .ok_or_else(|| anyhow!("COSMIC toplevel management protocol not advertised"))?;
         manager.activate(cosmic, &seat);
         self.event_queue
-            .roundtrip(&mut self.app_data)
-            .context("Wayland roundtrip after activation failed")?;
-        Ok(())
+            .flush()
+            .context("Wayland flush after activation failed")?;
+        // Verify on the same connection instead of trusting the fire-and-
+        // forget request: the compositor emits a fresh `State` with
+        // `Activated` for the target once focus actually moves.
+        let target_id = stable_window_id(
+            record
+                .identifier
+                .as_deref()
+                .ok_or_else(|| anyhow!("matched window has no identifier"))?,
+        );
+        let verified = self.wait_for_condition(ACTIVATE_VERIFY_TIMEOUT, |app_data| {
+            app_data.records.iter().any(|record| {
+                record.foreign.is_some()
+                    && record
+                        .identifier
+                        .as_deref()
+                        .is_some_and(|id| stable_window_id(id) == target_id)
+                    && record.focused
+            })
+        })?;
+        Ok(verified)
     }
 }
 
@@ -599,6 +758,7 @@ impl Dispatch<ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, ()> for Ap
                     ..Default::default()
                 };
                 if let Some(info) = app_data.toplevel_info.as_ref() {
+                    app_data.toplevel_done = false;
                     let cosmic = info.get_cosmic_toplevel(&toplevel, qh, ());
                     app_data
                         .by_cosmic_id
@@ -663,13 +823,16 @@ impl Dispatch<ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ()> fo
 
 impl Dispatch<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, ()> for AppData {
     fn event(
-        _app_data: &mut Self,
+        app_data: &mut Self,
         _info: &zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1,
-        _event: zcosmic_toplevel_info_v1::Event,
+        event: zcosmic_toplevel_info_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if matches!(event, zcosmic_toplevel_info_v1::Event::Done) {
+            app_data.toplevel_done = true;
+        }
     }
 
     event_created_child!(
@@ -700,12 +863,13 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for AppDa
         let record = &mut app_data.records[index];
         match event {
             zcosmic_toplevel_handle_v1::Event::State { state } => {
+                app_data.cosmic_state_seen.insert(handle.id().protocol_id());
                 record.focused = false;
                 record.hidden = false;
-                for value in state.chunks_exact(4) {
-                    if let Ok(parsed) = zcosmic_toplevel_handle_v1::State::try_from(
-                        u32::from_ne_bytes(value.try_into().unwrap()),
-                    ) {
+                for value in state.as_chunks::<4>().0 {
+                    if let Ok(parsed) =
+                        zcosmic_toplevel_handle_v1::State::try_from(u32::from_ne_bytes(*value))
+                    {
                         if parsed == zcosmic_toplevel_handle_v1::State::Activated {
                             record.focused = true;
                         }
@@ -715,9 +879,31 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for AppDa
                     }
                 }
             }
-            zcosmic_toplevel_handle_v1::Event::Geometry { .. }
-            | zcosmic_toplevel_handle_v1::Event::OutputEnter { .. }
-            | zcosmic_toplevel_handle_v1::Event::OutputLeave { .. }
+            zcosmic_toplevel_handle_v1::Event::Geometry {
+                output,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if width > 0 && height > 0 {
+                    record.geometries.insert(
+                        output.id().protocol_id(),
+                        WindowBounds {
+                            x: Some(x),
+                            y: Some(y),
+                            width: width as u32,
+                            height: height as u32,
+                        },
+                    );
+                } else {
+                    record.geometries.remove(&output.id().protocol_id());
+                }
+            }
+            zcosmic_toplevel_handle_v1::Event::OutputLeave { output } => {
+                record.geometries.remove(&output.id().protocol_id());
+            }
+            zcosmic_toplevel_handle_v1::Event::OutputEnter { .. }
             | zcosmic_toplevel_handle_v1::Event::WorkspaceEnter { .. }
             | zcosmic_toplevel_handle_v1::Event::WorkspaceLeave { .. }
             | zcosmic_toplevel_handle_v1::Event::ExtWorkspaceEnter { .. }
@@ -764,8 +950,62 @@ impl Dispatch<wl_seat::WlSeat, ()> for AppData {
     }
 }
 
+impl Dispatch<wl_output::WlOutput, ()> for AppData {
+    fn event(
+        app_data: &mut Self,
+        output: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // xdg-output v3 uses wl_output.done as its atomic state boundary.
+        if matches!(event, wl_output::Event::Done) {
+            if let Some(position) = app_data.outputs.get_mut(&output.id().protocol_id()) {
+                position.done = true;
+            }
+        }
+    }
+}
+
+impl Dispatch<zxdg_output_manager_v1::ZxdgOutputManagerV1, ()> for AppData {
+    fn event(
+        _: &mut Self,
+        _: &zxdg_output_manager_v1::ZxdgOutputManagerV1,
+        _: zxdg_output_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zxdg_output_v1::ZxdgOutputV1, u32> for AppData {
+    fn event(
+        app_data: &mut Self,
+        _: &zxdg_output_v1::ZxdgOutputV1,
+        event: zxdg_output_v1::Event,
+        output_id: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(position) = app_data.outputs.get_mut(output_id) else {
+            return;
+        };
+        match event {
+            zxdg_output_v1::Event::LogicalPosition { x, y } => {
+                position.logical = Some((x, y));
+                position.done = false;
+            }
+            zxdg_output_v1::Event::Done => position.done = true,
+            _ => {}
+        }
+    }
+}
+
 fn stable_window_id(identifier: &str) -> u64 {
-    fnv1a_64(identifier.as_bytes())
+    // Opaque numeric IDs must survive JSON clients that use IEEE-754 doubles.
+    (fnv1a_64(identifier.as_bytes()) & ((1u64 << 53) - 1)).max(1)
 }
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -783,49 +1023,6 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
         serde_json::to_string_pretty(value).context("failed to serialize JSON output")?
     );
     Ok(())
-}
-
-fn activation_state_path() -> PathBuf {
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(runtime_dir).join("codex-computer-use-cosmic-last-activation.json")
-    } else {
-        std::env::temp_dir().join("codex-computer-use-cosmic-last-activation.json")
-    }
-}
-
-fn write_activation_state(window_id: u64) -> Result<()> {
-    let state = ActivationState {
-        window_id,
-        timestamp_ms: now_timestamp_ms()?,
-    };
-    let path = activation_state_path();
-    let json = serde_json::to_vec(&state).context("failed to serialize activation state")?;
-    std::fs::write(&path, json)
-        .with_context(|| format!("failed to write activation state to {}", path.display()))
-}
-
-fn read_activation_state() -> Option<ActivationState> {
-    let path = activation_state_path();
-    let contents = std::fs::read(&path).ok()?;
-    serde_json::from_slice(&contents).ok()
-}
-
-fn clear_activation_state() {
-    let _ = std::fs::remove_file(activation_state_path());
-}
-
-fn state_is_stale(state: &ActivationState) -> bool {
-    let Ok(now_ms) = now_timestamp_ms() else {
-        return false;
-    };
-    now_ms.saturating_sub(state.timestamp_ms) > ACTIVATION_STATE_TTL.as_millis() as u64
-}
-
-fn now_timestamp_ms() -> Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before UNIX_EPOCH")?
-        .as_millis() as u64)
 }
 
 #[cfg(test)]
@@ -956,23 +1153,32 @@ mod tests {
     }
 
     #[test]
-    fn activation_state_expires_after_ttl() {
-        let state = ActivationState {
-            window_id: 7,
-            timestamp_ms: now_timestamp_ms().unwrap()
-                - (ACTIVATION_STATE_TTL.as_millis() as u64 + 1),
-        };
+    fn focus_selection_requires_compositor_activated_state() {
+        let windows = vec![test_window(7, false), test_window(9, false)];
 
-        assert!(state_is_stale(&state));
+        assert!(protocol_focused_window(windows).is_none());
     }
 
     #[test]
-    fn activation_state_is_fresh_within_ttl() {
-        let state = ActivationState {
-            window_id: 7,
-            timestamp_ms: now_timestamp_ms().unwrap(),
-        };
+    fn focus_selection_returns_compositor_activated_window() {
+        let windows = vec![test_window(7, false), test_window(9, true)];
 
-        assert!(!state_is_stale(&state));
+        assert_eq!(protocol_focused_window(windows).unwrap().window_id, 9);
+    }
+
+    fn test_window(window_id: u64, focused: bool) -> WindowInfo {
+        WindowInfo {
+            window_id,
+            title: None,
+            app_id: None,
+            wm_class: None,
+            pid: None,
+            bounds: None,
+            workspace: None,
+            focused,
+            hidden: false,
+            client_type: Some("wayland".to_string()),
+            backend: BACKEND.to_string(),
+        }
     }
 }

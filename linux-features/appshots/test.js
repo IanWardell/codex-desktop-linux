@@ -18,6 +18,7 @@ const {
   applyLinuxAppshotMainProcessPatch,
   descriptors,
   matchesLinuxAppshotAvailabilityContract,
+  matchesLinuxAppshotHotkeyContract,
 } = require("./patch.js");
 
 function applyPatchTwice(patchFn, source) {
@@ -40,15 +41,22 @@ function captureWarnings(callback) {
 }
 
 function appshotAvailabilityAtomBundleFixture() {
-  return "async function q1o({scope:e,hostId:t,queryClient:n}){return(await n.ensureQueryData({queryKey:Adn({hostId:t}),queryFn:()=>Mdn(e,t)})).requirements?.allowAppshots!==!1}function J1o(e){return e===`macOS`||e===`windows`}";
+  return 'let l=["appshot-hotkey-state"];async function _({scope:e,hostId:t,queryClient:n}){let i=await n.ensureQueryData({queryKey:(0,c.UA)({hostId:t}),queryFn:()=>(0,c.Wr)(e,t)});return i.requirements?.allowAppshots!==!1}function y(e){return"macOS"===e||"windows"===e}';
 }
 
 function appshotMainProcessBundleFixture() {
+  // rspack main-process shape: an `appshotCapture` app service class built
+  // only for macOS and Windows.
   return [
-    "var FO=new Map;",
-    "function HO(e,t){let n=FO.get(e);n!=null&&(n.windowManager.sendInlineMessageForView(n.origin,{requestId:e,type:`computer-use-capture-updated`,update:t}),done(e,n))}",
-    "\"computer-use-frontmost-window\":async({origin:e,signal:t})=>process.platform===`win32`?bridge(e,t):process.platform===`darwin`?Xo():null,",
-    "\"computer-use-start-capture\":async({animationDestination:e,animationPresentationStyle:s,bundleIdentifier:t,origin:n,requestId:r,signal:i})=>{if(process.platform!==`darwin`&&process.platform!==`win32`)return null;let a=GO({backgroundColor:e.backgroundColor,webContents:n});return a}",
+    "var OH=new Map;",
+    'function OG(e,t){let r=OH.get(e);null!=r&&r.windowManager.sendInlineMessageForView(r.origin,{requestId:e,type:"computer-use-capture-updated",update:t})}',
+    "class OZ extends TF{options;abortController=new AbortController;constructor(e){super(),this.options=e}",
+    '[Symbol.dispose](){this.abortController.abort()}async getFrontmostWindow(){return this.abortController.signal.aborted?null:"win32"===process.platform?bridge(this.options.origin):oI()}',
+    "async start({animationDestination:e,animationPresentationStyle:t,bundleIdentifier:r,requestId:n}){let{origin:i,settings:s,windowManager:a,requestComputerUseCaptureWorker:o,subscribeComputerUseCaptureWorkerEvent:l,windowsCaptureNativeBridge:c}=this.options;if(this.abortController.signal.aborted)return null;",
+    'return"win32"===process.platform?OK({bundleIdentifier:r,origin:i,requestId:n,windowManager:a}):null==o||null==l?null:Oz({bundleIdentifier:r,origin:i,requestId:n,windowManager:a})}}',
+    "function services(e,g){return{",
+    'appshotCapture:"darwin"===process.platform&&null!=this.options.requestComputerUseWorker&&null!=this.options.subscribeComputerUseCaptureWorkerEvent||"win32"===process.platform&&null!=this.options.windowsCaptureNativeBridge?new OZ({origin:e,windowManager:g}):void 0',
+    "}}",
   ].join("");
 }
 
@@ -56,10 +64,15 @@ function currentAppshotHotkeyMainBundleFixture() {
   return [
     "var R8=`DoubleCommand`,T8=`DoubleAlt`;",
     "var Yk=new Set([`cmdorctrl`,`command`,`cmd`,`control`,`ctrl`,`alt`,`option`]),Jk=new Set([...Yk,`shift`]);",
+    "function zk(e){return e}",
+    "function Qk(){return null}",
+    "function Nk(e,t,n){globalThis.registered={hotkey:e,handlers:t,trigger:n};return{unregister(){}}}",
     "function Lk(e,t=process.platform){return t===`darwin`&&zk(e)!=null}",
-    "function Mk(e,t,n=`press`){if(process.platform!==`darwin`)return null;let r=zk(e);return r==null?null:Nk(r,t,n)}",
-    "var B8=class{configuredHotkey;registration=null;windowsCaptureNativeBridgeFailed=!1;constructor(e){this.enabled=!0,this.windowsCaptureNativeBridge=null;let a=e.getStored(`appshotHotkey`);a===void 0?this.configuredHotkey=process.platform===`win32`?T8:R8:this.configuredHotkey=a}getState(){return{supported:this.enabled&&(process.platform===`darwin`||process.platform===`win32`&&this.windowsCaptureNativeBridge!=null&&!this.windowsCaptureNativeBridgeFailed),configuredHotkey:this.configuredHotkey,isActive:this.registration!=null}}};",
+    "function Mk(e,t,n=`press`){if(process.platform!==`darwin`)return null;let r=zk(e)??Qk(e);return r==null?null:Nk(r,t,n)}",
+    "var B8=class{configuredHotkey;registration=null;windowsCaptureNativeBridgeFailed=!1;constructor(e){this.enabled=!0,this.windowsCaptureNativeBridge=null;let a=e.getStored(`appshotHotkey`);this.configuredHotkey=a===void 0?process.platform===`win32`?T8:R8:a;this.sync()}getState(){return{supported:this.enabled&&(process.platform===`darwin`||process.platform===`win32`&&this.windowsCaptureNativeBridge!=null&&!this.windowsCaptureNativeBridgeFailed),configuredHotkey:this.configuredHotkey,isActive:this.registration!=null}}sync(){if(!this.getState().supported||this.configuredHotkey==null)return;this.registration=Mk(this.configuredHotkey,{onPressed(){}})}};",
+    "globalThis.hotkeyEligible=Lk;globalThis.modifiers=Jk;",
     "globalThis.AppshotHotkeys=B8;",
+    "globalThis.appshotHotkeyState=`appshot-hotkey-state`;",
   ].join("");
 }
 
@@ -86,7 +99,7 @@ for (const location of ["installed", "cache", "retired only"]) {
     fs.writeFileSync(backend, '#!/bin/sh\n[ "$1" = windows ] || exit 1\nprintf \'%s\\n\' \'{"backend":"staged-unified","windows":[]}\'\n', { mode: 0o755 });
     execFileSync("bash", [path.join(__dirname, "../computer-use-linux/stage.sh")], {
       env: { ...process.env, SCRIPT_DIR: path.resolve(__dirname, "../.."), INSTALL_DIR: installDir,
-        CODEX_COMPUTER_USE_BINARY_SOURCE: backend, CODEX_COMPUTER_USE_COSMIC_BINARY_SOURCE: backend },
+        CODEX_COMPUTER_USE_BINARY_SOURCE: backend, CODEX_COMPUTER_USE_COSMIC_BINARY_SOURCE: backend, CODEX_COMPUTER_USE_INDICATOR_BINARY_SOURCE: backend },
       stdio: "pipe",
     });
     if (location === "cache") {
@@ -164,16 +177,11 @@ test("appshots availability descriptor matches the current bundle", () => {
     (descriptor) => descriptor.id === "linux-appshots-availability",
   );
 
-  assert.equal(descriptor.pattern.test("appshot-availability-BoK-Z77O.js"), false);
-  assert.equal(
-    descriptor.pattern.test(
-      "app-initial~app-main~page-CMpPiY3-.js",
-    ),
-    false,
-  );
-  assert.ok(
-    descriptor.pattern.test("app-initial-BTphDPeq.js"),
-  );
+  assert.equal(descriptor.pattern, undefined);
+  assert.deepEqual(descriptor.assetNeedles, ["allowAppshots", "appshot-hotkey-state"]);
+  for (const needle of descriptor.assetNeedles) {
+    assert.ok(appshotAvailabilityAtomBundleFixture().includes(needle));
+  }
   assert.equal(descriptor.assetMatch(appshotAvailabilityAtomBundleFixture()), true);
   assert.equal(descriptor.assetMatch("function unrelated(){return `windows`}"), false);
 });
@@ -311,15 +319,60 @@ test("enables AppShots availability atom on Linux", () => {
 
   assert.match(
     patched,
-    /e===`linux`\/\*codexLinuxAppshotsPlatformAvailable\*\/\|\|e===`macOS`/,
+    /"linux"===e\/\*codexLinuxAppshotsPlatformAvailable\*\/\|\|"macOS"===e\|\|"windows"===e\}/,
   );
-  assert.match(patched, /e===`windows`/);
   assert.equal(matchesLinuxAppshotAvailabilityContract(patched), true);
+  assert.doesNotThrow(() => new Function(patched));
+  const legacy = "requirements?.allowAppshots!==!1}function J(e){return e===`macOS`||e===`windows`}";
+  assert.equal(matchesLinuxAppshotAvailabilityContract(legacy), false);
+  assert.equal(applyLinuxAppshotAvailabilityPatch(legacy), legacy);
+});
+
+test(
+  "signed upstream webview exposes one AppShots availability owner",
+  { skip: process.env.CODEX_SIGNED_EXTRACTED_APP == null },
+  () => {
+    const { findWebviewAssetsContaining } = require("../../scripts/patches/lib/assets.js");
+    const descriptor = descriptors.find(
+      (descriptor) => descriptor.id === "linux-appshots-availability",
+    );
+    const root = process.env.CODEX_SIGNED_EXTRACTED_APP;
+    const owners = findWebviewAssetsContaining(root, descriptor.assetNeedles)
+      .filter((assetName) => descriptor.assetMatch(
+        fs.readFileSync(path.join(root, "webview", "assets", assetName), "utf8"),
+      ));
+    assert.equal(owners.length, 1);
+    const source = fs.readFileSync(path.join(root, "webview", "assets", owners[0]), "utf8");
+    const patched = applyLinuxAppshotAvailabilityPatch(source);
+    assert.notEqual(patched, source);
+    assert.equal(patched.split("codexLinuxAppshotsPlatformAvailable").length - 1, 1);
 });
 
 test("rejects the obsolete raw renderer message sender shape", () => {
   const obsolete = "var F=`codex_desktop:message-for-view`;function nS(e,t){e.send(F,t)}";
   assert.equal(applyLinuxAppshotMainProcessPatch(obsolete), obsolete);
+});
+
+test("AppShots capture service patch fails closed and warns on drift", () => {
+  const current = appshotMainProcessBundleFixture();
+  const retiredIpc = [
+    'function HO(e,t){e.windowManager.sendInlineMessageForView(e.origin,{requestId:t,type:"computer-use-capture-updated"})}',
+    '"computer-use-frontmost-window":async({origin:e,signal:t})=>process.platform===`win32`?bridge(e,t):null,',
+  ].join("");
+  const patched = applyLinuxAppshotMainProcessPatch(current);
+  for (const source of [
+    retiredIpc,
+    current.replace("appshotCapture:", "appshotCaptureService:"),
+    current.replace('aborted?null:"win32"', 'aborted?null:"darwin"'),
+    current.replace("windowManager:a,", "windowManager:a,windowManager:b,"),
+    current + current,
+    patched.replace('"linux"===process.platform||"darwin"', '"darwin"'),
+  ]) {
+    const warnings = captureWarnings(() => {
+      assert.equal(applyLinuxAppshotMainProcessPatch(source), source);
+    });
+    assert.ok(warnings.some((warning) => /AppShots capture service/.test(warning)), source);
+  }
 });
 
 test("routes AppShots capture through the self-contained Linux feature", () => {
@@ -330,12 +383,14 @@ test("routes AppShots capture through the self-contained Linux feature", () => {
 
   assert.match(
     patched,
-    /process\.platform===`linux`\?codexLinuxAppshotFrontmostWindow\(\):process\.platform===`win32`/,
+    /aborted\?null:"linux"===process\.platform\?codexLinuxAppshotFrontmostWindow\(\):"win32"===process\.platform/,
   );
   assert.match(
     patched,
-    /if\(process\.platform===`linux`\)return codexLinuxAppshotStartCapture\(\{origin:n,requestId:r,bundleIdentifier:t,windowManager:this\.windowManager\}\);/,
+    /aborted\)return null;if\("linux"===process\.platform\)return codexLinuxAppshotStartCapture\(\{origin:i,requestId:n,bundleIdentifier:r,windowManager:a\}\);/,
   );
+  assert.match(patched, /appshotCapture:"linux"===process\.platform\|\|"darwin"===process\.platform/);
+  assert.doesNotThrow(() => new Function("TF", "bridge", "oI", "OK", "Oz", "require", patched));
   assert.match(patched, /function codexLinuxAppshotBackendPath/);
   assert.match(patched, /codexLinuxAppshotBackendJson\(\[`windows`\],5000\)/);
   assert.match(patched, /codexLinuxAppshotBackendJson\(\[`state`,e\],10000\)/);
@@ -365,7 +420,7 @@ test("routes AppShots capture through the self-contained Linux feature", () => {
   assert.match(patched, /codexLinuxAppshotCropWithImageMagick/);
   assert.ok(
     patched.indexOf("await codexLinuxAppshotCropWithImageMagick") <
-      patched.indexOf("codexLinuxAppshotCropNativeImage(o,d,s)"),
+      patched.indexOf("codexLinuxAppshotCropNativeImage(o,d,c.source===`imagemagick-window`?null:s)"),
   );
   assert.match(patched, /\[linux-appshots\]/);
   assert.match(patched, /codexLinuxAppshotCropRects/);
@@ -869,10 +924,11 @@ function x11AppshotCaptureFixture({ backend = "x11", initiallyFocused = false, f
     require(name) {
       assert.equal(name, "node:child_process");
       return { execFile(program, args, _options, callback) {
-        const id = backend === "i3" ? Number(args[0].match(/0x[0-9a-f]+/)[0]) : Number(args[2]);
+        // i3 and Sway take the decimal X11 id; Sway rejects the hex form.
+        const id = backend === "i3" ? Number(args[0].match(/^\[id="(\d+)"\] focus$/)[1]) : Number(args[2]);
         assert.equal(program, backend === "i3" ? "i3-msg" : "wmctrl");
         assert.deepEqual(Array.from(args), backend === "i3"
-          ? [`[id="0x${id.toString(16)}"] focus`] : ["-i", "-a", `0x${id.toString(16)}`]);
+          ? [`[id="${id}"] focus`] : ["-i", "-a", `0x${id.toString(16)}`]);
         activations.push(id);
         if (failure === "activation-command" && id === external.window_id) {
           callback(new Error("activation failed"), "", "");
@@ -888,6 +944,8 @@ function x11AppshotCaptureFixture({ backend = "x11", initiallyFocused = false, f
     },
   });
   vm.runInContext(patched.slice(patched.lastIndexOf(";function codexLinuxAppshotRequire")), context);
+  context.codexLinuxAppshotI3Program = () => "i3-msg";
+  context.codexLinuxAppshotI3Socket = () => null;
   context.codexLinuxAppshotBackendJson = async () => ({
     backend, windows: [structuredClone(desktop), structuredClone(external)],
   });
@@ -926,6 +984,118 @@ for (const backend of ["x11", "i3"]) {
     assert.equal(fixture.updates.at(-1).type, "completed");
   });
 }
+
+test("AppShots focuses i3 and Sway windows the way the i3 backend reports them", async () => {
+  const patched = applyLinuxAppshotMainProcessPatch(appshotMainProcessBundleFixture());
+  const calls = [];
+  const context = vm.createContext({
+    Buffer, console: { warn() {} }, setTimeout,
+    process: { env: {}, pid: 101, platform: "linux" },
+    require(name) {
+      assert.equal(name, "node:child_process");
+      return { execFile(program, args, _options, callback) {
+        calls.push([program, ...args]);
+        callback(null, '[{"success":true}]', "");
+      } };
+    },
+  });
+  vm.runInContext(patched.slice(patched.lastIndexOf(";function codexLinuxAppshotRequire")), context);
+
+  // swaymsg only when i3-msg is missing, as the backend's ipc_program does.
+  for (const [installed, expected] of [
+    [["i3-msg", "swaymsg"], "i3-msg"],
+    [["swaymsg"], "swaymsg"],
+    [["i3-msg"], "i3-msg"],
+    [[], "i3-msg"],
+  ]) {
+    context.codexLinuxAppshotExecutablePath = (names) =>
+      names.find((name) => installed.includes(name)) ?? null;
+    assert.equal(context.codexLinuxAppshotI3Program(), expected);
+  }
+
+  // X11 windows take their decimal id; a native Wayland window on Sway is
+  // 2^32 plus its container id and is focused by con_id, as i3_focus_command
+  // does. The socket the backend would pick goes in front with -s.
+  context.codexLinuxAppshotI3Program = () => "swaymsg";
+  context.codexLinuxAppshotI3Socket = () => null;
+  for (const window_id of [0x200, 2 ** 32 - 1, 2 ** 32, 2 ** 32 + 7]) {
+    assert.equal(await context.codexLinuxAppshotFocusWindow({ window_id }, "i3"), true);
+  }
+  context.codexLinuxAppshotI3Socket = () => "/run/user/1000/sway-ipc.1000.42.sock";
+  assert.equal(await context.codexLinuxAppshotFocusWindow({ window_id: 0x200 }, "i3"), true);
+  assert.deepEqual(calls, [
+    ["swaymsg", '[id="512"] focus'],
+    ["swaymsg", '[id="4294967295"] focus'],
+    ["swaymsg", '[con_id="0"] focus'],
+    ["swaymsg", '[con_id="7"] focus'],
+    ["swaymsg", "-s", "/run/user/1000/sway-ipc.1000.42.sock", '[id="512"] focus'],
+  ]);
+});
+
+test("AppShots finds the i3 or Sway socket in the backend's order", async (t) => {
+  const net = require("node:net");
+  const patched = applyLinuxAppshotMainProcessPatch(appshotMainProcessBundleFixture());
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "as-"));
+  const servers = [];
+  t.after(async () => {
+    await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
+    fs.rmSync(runtime, { recursive: true, force: true });
+  });
+  const listen = (socketPath) => new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(socketPath, () => { servers.push(server); resolve(socketPath); });
+  });
+  const env = {};
+  const context = vm.createContext({
+    Buffer, console: { warn() {} }, setTimeout,
+    process: { env, pid: 101, platform: "linux" },
+    require,
+  });
+  vm.runInContext(patched.slice(patched.lastIndexOf(";function codexLinuxAppshotRequire")), context);
+  const missing = path.join(runtime, "missing.sock");
+  env.XDG_RUNTIME_DIR = runtime;
+  assert.equal(context.codexLinuxAppshotI3Socket(), null);
+  env.I3SOCK = missing;
+  assert.equal(context.codexLinuxAppshotI3Socket(), missing, "a set variable is the last resort");
+  const sway = await listen(path.join(runtime, "sway-ipc.1000.42.sock"));
+  assert.equal(context.codexLinuxAppshotI3Socket(), sway);
+  fs.mkdirSync(path.join(runtime, "i3"));
+  const i3 = await listen(path.join(runtime, "i3", "ipc-socket.7"));
+  assert.equal(context.codexLinuxAppshotI3Socket(), i3, "the i3 runtime socket comes before Sway's");
+  env.SWAYSOCK = sway;
+  assert.equal(context.codexLinuxAppshotI3Socket(), sway, "a set variable naming a socket comes first");
+});
+
+test("AppShots ranks Sway windows by Xwayland stacking only when it lists every target", async () => {
+  const patched = applyLinuxAppshotMainProcessPatch(appshotMainProcessBundleFixture());
+  const context = vm.createContext({
+    Buffer, console: { warn() {} }, setTimeout,
+    process: { env: { WAYLAND_DISPLAY: "wayland-1", XDG_SESSION_TYPE: "wayland" }, pid: 101, platform: "linux" },
+    require() {
+      throw new Error("No module access expected");
+    },
+  });
+  vm.runInContext(patched.slice(patched.lastIndexOf(";function codexLinuxAppshotRequire")), context);
+  let stackingReads = 0;
+  context.codexLinuxAppshotX11Stacking = async () => {
+    stackingReads++;
+    return [{ window_id: "0x1200003" }];
+  };
+  const chatgpt = { app_id: "codex-desktop", pid: 101, window_id: 2 ** 32 + 1, focused: true };
+  const code = { app_id: "code", wm_class: "code", pid: 303, window_id: 0x1200003, focused: false };
+  const firefox = { app_id: "firefox", pid: 404, window_id: 2 ** 32 + 2, focused: false };
+
+  // Every external window is Xwayland: the stacking list covers them.
+  const covered = await context.codexLinuxAppshotResolvedWindow({ backend: "i3", windows: [chatgpt, code] });
+  assert.equal(covered.focusedWindow?.app_id, "code");
+  assert.equal(stackingReads, 1);
+
+  // A native Wayland window is missing from Xwayland stacking, so no target is guessed.
+  const mixed = await context.codexLinuxAppshotResolvedWindow({ backend: "i3", windows: [chatgpt, firefox, code] });
+  assert.equal(mixed.focusedWindow, null);
+  assert.equal(stackingReads, 1);
+});
 
 for (const failure of ["activation-command", "activation-ignored", "target-changed", "focus-changed", "bounds-changed", "restore-ignored"]) {
   test(`AppShots delivers no X11 attachment on ${failure}`, async () => {
@@ -1080,6 +1250,55 @@ test("AppShots restores ChatGPT after successful and failed Hyprland capture", a
   assert.deepEqual(trace, ["verify-captured-target", "restore-failed:256"]);
 });
 
+test("AppShots prefers direct X11 window capture before root screenshot fallback", () => {
+  const patched = applyLinuxAppshotMainProcessPatch(appshotMainProcessBundleFixture());
+  const helperStart = patched.lastIndexOf(";function codexLinuxAppshotRequire");
+  const context = vm.createContext({
+    process: { env: {}, pid: 101, platform: "linux" },
+    require() {
+      throw new Error("No module access expected");
+    },
+  });
+
+  vm.runInContext(patched.slice(helperStart), context, { timeout: 1_000 });
+
+  const directCapture = context.codexLinuxAppshotScreenshotCommands({
+    backend: "x11",
+    window_id: 0x200,
+  })[0];
+  assert.equal(directCapture.source, "imagemagick-window");
+  assert.deepEqual(Array.from(directCapture.programs), ["import", "/usr/bin/import"]);
+  assert.deepEqual(Array.from(directCapture.args), ["-window", "0x200"]);
+  assert.equal(directCapture.output, "append");
+  for (const window_id of [0, -1, NaN, 1.5, "invalid", Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(
+      context.codexLinuxAppshotScreenshotCommands({ backend: "x11", window_id })[0].source,
+      "grim",
+    );
+  }
+  assert.equal(
+    context.codexLinuxAppshotScreenshotCommands({
+      backend: "wayland",
+      window_id: 0x200,
+    })[0].source,
+    "grim",
+  );
+  // An X11 window under i3 or Xwayland keeps the direct capture; a native
+  // Wayland window on Sway (2^32 plus its container id) has no X11 id.
+  for (const window_id of [0x200, 2 ** 32 - 1]) {
+    assert.deepEqual(
+      Array.from(context.codexLinuxAppshotScreenshotCommands({ backend: "i3", window_id })[0].args),
+      ["-window", `0x${window_id.toString(16)}`],
+    );
+  }
+  for (const window_id of [2 ** 32, 2 ** 32 + 7]) {
+    assert.equal(
+      context.codexLinuxAppshotScreenshotCommands({ backend: "i3", window_id })[0].source,
+      "grim",
+    );
+  }
+});
+
 test("AppShots captures accessibility and pixels concurrently", async () => {
   const patched = applyLinuxAppshotMainProcessPatch(appshotMainProcessBundleFixture());
   const helperStart = patched.lastIndexOf(";function codexLinuxAppshotRequire");
@@ -1190,13 +1409,15 @@ test("AppShots serializes capture transactions", async () => {
   await context.codexLinuxAppshotCaptureQueue;
 });
 
-test("AppShots capture uses and removes its private temporary directory", async () => {
+test("AppShots preserves window captures and cleans private temporary directories", async () => {
   const patched = applyLinuxAppshotMainProcessPatch(appshotMainProcessBundleFixture());
   const helperStart = patched.lastIndexOf(";function codexLinuxAppshotRequire");
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "appshots-private-capture-"));
   const captureDirs = [];
   const chmodModes = [];
   let failCaptures = false;
+  let failDirectCapture = false;
+  const cropArgs = [];
 
   assert.ok(helperStart >= 0);
 
@@ -1218,6 +1439,14 @@ test("AppShots capture uses and removes its private temporary directory", async 
         callback(new Error("Expected capture failure"), "", "expected failure");
         return;
       }
+      if (program.endsWith("import") && args[1] === "0x200") {
+        if (failDirectCapture) callback(new Error("Direct capture unavailable"), "", "");
+        else {
+          fs.writeFileSync(args.at(-1), "window source");
+          callback(null, "", "");
+        }
+        return;
+      }
       if (program.endsWith("grim")) {
         fs.writeFileSync(args.at(-1), "source");
         callback(null, "", "");
@@ -1228,6 +1457,7 @@ test("AppShots capture uses and removes its private temporary directory", async 
         return;
       }
       if (program.endsWith("convert")) {
+        cropArgs.push(args[2]);
         fs.writeFileSync(args.at(-1), "crop");
         callback(null, "", "");
         return;
@@ -1271,6 +1501,44 @@ test("AppShots capture uses and removes its private temporary directory", async 
     assert.equal(captureDirs.length, 1);
     assert.equal(fs.existsSync(captureDirs[0]), false);
 
+    for (const backend of ["x11", "i3"]) {
+      const direct = await context.codexLinuxAppshotScreenshot(
+        { backend, window_id: 0x200, bounds: { x: 20, y: 30, width: 50, height: 40 } },
+        [],
+      );
+      assert.equal(direct.width, 100);
+      assert.equal(direct.height, 100);
+      assert.equal(cropArgs.at(-1), "100x100+0+0");
+      assert.match(direct.source, /^imagemagick-window:/);
+    }
+    failDirectCapture = true;
+    const fallback = await context.codexLinuxAppshotScreenshot(
+      { backend: "x11", window_id: 0x200, bounds: { x: 20, y: 30, width: 50, height: 40 } },
+      [],
+    );
+    assert.equal(fallback.width, 50);
+    assert.equal(fallback.height, 40);
+    assert.equal(cropArgs.at(-1), "50x40+20+30");
+    assert.match(fallback.source, /^grim:/);
+
+    const nativeCrops = [];
+    const nativeImage = {
+      createFromPath: () => ({
+        getSize: () => ({ width: 100, height: 100 }),
+        crop: (rect) => {
+          nativeCrops.push({ ...rect });
+          return { getSize: () => ({ width: rect.width, height: rect.height }) };
+        },
+      }),
+    };
+    const native = context.codexLinuxAppshotCropNativeImage(nativeImage, "source.png", null);
+    assert.equal(native.width, 100);
+    assert.equal(native.height, 100);
+    assert.deepEqual(nativeCrops, [{ x: 0, y: 0, width: 100, height: 100 }]);
+    assert.equal(context.codexLinuxAppshotCropNativeImage({
+      createFromPath: () => ({ getSize: () => ({ width: NaN, height: NaN }) }),
+    }, "invalid.png", null), null);
+
     failCaptures = true;
     const failedResult = await context.codexLinuxAppshotScreenshot(
       { bounds: { height: 40, width: 50, x: 0, y: 0 } },
@@ -1286,78 +1554,91 @@ test("AppShots capture uses and removes its private temporary directory", async 
   }
 });
 
-test("enables the current AppShots hotkey class and bare modifiers on Linux", () => {
-  const patched = applyPatchTwice(
-    applyLinuxAppshotHotkeyPatch,
-    currentAppshotHotkeyMainBundleFixture(),
-  );
+test("current AppShots hotkey owner supports Linux and registers a saved bare-modifier shortcut", () => {
+  const pristine = currentAppshotHotkeyMainBundleFixture();
+  const patched = applyPatchTwice(applyLinuxAppshotHotkeyPatch, pristine);
 
-  assert.match(
-    patched,
-    /function codexLinuxAppshotIsWayland\(\)\{return process\.platform===`linux`&&\(\(process\.env\.XDG_SESSION_TYPE\|\|``\)\.toLowerCase\(\)===`wayland`\|\|!!process\.env\.WAYLAND_DISPLAY\)\}/,
-  );
-  assert.match(
-    patched,
-    /function Lk\(e,t=process\.platform\)\{return \(t===`darwin`\|\|t===`linux`&&!codexLinuxAppshotIsWayland\(\)\)&&zk\(e\)!=null\}/,
-  );
-  assert.match(
-    patched,
-    /function Mk\(e,t,n=`press`\)\{if\(process\.platform!==`darwin`&&process\.platform!==`linux`\)return null;/,
-  );
-  assert.match(patched, /new Set\(\[\.\.\.Yk,`shift`,`super`,`meta`,`win`\]\)/);
-  assert.match(
-    patched,
-    /a===void 0\?this\.configuredHotkey=process\.platform===`win32`\?T8:process\.platform===`linux`\?null:R8:this\.configuredHotkey=a/,
-  );
-  assert.match(
-    patched,
-    /supported:this\.enabled&&\(process\.platform===`linux`\|\|process\.platform===`darwin`\|\|process\.platform===`win32`&&this\.windowsCaptureNativeBridge!=null&&!this\.windowsCaptureNativeBridgeFailed\),configuredHotkey:this\.configuredHotkey,isActive:this\.registration!=null,linuxWayland:codexLinuxAppshotIsWayland\(\)/,
-  );
+  assert.equal(matchesLinuxAppshotHotkeyContract(pristine), true);
+  assert.equal(matchesLinuxAppshotHotkeyContract(patched), true);
+  assert.match(patched, /process\.platform===`linux`\|\|process\.platform===`darwin`/);
+  assert.match(patched, /process\.platform!==`darwin`&&process\.platform!==`linux`/);
+  assert.match(patched, /`shift`,`super`,`meta`,`win`/);
+  assert.match(patched, /process\.platform===`linux`\?null:R8/);
 
-  const context = {
-    globalThis: {},
+  const context = vm.createContext({
     process: { env: { XDG_SESSION_TYPE: "x11" }, platform: "linux" },
-  };
-  vm.runInNewContext(patched, context);
-  const state = new context.globalThis.AppshotHotkeys({ getStored() {} }).getState();
-  assert.equal(state.supported, true);
-  assert.equal(state.configuredHotkey, null);
-  assert.equal(state.linuxWayland, false);
+  });
+  vm.runInContext(patched, context);
+  const noSavedShortcut = new context.AppshotHotkeys({ getStored() {} });
+  assert.equal(noSavedShortcut.getState().supported, true);
+  assert.equal(noSavedShortcut.getState().configuredHotkey, null);
+  assert.equal(noSavedShortcut.getState().linuxWayland, false);
+  assert.equal(noSavedShortcut.getState().isActive, false);
+
+  const savedShortcut = new context.AppshotHotkeys({ getStored: () => "DoubleAlt" });
+  assert.equal(savedShortcut.getState().supported, true);
+  assert.equal(savedShortcut.getState().isActive, true);
+  assert.equal(context.registered.hotkey, "DoubleAlt");
+  assert.equal(context.hotkeyEligible("DoubleAlt"), true);
+  assert.deepEqual(Array.from(context.modifiers).slice(-4), ["shift", "super", "meta", "win"]);
 });
 
-test("AppShots hotkey patch fails closed when one current class shape drifts", () => {
-  const source = currentAppshotHotkeyMainBundleFixture().replace(
-    "new Set([...Yk,`shift`])",
-    "new Set([...Yk,`shift`,`alt`])",
+test("AppShots hotkey Linux eligibility remains disabled for Wayland bare modifiers", () => {
+  const patched = applyLinuxAppshotHotkeyPatch(currentAppshotHotkeyMainBundleFixture());
+  const context = vm.createContext({
+    process: { env: { WAYLAND_DISPLAY: "wayland-0" }, platform: "linux" },
+  });
+  vm.runInContext(patched, context);
+  assert.equal(context.hotkeyEligible("DoubleAlt"), false);
+  assert.equal(new context.AppshotHotkeys({ getStored() {} }).getState().linuxWayland, true);
+});
+
+test("AppShots hotkey patch fails closed for missing, partial, duplicate, and ambiguous owners", () => {
+  const pristine = currentAppshotHotkeyMainBundleFixture();
+  const patched = applyLinuxAppshotHotkeyPatch(pristine);
+  const partial = patched.replace(
+    "process.platform===`linux`||process.platform===`darwin`",
+    "process.platform===`darwin`",
   );
-
-  assert.deepEqual(captureWarnings(() => {
-    assert.equal(applyLinuxAppshotHotkeyPatch(source), source);
-  }), [
-    "WARN: Could not find current AppShots hotkey class - skipping Linux AppShots hotkey patch",
-  ]);
+  const missing = "globalThis.appshotHotkeyState=`appshot-hotkey-state`";
+  const retired = pristine.replace("let r=zk(e)??Qk(e)", "let r=zk(e)");
+  const mixedContracts = `${pristine}function retired(e,t,n=\`press\`){if(process.platform!==\`darwin\`)return null;let r=zk(e);}`;
+  for (const source of [
+    missing,
+    retired,
+    mixedContracts,
+    partial,
+    pristine + pristine,
+    patched + patched,
+    pristine + patched,
+  ]) {
+    assert.equal(matchesLinuxAppshotHotkeyContract(source), false);
+    assert.deepEqual(captureWarnings(() => {
+      assert.equal(applyLinuxAppshotHotkeyPatch(source), source);
+    }), [
+      "WARN: Could not find one complete current AppShots hotkey owner - skipping Linux AppShots hotkey patch",
+    ]);
+  }
 });
 
-test("AppShots hotkey patch rejects a partially patched setter", () => {
-  const partial = currentAppshotHotkeyMainBundleFixture().replace(
-    "this.windowsCaptureNativeBridge!=null&&!this.windowsCaptureNativeBridgeFailed",
-    "this.windowsCaptureNativeBridge!=null",
-  );
-
-  assert.deepEqual(captureWarnings(() => {
-    assert.equal(applyLinuxAppshotHotkeyPatch(partial), partial);
-  }), [
-    "WARN: Could not find current AppShots hotkey class - skipping Linux AppShots hotkey patch",
-  ]);
-});
-
-test("AppShots hotkey patch rejects duplicate current class contracts", () => {
-  const source = currentAppshotHotkeyMainBundleFixture();
-  const duplicate = `${source}${source}`;
-
-  assert.deepEqual(captureWarnings(() => {
-    assert.equal(applyLinuxAppshotHotkeyPatch(duplicate), duplicate);
-  }), [
-    "WARN: Could not find current AppShots hotkey class - skipping Linux AppShots hotkey patch",
-  ]);
-});
+test(
+  "signed upstream main process exposes exactly one AppShots capture service chunk",
+  { skip: process.env.CODEX_SIGNED_EXTRACTED_APP == null },
+  () => {
+    const { findMainProcessChunks } = require("../../scripts/patches/lib/assets.js");
+    const mainProcess = findMainProcessChunks(process.env.CODEX_SIGNED_EXTRACTED_APP);
+    const changed = [];
+    for (const name of mainProcess.chunks) {
+      const source = fs.readFileSync(path.join(mainProcess.buildDir, name), "utf8");
+      let patched;
+      captureWarnings(() => {
+        patched = applyLinuxAppshotMainProcessPatch(source);
+      });
+      if (patched === source) continue;
+      changed.push(name);
+      assert.equal(applyLinuxAppshotMainProcessPatch(patched), patched);
+      assert.doesNotThrow(() => new vm.Script(patched));
+    }
+    assert.equal(changed.length, 1, changed.join(", "));
+  },
+);

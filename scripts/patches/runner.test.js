@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { detectLinuxTargetContext } = require("../lib/linux-target-context.js");
 const {
   createPatchReport,
   enabledFeatureFailuresFromReport,
@@ -18,13 +19,61 @@ const {
 } = require("./runner.js");
 
 const emptyConfig = path.join(__dirname, "..", "..", "linux-features", "features.example.json");
+const officialQuitBundle =
+  "let qrt=function({isWindows:e,disableQuitConfirmationPrompt:d,quitState:r,windows:i,settingsStore:x}){" +
+  "let S=!1;l.app.on(\"before-quit\",o=>{if(e||r.canQuitWithoutPrompt()||d){S=!0,i.markAppQuitting();return}" +
+  "let c={formatMessage:e=>e.defaultMessage};0!==l.dialog.showMessageBoxSync({type:\"warning\",message:\"Quit?\"," +
+  "buttons:[c.formatMessage({messageId:\"desktop.quitConfirmation.quit\",defaultMessage:\"Quit\"}),\"Cancel\"]," +
+  "detail:function({answer:e}){return e}({answer:\"Stop chats?\"})})?o.preventDefault():" +
+  "(r.markQuitApproved(),S=!0,i.markAppQuitting())})};function next(){}";
 
-test("official baseline has no core patches", () => {
-  assert.deepEqual(corePatchDescriptors(), []);
-  assert.deepEqual(allPatchPolicies({ featuresConfigPath: emptyConfig }), []);
+function linuxTarget(id, versionId, desktop) {
+  return detectLinuxTargetContext({
+    env: {
+      CODEX_LINUX_TARGET_ID: id,
+      CODEX_LINUX_TARGET_VERSION_ID: versionId,
+      CODEX_LINUX_TARGET_DESKTOP: desktop,
+      CODEX_LINUX_TARGET_PACKAGE_FORMAT: id === "fedora" ? "rpm" : "deb",
+      PATH: "",
+    },
+    osReleaseFields: {},
+    atomic: false,
+  });
+}
+
+const fedoraKde = linuxTarget("fedora", "44", "KDE:Plasma");
+const ubuntuGnome = linuxTarget("ubuntu", "26.04", "ubuntu:GNOME");
+
+test("the official Linux baseline registers required compatibility patches", () => {
   assert.deepEqual(
-    requiredPatchNamesForProfile("upstream-build", { featuresConfigPath: emptyConfig }),
-    [],
+    corePatchDescriptors().map(({ id, ciPolicy, phase }) => ({ id, ciPolicy, phase })),
+    [{
+      id: "quit-confirmation-focus",
+      ciPolicy: "required-upstream",
+      phase: "extracted-app:pre-webview",
+    }],
+  );
+  assert.deepEqual(
+    allPatchPolicies({ featuresConfigPath: emptyConfig }),
+    [{
+      name: "quit-confirmation-focus",
+      ciPolicy: "required-upstream",
+      phase: "extracted-app:pre-webview",
+    }],
+  );
+  assert.deepEqual(
+    requiredPatchNamesForProfile("upstream-build", {
+      featuresConfigPath: emptyConfig,
+      linuxTarget: fedoraKde,
+    }),
+    ["quit-confirmation-focus"],
+  );
+  assert.deepEqual(
+    requiredPatchNamesForProfile("upstream-build", {
+      featuresConfigPath: emptyConfig,
+      linuxTarget: ubuntuGnome,
+    }),
+    ["quit-confirmation-focus"],
   );
 });
 
@@ -40,7 +89,7 @@ test("runner context exposes enabled feature IDs", () => {
   }
 });
 
-test("default empty registry leaves official extracted files byte-identical", () => {
+test("the default core registry repairs Quit and shell startup without changing webview assets", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "runner-baseline-"));
   try {
     const mainDir = path.join(root, ".vite", "build");
@@ -49,16 +98,55 @@ test("default empty registry leaves official extracted files byte-identical", ()
     fs.mkdirSync(webviewDir, { recursive: true });
     const main = path.join(mainDir, "main.js");
     const webview = path.join(webviewDir, "app-initial-A.js");
-    fs.writeFileSync(main, "official-main\n");
+    fs.writeFileSync(main, officialQuitBundle);
+    const shell = path.join(mainDir, "shell-env-fixture.js");
+    fs.writeFileSync(shell, "async function load(a,b){let start=Date.now();e.app.isPackaged||clean();" +
+      "let abort=new AbortController;log(\"Failed to load shell env\",{resultSource:\"load\"})}");
     fs.writeFileSync(webview, "official-webview\n");
     const report = createPatchReport();
     patchExtractedApp(root, {
       report,
       featuresConfigPath: emptyConfig,
+      linuxTarget: fedoraKde,
     });
-    assert.equal(fs.readFileSync(main, "utf8"), "official-main\n");
+    assert.match(fs.readFileSync(main, "utf8"), /function codexLinuxQuitDialogParent\(/);
     assert.equal(fs.readFileSync(webview, "utf8"), "official-webview\n");
-    assert.deepEqual(report.patches, []);
+    assert.match(fs.readFileSync(shell, "utf8"), /await new Promise\(setImmediate\)/);
+    assert.equal(report.patches.length, 1);
+    assert.equal(report.patches[0].name, "quit-confirmation-focus");
+    assert.equal(report.patches[0].status, "applied");
+    assert.equal(report.patches[0].ciPolicy, "required-upstream");
+    assert.equal(report.patches[0].sourceKind, "core");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("portable artifacts include the shell repair when built on Ubuntu GNOME", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "runner-portable-shell-repair-"));
+  try {
+    const mainDir = path.join(root, ".vite", "build");
+    fs.mkdirSync(mainDir, { recursive: true });
+    const main = path.join(mainDir, "main.js");
+    const shell = path.join(mainDir, "shell-env-fixture.js");
+    const shellSource = "async function load(a,b){let start=Date.now();e.app.isPackaged||clean();" +
+      "let abort=new AbortController;log(\"Failed to load shell env\",{resultSource:\"load\"})}";
+    fs.writeFileSync(main, officialQuitBundle);
+    fs.writeFileSync(shell, shellSource);
+    const report = createPatchReport();
+
+    patchExtractedApp(root, {
+      report,
+      featuresConfigPath: emptyConfig,
+      linuxTarget: ubuntuGnome,
+    });
+
+    assert.match(fs.readFileSync(main, "utf8"), /function codexLinuxQuitDialogParent\(/);
+    assert.match(fs.readFileSync(shell, "utf8"), /await new Promise\(setImmediate\)/);
+    assert.deepEqual(
+      report.patches.map(({ name, status }) => ({ name, status })),
+      [{ name: "quit-confirmation-focus", status: "applied" }],
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -73,8 +161,13 @@ test("missing main bundle records enabled feature drift", (t) => {
 
   patchExtractedApp(root, { report, featuresConfigPath: config });
 
-  const [entry] = report.patches;
-  assert.equal(entry.name, "feature:frameless-titlebar:main-process");
+  const entry = report.patches.find((patch) =>
+    patch.name === "feature:frameless-titlebar:main-process");
+  const coreEntry = report.patches.find((patch) =>
+    patch.name === "quit-confirmation-focus");
+  assert.ok(entry);
+  assert.ok(coreEntry);
+  assert.equal(coreEntry.status, "failed-required");
   assert.equal(entry.status, "skipped-optional");
   assert.equal(entry.enforceWhenEnabled, true);
   assert.equal(entry.unavailable, true);
@@ -82,4 +175,35 @@ test("missing main bundle records enabled feature drift", (t) => {
     enabledFeatureFailuresFromReport(report).some((failure) => failure.name === entry.name),
     true,
   );
+});
+
+test("main-process chunks are the rspack early-bootstrap entry and its numbered chunks", () => {
+  const { findMainProcessChunks } = require("./lib/assets.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "runner-rspack-chunks-"));
+  try {
+    const buildDir = path.join(root, ".vite", "build");
+    fs.mkdirSync(buildDir, { recursive: true });
+    for (const name of [
+      "early-bootstrap.js",
+      "early-bootstrap-916-2f6483d5bfd826f1.js",
+      "early-bootstrap-87-929aa7e5d829f2a8.js",
+      "worker.js",
+      "worker-904-f6f849be9d0ea1f7.js",
+      "preload.js",
+      "main-legacy.js",
+    ]) {
+      fs.writeFileSync(path.join(buildDir, name), "");
+    }
+    assert.deepEqual(findMainProcessChunks(root), {
+      buildDir,
+      chunks: [
+        "early-bootstrap-87-929aa7e5d829f2a8.js",
+        "early-bootstrap-916-2f6483d5bfd826f1.js",
+        "early-bootstrap.js",
+      ],
+    });
+    assert.equal(findMainProcessChunks(path.join(root, "missing")), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

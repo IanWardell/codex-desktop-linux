@@ -13,7 +13,25 @@ pub async fn list_windows() -> Result<Vec<WindowInfo>> {
 }
 
 pub async fn focused_window() -> Result<Option<WindowInfo>> {
-    current_focused_window().await
+    Ok(focused_window_with_backend().await?.1)
+}
+
+/// The focused window together with the backend that answered, which is known
+/// even when no window has focus.
+pub async fn focused_window_with_backend() -> Result<(String, Option<WindowInfo>)> {
+    if let Some(window) = registry::focused_window_override().await {
+        return Ok((window.backend.clone(), Some(window)));
+    }
+
+    Ok(focused_in(list_windows().await?))
+}
+
+pub(crate) fn focused_in(windows: Vec<WindowInfo>) -> (String, Option<WindowInfo>) {
+    let backend = windows
+        .first()
+        .map(|window| window.backend.clone())
+        .unwrap_or_else(|| registry::UNAVAILABLE_BACKEND.to_string());
+    (backend, windows.into_iter().find(|window| window.focused))
 }
 
 pub async fn focus_window_target(target: &WindowTarget) -> Result<WindowFocusResult> {
@@ -25,9 +43,15 @@ pub async fn focus_window_target(target: &WindowTarget) -> Result<WindowFocusRes
     let requested_window = resolve_window_target(&windows, target)?.clone();
     ensure_backend_can_focus_target(target, &requested_window)?;
 
-    registry::activate_window(&requested_window).await?;
-
-    let focused_window = wait_for_focused_window(&requested_window).await;
+    // GNOME Shell's FocusApp selects an icon in the overview, not a window.
+    // Introspect can safely verify an already focused app, but cannot raise it.
+    let passive = requested_window.backend == registry::GNOME_SHELL_INTROSPECT_BACKEND;
+    let focused_window = if passive {
+        windows.into_iter().find(|window| window.focused)
+    } else {
+        registry::activate_window(&requested_window).await?;
+        wait_for_focused_window(&requested_window).await
+    };
     let exact_window_focused = focused_window
         .as_ref()
         .is_some_and(|window| window.window_id == requested_window.window_id);
@@ -41,8 +65,11 @@ pub async fn focus_window_target(target: &WindowTarget) -> Result<WindowFocusRes
         focused_window,
         exact_window_focused,
         app_focused,
-        note: "Computer Use activated the requested window through the available window backend, then verified focus through a fresh window query."
-            .to_string(),
+        note: if passive {
+            "GNOME Introspect only verifies current app focus. Focus the target manually or install the GNOME Shell extension to activate windows."
+        } else {
+            "Computer Use activated the requested window through the available window backend, then verified focus through a fresh window query."
+        }.to_string(),
     })
 }
 
@@ -57,17 +84,6 @@ pub(crate) fn ensure_backend_can_focus_target(
         );
     }
     Ok(())
-}
-
-async fn current_focused_window() -> Result<Option<WindowInfo>> {
-    if let Some(window) = registry::focused_window_override().await {
-        return Ok(Some(window));
-    }
-
-    Ok(list_windows()
-        .await?
-        .into_iter()
-        .find(|window| window.focused))
 }
 
 async fn wait_for_focused_window(requested_window: &WindowInfo) -> Option<WindowInfo> {
@@ -127,7 +143,7 @@ pub fn resolve_window_target<'a>(
     target: &WindowTarget,
 ) -> Result<&'a WindowInfo> {
     if let Some(window_id) = target.window_id {
-        return resolve_window_id_target(windows, target, window_id);
+        return resolve_window_id_target(windows, window_id);
     }
 
     if target.has_terminal_target() {
@@ -151,15 +167,7 @@ pub fn resolve_window_target<'a>(
     }
 
     if let Some(app_id) = normalized_target(target.app_id.as_deref()) {
-        if let Some(window) = windows.iter().find(|window| {
-            window
-                .app_id
-                .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case(&app_id))
-        }) {
-            return Ok(window);
-        }
-        bail!("No window matched app_id {app_id}.");
+        return resolve_app_id_target(windows, &app_id);
     }
 
     if let Some(wm_class) = normalized_target(target.wm_class.as_deref()) {
@@ -190,75 +198,43 @@ pub fn resolve_window_target<'a>(
     bail!("Pass window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd to target a window.");
 }
 
-fn resolve_window_id_target<'a>(
-    windows: &'a [WindowInfo],
-    target: &WindowTarget,
-    window_id: u64,
-) -> Result<&'a WindowInfo> {
-    if let Some(window) = windows.iter().find(|window| window.window_id == window_id) {
+fn resolve_app_id_target<'a>(windows: &'a [WindowInfo], app_id: &str) -> Result<&'a WindowInfo> {
+    if let Some(window) = windows.iter().find(|window| {
+        window
+            .app_id
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(app_id))
+    }) {
         return Ok(window);
     }
 
-    let matches = windows
-        .iter()
-        .filter(|window| window_id_matches_json_number(window.window_id, window_id))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [window] => Ok(*window),
-        [] => Err(anyhow::anyhow!("No window matched window_id {window_id}.")),
-        windows => resolve_rounded_window_id_matches(windows, target, window_id),
-    }
-}
-
-fn resolve_rounded_window_id_matches<'a>(
-    windows: &[&'a WindowInfo],
-    target: &WindowTarget,
-    window_id: u64,
-) -> Result<&'a WindowInfo> {
-    let ids = windows
-        .iter()
-        .map(|window| window.window_id.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    if has_window_id_disambiguator(target) {
-        let matches = windows
-            .iter()
-            .copied()
-            .filter(|window| window_id_disambiguators_match(window, target))
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [window] => return Ok(*window),
-            [] => bail!(
-                "window_id {window_id} matched multiple windows after JSON number rounding ({ids}), but none matched the provided title, pid, app_id, or wm_class disambiguators."
-            ),
-            _ => {}
-        }
+    if app_id.contains('.') {
+        bail!("No window matched app_id {app_id}.");
     }
 
-    bail!(
-        "window_id {window_id} matched multiple windows after JSON number rounding ({ids}); add title, pid, app_id, or wm_class to disambiguate."
-    );
+    let mut matches = windows.iter().filter(|window| {
+        window.app_id.as_deref().is_some_and(|value| {
+            crate::windowing::types::app_id_leaf(value).eq_ignore_ascii_case(app_id)
+        })
+    });
+    let Some(first) = matches.next() else {
+        bail!("No window matched app_id {app_id}.");
+    };
+    if matches.any(|window| !same_optional_string(&first.app_id, &window.app_id)) {
+        bail!("app_id {app_id} matched multiple applications; use the full app_id.");
+    }
+    Ok(first)
 }
 
-fn has_window_id_disambiguator(target: &WindowTarget) -> bool {
-    target.pid.is_some()
-        || normalized_target(target.app_id.as_deref()).is_some()
-        || normalized_target(target.wm_class.as_deref()).is_some()
-        || normalized_target(target.title.as_deref()).is_some()
-}
-
-fn window_id_disambiguators_match(window: &WindowInfo, target: &WindowTarget) -> bool {
-    target.pid.is_none_or(|pid| window.pid == Some(pid))
-        && optional_exact_match(&window.app_id, target.app_id.as_deref())
-        && optional_exact_match(&window.wm_class, target.wm_class.as_deref())
-        && optional_title_match(&window.title, target.title.as_deref())
-}
-
-fn window_id_matches_json_number(actual: u64, requested: u64) -> bool {
-    const JS_SAFE_INTEGER_MAX: u64 = (1_u64 << 53) - 1;
-    (actual > JS_SAFE_INTEGER_MAX || requested > JS_SAFE_INTEGER_MAX)
-        && (actual as f64) == (requested as f64)
+fn resolve_window_id_target(windows: &[WindowInfo], window_id: u64) -> Result<&WindowInfo> {
+    windows
+        .iter()
+        .find(|window| window.window_id == window_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No window matched window_id {window_id}. Re-run list_windows and pass a current window_id."
+            )
+        })
 }
 
 fn unique_window_match<'a>(

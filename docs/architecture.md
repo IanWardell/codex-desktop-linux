@@ -12,11 +12,14 @@ resolve it through signed stable APT metadata rather than trusting the moving
 2. `upstream-linux-package.sh` extracts the package data archive without running
    maintainer scripts and validates `/usr/lib/chatgpt`.
 3. `install.sh` stages that directory as `codex-app/`, adds the compact launcher
-   and metadata schema v2, and applies only explicitly enabled features.
-4. If no enabled feature has ASAR descriptors, `resources/app.asar` is never
-   unpacked and its SHA-256 must equal upstream. Otherwise a temporary copy is
-   patched, deterministically repacked, and reported.
-5. Package builders transform the same staged tree into deb, RPM, pacman, or
+   and metadata schema v2, then applies required core patches and explicitly
+   enabled features.
+4. If no core or feature ASAR descriptor is active, `resources/app.asar` is
+   never unpacked and its SHA-256 must equal upstream. Otherwise a temporary
+   copy is patched and reported; deterministic repacking happens only if a
+   descriptor reports changes. An unchanged report retains the official archive.
+5. Package builders transform the same staged tree into deb, RPM, pacman, a
+   local Gentoo ebuild/payload, or
    AppImage output. Nix extracts the architecture-specific official package
    directly and wraps its ELF runtime.
 
@@ -25,9 +28,9 @@ flowchart LR
   A["Signed InRelease"] --> B["Verified Packages index"]
   B --> C["Verified chatgpt package"]
   C --> D["Official /usr/lib/chatgpt payload"]
-  D --> E{"ASAR features enabled?"}
-  E -- "no" --> F["Byte-identical app.asar"]
-  E -- "yes" --> G["Temporary deterministic patch"]
+  D --> E{"Core or feature ASAR descriptors active?"}
+  E -- "none" --> F["Byte-identical app.asar"]
+  E -- "active" --> G["Temporary deterministic patch"]
   F --> H["codex-desktop outputs"]
   G --> H
 ```
@@ -40,6 +43,14 @@ convenience aliases only. Trust is derived from `InRelease`, then the digest of
 the architecture-specific `Packages` file, then the package SHA-256 recorded in
 that index. Wrong signatures, hashes, package names, versions, architectures,
 or incomplete payloads fail closed.
+
+Local input reuses package bytes while retaining signed verification by default.
+All builds verify without prompting or reading user input. Only
+`--skip-oai-official-sig-verification` selects the local exception.
+The exception retains structural
+checks and records `signatureVerification: "skipped"` in build provenance; it
+does not follow automatically from a signature or digest failure. Nix's offline
+builds use that explicit exception with their independently hash-verified pins.
 
 The upstream source/key setup and maintainer scripts are never copied into the
 custom package. This prevents an official package-manager transaction from
@@ -72,16 +83,22 @@ the official browser registry.
 | Optional feature framework | `scripts/lib/linux-features.*`, `linux-features/` |
 | ASAR descriptors and reports | `scripts/patches/`, `scripts/patch-linux-window-ui.js`, `scripts/lib/patch-report.js` |
 | Cross-format payload assembly | `scripts/lib/package-common.sh`, `packaging/` |
-| Native update state machine | `updater/src/`, `packaging/update-builder/` |
+| Native update state machine | `updater/src/`; rebuild payload: `scripts/lib/package-common.sh` |
 | Reproducible Nix packaging | `flake.nix`, `nix/` |
 | Upstream drift automation | `scripts/automation/upstream-linux-package-watchdog/`, `.github/workflows/upstream-build-app.yml` |
 
 ## Patches and features
 
-`scripts/patches/runner.js` composes an empty core registry with descriptors
-from enabled features. Patch reports remain the candidate-acceptance contract.
-An enabled feature's missing or drifted required surface rejects promotion;
-disabled features do not participate.
+`scripts/patches/runner.js` composes required core compatibility patches with
+descriptors from enabled features. The current registry repairs the unparented
+Quit-confirmation dialog and defers early shell-environment startup so browser
+initialization does not overwrite libuv's child-process signal handler. See the
+[core patch registry](../scripts/patches/core/README.md) for reproduction evidence
+and retirement criteria. Patch reports remain the candidate-acceptance contract.
+Enabled feature descriptors default to enforced acceptance even when their
+execution policy is optional: warnings or drift reject promotion unless an
+optional descriptor explicitly opts out with `enforceWhenEnabled: false`.
+Target/gate skips are not applicable; disabled feature modules are not loaded.
 
 The committed feature config is empty. Features stage declarative resources,
 runtime hooks, package hooks, or narrowly scoped ASAR descriptors. Native helper
@@ -98,10 +115,13 @@ rebuilds cannot silently use a different selection.
 
 Native packages use `codex-desktop` and `/opt/codex-desktop`; the official app
 uses `chatgpt`. The custom desktop entry is **ChatGPT Community**, with a
-community-marked icon; desktop entries and AppArmor paths are distinct. The
-upstream `Codex` profile is intentionally preserved for compatibility, so both
-runtimes must not run simultaneously. The upstream single-instance lock governs
-a second launch.
+community-marked icon; desktop entries and AppArmor paths are distinct. By
+default the upstream `Codex` profile is intentionally preserved for
+compatibility, so both runtimes must not run simultaneously. The optional
+`community-profile-isolation` feature instead pins Community to a separate
+Codex state directory and Electron profile and keeps app-server/child CLI
+resolution on the bundled Community `codex`. It does not change package
+identity or the official URL handler.
 
 The wrapper has one narrowly scoped migration for bundled Browser and Chrome
 cache snapshots created by the former Linux port. It replaces a cache only when
@@ -112,9 +132,14 @@ user-authored plugins.
 ## Updates
 
 The Rust updater polls signed metadata, downloads into a
-version/architecture/SHA cache, runs the minimal packaged update-builder, and
-builds a sibling candidate. Atomic promotion happens only after the app exits.
-The previous managed artifact is retained for rollback. Legacy schema-v1
+version/architecture/SHA cache, and builds a native package in the configured
+workspace with the minimal packaged update-builder. After the managed app exits,
+it authorizes the package manager through `pkexec`, using a durable transaction
+and command-owner identity to reconcile interrupted installs. Package-manager
+failure can leave partial changes; this is distinct from the atomic sibling
+directory exchange used for manual generated-tree rebuilds. The previous
+managed package is retained for rollback. See [Updater](updater.md) for both
+workflows. Legacy schema-v1
 candidate state is reset without deleting installed or rollback packages. A
 schema-2 interrupted package transaction whose owner identity cannot survive a
 reboot is instead retained as failed evidence behind a manual-recovery barrier;
@@ -130,7 +155,10 @@ committed. See [Generated and runtime notes](agents/generated-and-runtime-notes.
 ## Architecture invariants
 
 - The latest signed stable upstream package is the only supported baseline.
-- The clean ASAR hash equals the official package hash.
+- Without a required core patch or enabled ASAR feature, the clean ASAR hash
+  equals the hash of `resources/app.asar` inside the verified official package.
+  Required core and enabled feature changes are explained by the patch report;
+  an active descriptor does not imply that every build changes bytes.
 - Upstream package scripts and APT source configuration never enter the custom
   output.
 - `codex-desktop` package identity and **ChatGPT Community** display identity

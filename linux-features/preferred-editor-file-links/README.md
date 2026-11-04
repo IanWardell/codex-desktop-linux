@@ -53,6 +53,11 @@ official click/dispatch code through its native mutation boundary. The latter
 checks preference resolution and location arguments, not editor-process launch.
 `arm64`, individual distributable formats, and desktop clicks on Wayland/X11
 have not been validated for this feature.
+For signed official Linux `26.1029.61003` (rspack renderer), upstream
+compiles the click branches into a single conditional chain whose last branch
+opens the side panel; the new branch is inserted before the branch that chooses
+between external and side-panel opening. The anchor was re-verified with the
+feature tests and the official-bundle feature audit.
 
 ```sh
 node --test linux-features/preferred-editor-file-links/test.js

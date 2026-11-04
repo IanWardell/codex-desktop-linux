@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  English | <a href="README.zh-CN.md">简体中文</a>
+  English | <a href="README.zh-CN.md">简体中文</a> | <a href="README.fa.md">فارسی</a>
 </p>
 
 `codex-desktop` is an unofficial, community-maintained distribution of
@@ -16,15 +16,16 @@ repackages the signed upstream Linux payload, adds disabled-by-default Linux
 features, and produces deb, RPM, pacman, AppImage, and Nix outputs.
 
 The custom application appears in desktop menus as **ChatGPT Community** and
-uses an icon marked with a blue `C`. Its package, command, and installation
-identity remain `codex-desktop` and `/opt/codex-desktop`, so it is easy to
-distinguish from OpenAI's separate **ChatGPT** package.
+uses an icon marked with a blue `C`. Its package and command are
+`codex-desktop`, and its installation root is `/opt/codex-desktop`, so it is
+easy to distinguish from OpenAI's separate **ChatGPT** package.
 
 OpenAI's signed Linux `.deb` is the only upstream source. The official
 Electron runtime, native modules, bundled `codex` and `rg`, code-mode host,
-plugins, libraries, locales, and Owl metadata are reused directly. With no
-ASAR-changing feature enabled, `resources/app.asar` remains byte-for-byte
-identical to the official package.
+plugins, libraries, locales, and Owl metadata are reused directly. A clean
+build applies only required compatibility patches to `resources/app.asar` and
+preserves the official ELF runtime and bundled tools byte-for-byte. Optional
+Linux features remain disabled unless explicitly selected.
 
 <p align="center">
   <a href="#install">Install</a> ·
@@ -56,8 +57,23 @@ cd codex-desktop-linux
 | Fedora | `make bootstrap-native` | Builds and installs an RPM |
 | openSUSE | `make bootstrap-native` | Builds and installs an RPM |
 | Arch, Manjaro, EndeavourOS | `make bootstrap-native` | Builds and installs a pacman package |
+| Gentoo | `make bootstrap-native` | Builds a local ebuild and installs through Portage; audited features only, no updater |
 | NixOS or another Nix system | `nix run github:ilysenko/codex-desktop-linux` | Builds and runs the flake output; see [Nix](docs/nix.md) |
 | Atomic desktops or another distribution | `make build-app && make appimage` | Produces a local AppImage without the native updater |
+
+Gentoo's application merge ignores `EMERGE_DEFAULT_OPTS` to install through the
+generated ebuild rather than reuse a binary package. Global Portage settings are unchanged.
+Gentoo has a phase-aware dependency and package-resource framework for audited
+features. `ui-tweaks`, `remote-mobile-control` and
+`community-features-in-gui-settings` are supported and remain
+disabled by default; other repository features require their own support
+declarations. Remote mobile control uses the existing Desktop-owned app-server;
+the ebuild does not install or enable a remote-control service. The read-only
+community catalog is embedded in ASAR and needs no extra Gentoo dependency or
+updater snapshot; see its [Gentoo scope](linux-features/community-features-in-gui-settings/README.md#gentoo)
+and the [Gentoo feature contract](docs/linux-features-architecture.md#gentoo-feature-contract).
+Gentoo's local ebuild path has been tested on OpenRC; a Gentoo systemd
+environment has not been tested. See [Gentoo validation scope](docs/native-setup.md#gentoo-local-ebuild).
 
 The recommended native installation is:
 
@@ -76,7 +92,27 @@ If the dependencies are already installed, use:
 make install-native
 ```
 
-To choose optional features before installing:
+For the graphical guided installer, run the standalone repository entrypoint:
+
+```bash
+./install-community
+```
+
+(`make guided-install` invokes the same entrypoint.) The installer is part of
+the repository setup experience, not an optional Linux feature. On desktops
+with GTK4/PyGObject it walks through feature selection, installation options,
+review, and build/install progress with a live log. Required features are
+selected automatically; conflicting choices are disabled with the reason kept
+visible.
+
+The graphical installer does not modify feature implementations or feature
+settings. It updates only the enabled-feature list and its own installer
+preferences in the gitignored `linux-features/features.json`; any existing
+feature settings are preserved unchanged. Native output always keeps the
+repository identity `codex-desktop` under `/opt/codex-desktop`, whether or not
+the automatic updater is included.
+
+To configure features without installing yet, keep using:
 
 ```bash
 make setup-native
@@ -90,15 +126,26 @@ guided flow, non-interactive settings, updater selection, and cleanup.
 ### Use an already downloaded official package
 
 Normally the build resolves `amd64` or `arm64` from the signed stable index.
-You can instead provide a local package that you already trust:
+You can reuse an already-downloaded package body:
 
 ```bash
 UPSTREAM_DEB=/path/to/chatgpt_<version>_<arch>.deb make build-app
 ```
 
-The local package is still checked for package name, architecture, control
-metadata, payload completeness, and SHA-256 recording. Because signed
-repository discovery is skipped, the caller is responsible for its origin.
+The local package is verified against the signed stable metadata by default,
+including its version, architecture, size, and SHA-256, without downloading its
+body again. All builds verify without prompting or reading user input,
+including interactive local builds. To choose the local exception explicitly:
+
+```bash
+./install.sh --skip-oai-official-sig-verification /path/to/chatgpt_<version>_<arch>.deb
+```
+
+The exception applies only to this invocation and still checks package name,
+version format, architecture, and payload completeness. Build metadata records
+`signatureVerification: "skipped"`; the caller is responsible for provenance.
+Verification errors never silently enable the exception. See
+[Build and packaging](docs/build-and-packaging.md#build-the-application-tree).
 Old `.dmg`, `DMG=`, and `CODEX_DMG_*` inputs are intentionally unsupported.
 
 ### Before you install
@@ -109,10 +156,11 @@ Old `.dmg`, `DMG=`, and `CODEX_DMG_*` inputs are intentionally unsupported.
   `dpkg-deb`, tar, make, and a C/C++ toolchain. Rust is used for the updater and
   enabled native feature helpers. `make bootstrap-native` installs or guides
   you through these requirements.
-- The official `chatgpt` and custom `codex-desktop` packages may coexist, but
-  both intentionally use the upstream `Codex` user profile. Do not run them at
-  the same time; the upstream single-instance lock may route the second launch
-  into the process that is already running.
+- The official `chatgpt` and custom `codex-desktop` packages may coexist. By
+  default they intentionally share the upstream `Codex` user profile and should
+  not run at the same time. The optional `community-profile-isolation` feature
+  gives Community separate Codex and Electron state and pins its bundled CLI so
+  users who need isolated runtimes can avoid that shared-profile boundary.
 - AppImage never adds `--no-sandbox` automatically. If your distribution
   disables unprivileged user namespaces, use the native package or follow the
   sandbox guidance in [Troubleshooting](docs/troubleshooting.md).
@@ -153,6 +201,10 @@ sudo zypper remove codex-desktop
 
 # Arch / Manjaro
 sudo pacman -R codex-desktop
+
+# Gentoo
+sudo emerge --deselect app-misc/codex-desktop
+sudo emerge --unmerge app-misc/codex-desktop
 ```
 
 Native package removal disables the user update service. If a service from an
@@ -185,10 +237,15 @@ updater state, inspect and then delete the following directories:
 ~/.cache/codex-update-manager
 ```
 
+If `community-profile-isolation` was enabled, its Community-owned state is
+`~/.codex-community` and its Electron profile is `~/.config/Codex-Community`.
+Remove those paths only when you intentionally want to delete that isolated
+Community data.
+
 If `remote-mobile-control` was enabled, revoke paired devices before removing
 its private device keys. Do not remove `~/.codex` unless you intentionally want
-to delete the shared Codex profile, configuration, plugins, and project state
-used by both official and Community applications.
+to delete the default shared Codex profile, configuration, plugins, and project
+state.
 
 ## Feature matrix
 
@@ -197,13 +254,13 @@ used by both official and Community applications.
 | Capability | Default | How it is provided |
 |---|---|---|
 | Official ChatGPT Linux runtime | Always | Copied from the verified official `.deb` data payload |
-| Signed source verification | Always | Pinned repository key → `InRelease` → `Packages` SHA-256 → package SHA-256 |
-| Byte-identical baseline ASAR | Always | The ASAR is not unpacked when no enabled feature needs it |
+| Signed source verification | Enabled | Pinned repository key → `InRelease` → `Packages` SHA-256 → package SHA-256; explicit local exceptions are recorded |
 | Native deb, RPM, and pacman packages | Manual build | `make deb`, `make rpm`, or `make pacman` |
 | AppImage | Manual build | `make appimage`; no automatic sandbox bypass or bundled updater |
 | Nix flake | Manual build | `nix run github:ilysenko/codex-desktop-linux` |
 | Transactional update manager | Native packages | Included unless built with `PACKAGE_WITH_UPDATER=0` |
 | Official Browser and Chrome integrations | Upstream | Reused from the official Linux package; no legacy port layer |
+| Focusable Quit confirmation | Always | Required compatibility patch parents the upstream confirmation on Linux |
 | Optional Linux feature framework | Disabled | Configure with `make setup-native` |
 | Distinct desktop identity | Always | **ChatGPT Community**, blue `C` icon, `codex-desktop` package identity |
 
@@ -214,6 +271,7 @@ requirements, known limitations, configuration, and tests.
 
 | Feature ID | Purpose | Documentation |
 |---|---|---|
+| `account-switcher` | Experimental encrypted ChatGPT login switching from the profile menu; requires Secret Service and `secret-tool`; shares local chats and settings | [Docs](linux-features/account-switcher/README.md) |
 | `agent-workspace` | Agent-workspace settings and bridge for hidden desktop environments | [Docs](linux-features/agent-workspace/README.md) |
 | `account-switcher` | Rapid per-account profiles with isolated credentials and optional shared local catalog | [Docs](linux-features/account-switcher/README.md) |
 | `api-key-model-visibility` | Show models reported by API-key authenticated compatible providers | [Docs](linux-features/api-key-model-visibility/README.md) |
@@ -223,15 +281,23 @@ requirements, known limitations, configuration, and tests.
 | `authenticated-proxy` | Username/password support for HTTP proxies | [Docs](linux-features/authenticated-proxy/README.md) |
 | `automation-extensions` | Multi-time schedules and eager `automation_update` exposure | [Docs](linux-features/automation-extensions/README.md) |
 | `browser-proxy` | Pass explicit proxy settings to Browser Use network helpers | [Docs](linux-features/browser-proxy/README.md) |
+| `chatgpt-dil-markdown-fallback` | Show saved Markdown when an interactive ChatGPT reply cannot render | [Docs](linux-features/chatgpt-dil-markdown-fallback/README.md) |
+| `chatgpt-dots-any-country` | Keep ChatGPT Dots entry points visible when the account response is country-gated | [Docs](linux-features/chatgpt-dots-any-country/README.md) |
+| `chatgpt-sidebar-separate-history` | Default the ChatGPT history filter to Chat and remember Chat / Work / All selections | [Docs](linux-features/chatgpt-sidebar-separate-history/README.md) |
 | `chronicle-skysight` | Opt-in Linux desktop activity memory and restricted Skysight MCP tools | [Docs](linux-features/chronicle-skysight/README.md) |
 | `codex-micro` | Work Louder Codex Micro hotplug and hidraw policy using upstream `node-hid` | [Docs](linux-features/codex-micro/README.md) |
+| `community-features-in-gui-settings` | Browse public features, declared subfeatures and enabled local features atop General settings; build-selection counts and statuses, English and Simplified Chinese UI | [Docs](linux-features/community-features-in-gui-settings/README.md) |
+| `community-profile-isolation` | Isolate Community Codex/Electron state and child CLI resolution from official ChatGPT | [Docs](linux-features/community-profile-isolation/README.md) |
 | `computer-use-linux` | Linux desktop-control UI and native MCP backend | [Docs](linux-features/computer-use-linux/README.md) |
 | `copilot-reasoning-effort` | Persistent reasoning-effort defaults for Copilot-auth sessions | [Docs](linux-features/copilot-reasoning-effort/README.md) |
+| `desktop-identity` | Use the Community desktop entry for notification and child-process desktop identity | [Docs](linux-features/desktop-identity/README.md) |
 | `directory-only-working-tree-watch` | Bounded Watchbound working-tree watching | [Docs](linux-features/directory-only-working-tree-watch/README.md) |
 | `filesystem-root-follow-ups` | Allow follow-ups in existing local tasks rooted at `/` | [Docs](linux-features/filesystem-root-follow-ups/README.md) |
 | `flatpak-chrome-native-messaging` | Bridge the official Chrome extension into Flatpak Google Chrome | [Docs](linux-features/flatpak-chrome-native-messaging/README.md) |
 | `frameless-titlebar` | Hide official Linux overlay buttons for compositor-managed decorations | [Docs](linux-features/frameless-titlebar/README.md) |
 | `global-dictation` | X11 and XDG portal global dictation hotkeys | [Docs](linux-features/global-dictation/README.md) |
+| `wayland-global-shortcuts` | Native Wayland support for the app's Popout, Mini/Pet and other global shortcuts; independent of dictation | [Docs](linux-features/wayland-global-shortcuts/README.md) |
+| `global-dictation-gnome` | Optional GNOME Shell paste companion without RemoteDesktop sessions; requires `global-dictation` and explicit extension activation | [Docs](linux-features/global-dictation-gnome/README.md) |
 | `linux-performance-workarounds` | Measured renderer workarounds for affected systems | [Docs](linux-features/linux-performance-workarounds/README.md) |
 | `mcp-helper-reaper` | Reap orphaned MCP helpers without touching live sessions | [Docs](linux-features/mcp-helper-reaper/README.md) |
 | `model-picker-default-presets` | Configure ordered model/effort pairs behind ChatGPT Default | [Docs](linux-features/model-picker-default-presets/README.md) |
@@ -244,14 +310,34 @@ requirements, known limitations, configuration, and tests.
 | `project-task-sort` | Restore Created ordering for alternate Projects tasks | [Docs](linux-features/project-task-sort/README.md) |
 | `read-aloud` | Add Linux read-aloud controls to assistant responses | [Docs](linux-features/read-aloud/README.md) |
 | `read-aloud-mcp` | Let the agent speak through the Linux Read Aloud backend | [Docs](linux-features/read-aloud-mcp/README.md) |
+| `reasoning-visibility` | Add a translated, default-off General setting to show reasoning summaries; changes apply after restart | [Docs](linux-features/reasoning-visibility/README.md) |
 | `record-and-replay` | Record a Linux demonstration and turn it into a reusable skill | [Docs](linux-features/record-and-replay/README.md) |
 | `remote-control-ui` | Expose experimental remote-control settings on Linux | [Docs](linux-features/remote-control-ui/README.md) |
 | `remote-mobile-control` | Experimental Linux remote-host and outbound-control flows | [Docs](linux-features/remote-mobile-control/README.md) |
 | `shallow-repository-watches` | Avoid recursive main-thread walks for transient repository previews | [Docs](linux-features/shallow-repository-watches/README.md) |
 | `shared-app-server-socket` | Share one protocol-transparent Unix app-server socket | [Docs](linux-features/shared-app-server-socket/README.md) |
+| `start-minimized-to-tray` | Add opt-in General settings to start hidden in the tray, either on every launch or only at login autostart | [Docs](linux-features/start-minimized-to-tray/README.md) |
 | `thorium-chrome-plugin` | Add Thorium to the official bundled Chrome integration | [Docs](linux-features/thorium-chrome-plugin/README.md) |
 | `tray-usage` | Show usage remaining in the Linux system-tray menu | [Docs](linux-features/tray-usage/README.md) |
 | `ui-tweaks` | Optional visual and interaction customizations | [Docs](linux-features/ui-tweaks/README.md) |
+
+For GNOME Wayland dictation without RemoteDesktop permission prompts, select
+both `global-dictation` and `global-dictation-gnome` with `make setup-native`,
+then rebuild/install. The first app launch installs the companion for the current
+user; log out/in and explicitly enable it with
+`gnome-extensions enable global-dictation-gnome@chatgpt-community.local`.
+Restart the app/helper after enabling the extension. The helper automatically
+checks the companion's version at startup: a compatible enabled extension selects
+GNOME; otherwise it selects RemoteDesktop. This choice stays fixed until restart.
+Once GNOME is selected, paste errors never fall back to RemoteDesktop or retry.
+The build feature only ships/installs the companion; a manually installed compatible
+extension is also detected. Shortcut approval still uses GlobalShortcuts.
+Disabling the build feature does not uninstall the user extension; see its
+[activation and removal instructions](linux-features/global-dictation-gnome/README.md).
+
+The optional Computer Use backend provides `guard-accessibility` for an
+explicit foreground GNOME accessibility hold-open. It never starts
+automatically; see [Linux Computer Use](docs/linux-computer-use.md).
 
 With `shared-app-server-socket` enabled and Desktop running, use
 `codex-desktop --cli` to attach Codex CLI to Desktop's app-server. See
@@ -259,6 +345,26 @@ With `shared-app-server-socket` enabled and Desktop running, use
 
 Account rollouts and server-side ChatGPT features remain controlled by OpenAI.
 Rebuilding this project does not unlock an account rollout.
+
+For CSS font fallback lists, the optional
+[`ui-tweaks` custom font input](linux-features/ui-tweaks/README.md#appearancecustomfontinput)
+adds a switch between installed-font lists and manual font-stack entry in
+Appearance. This nested tweak is disabled by default and must be enabled in
+local feature settings before rebuilding.
+
+The optional `ui-tweaks` sub-option `tweaks.selection.moreDetails.enabled`
+restores **More details** in the Codex reply selection menu, asking ChatGPT
+Quick Chat to explain the selected text with its source context. It is disabled
+by default; see the [UI Tweaks configuration](linux-features/ui-tweaks/README.md#selectionmoredetails).
+
+When testing a local build, launch `codex-app/start.sh` with the same Electron
+flags as your normal desktop entry, including any required `--proxy-server=...`
+argument. Quick Chat becomes available after ChatGPT account initialization.
+
+The optional `ui-tweaks` sub-option `tweaks.selection.annotationSubmit.enabled`
+makes Ctrl+Enter send the active selected-text annotation editor's text without
+being intercepted by the regular composer; it is disabled by default.
+See the [annotation submit configuration](linux-features/ui-tweaks/README.md#selectionannotationsubmit).
 
 ## Configure optional features
 
@@ -297,12 +403,14 @@ and [feature architecture](docs/linux-features-architecture.md).
 
 ## Updates
 
-Native packages include `codex-update-manager` by default. Its user service
+deb, RPM, and pacman packages include `codex-update-manager` by default. Its user service
 polls the same signed APT metadata, caches official packages by
 version/architecture/SHA-256, reconstructs the selected native package with the
-currently enabled features, and waits for the application to exit before
-promotion. The immediately previous managed package remains available for
-rollback.
+currently enabled features in a separate workspace, and waits for the managed
+application to exit before an authorized package-manager install. A durable
+transaction supports recovery from interrupted or partially applied installs;
+this does not use the manual generated-tree directory exchange. The immediately
+previous managed package remains available for rollback.
 
 ```bash
 codex-update-manager status
@@ -326,8 +434,8 @@ PACKAGE_WITH_UPDATER=0 make package
 make install
 ```
 
-AppImage and repository-only generated apps do not include the native package
-updater. Full behavior and recovery steps are documented in
+AppImage, repository-only generated apps, Nix, and manual-update Gentoo outputs
+do not use the native package updater. Full behavior and recovery steps are documented in
 [Updater](docs/updater.md).
 
 ## Build, package, and run
@@ -361,12 +469,12 @@ output layout, parallelism, and payload inspection.
 | Official and Community launches interfere | Fully exit every `ChatGPT` process; both apps share the upstream profile |
 | AppImage opens from Flatpak Chrome, but the extension says `Native transport disconnected` | Enable `flatpak-chrome-native-messaging`; see [Flatpak Chrome setup](docs/troubleshooting.md#appimage-opens-from-flatpak-chrome-but-the-extension-cannot-connect) |
 | Browser/Chrome extension cannot connect after migration | Exit ChatGPT and Chrome completely, then follow the narrow cache repair in [Troubleshooting](docs/troubleshooting.md#browser-or-chrome-plugin-is-visible-but-cannot-connect) |
-| Signature or package verification fails | Do not bypass it; check time, network, `gpgv`, architecture, and disk space |
+| Signature or package verification fails | Check time, network, `gpgv`, architecture, and disk space; intentional unverified local builds require the documented explicit flag |
 | App does not launch | Run `/opt/codex-desktop/start.sh --diagnose` |
 | App uses XWayland or needs persistent Electron flags | A confirmed Wayland session selects the native backend automatically; pin one with `CODEX_OZONE_PLATFORM=x11\|wayland`, or put one flag per line in `~/.config/codex-desktop/electron-flags.conf`, for example `--ozone-platform=x11` |
 | AppImage reports a sandbox error | Enable user namespaces or install a native package; `--no-sandbox` is not added automatically |
 | Enabled feature drifts after an upstream release | Disable that feature to confirm the clean baseline and attach its patch report to an issue |
-| Updater waits for application exit | Close official and Community processes, then inspect `codex-update-manager status --json` |
+| Updater waits for application exit | Close the managed app (default `/opt/codex-desktop/ChatGPT`); inspect `appExecutable` and `appRunning` with `codex-update-manager diagnose --json` |
 | Old `codex-app.backup-*` reports permission errors | Inspect the exact path and follow the root-owned backup procedure; never delete a wildcard blindly |
 
 Full guide: [Troubleshooting](docs/troubleshooting.md).

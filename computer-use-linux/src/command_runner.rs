@@ -1,8 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use std::{
     io::{self, Read},
-    os::{fd::AsRawFd, unix::process::CommandExt as _},
-    process::{Command as StdCommand, Output, Stdio},
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::process::CommandExt as _,
+    },
+    process::{Command as StdCommand, ExitStatus, Output, Stdio},
     thread,
     time::Instant as StdInstant,
 };
@@ -17,9 +20,49 @@ use tokio::{
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_COMMAND_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
-const BLOCKING_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const EXIT_POLL_INITIAL_INTERVAL: Duration = Duration::from_micros(100);
+const EXIT_POLL_MAX_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_BLOCKING_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_BLOCKING_DRAIN_BYTES: usize = 64 * 1024;
+/// `exec` fails with ETXTBSY while any process holds a write handle on the
+/// program file. That happens when a helper binary is being replaced, and in
+/// tests when another thread forks while a fake script is still open for
+/// writing: the child inherits the O_CLOEXEC handle until its own exec. The
+/// window is short, so retry a few times with a growing pause (75 ms total).
+const TEXT_FILE_BUSY_RETRIES: u32 = 5;
+const TEXT_FILE_BUSY_BACKOFF: Duration = Duration::from_millis(5);
+
+fn is_text_file_busy(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+/// `StdCommand::spawn` that retries a transient ETXTBSY.
+pub(crate) fn spawn_std_retrying_busy(command: &mut StdCommand) -> io::Result<std::process::Child> {
+    let mut attempt = 0;
+    loop {
+        match command.spawn() {
+            Err(error) if is_text_file_busy(&error) && attempt < TEXT_FILE_BUSY_RETRIES => {
+                attempt += 1;
+                thread::sleep(TEXT_FILE_BUSY_BACKOFF * attempt);
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Tokio `Command::spawn` that retries a transient ETXTBSY.
+pub(crate) async fn spawn_retrying_busy(command: &mut Command) -> io::Result<Child> {
+    let mut attempt = 0;
+    loop {
+        match command.spawn() {
+            Err(error) if is_text_file_busy(&error) && attempt < TEXT_FILE_BUSY_RETRIES => {
+                attempt += 1;
+                tokio::time::sleep(TEXT_FILE_BUSY_BACKOFF * attempt).await;
+            }
+            result => return result,
+        }
+    }
+}
 
 pub(crate) async fn output(command: Command, action: &str) -> Result<Output> {
     output_with_timeout(command, action, COMMAND_TIMEOUT).await
@@ -42,6 +85,10 @@ pub(crate) async fn output_with_stdin(
     output_with_input(command, action, timeout, Some(input)).await
 }
 
+pub(crate) fn output_blocking(command: &mut StdCommand, action: &str) -> Result<Output> {
+    output_blocking_with_timeout(command, action, COMMAND_TIMEOUT)
+}
+
 pub(crate) fn output_blocking_with_timeout(
     command: &mut StdCommand,
     action: &str,
@@ -52,9 +99,8 @@ pub(crate) fn output_blocking_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to {action}"))?;
+    let mut child =
+        spawn_std_retrying_busy(command).with_context(|| format!("failed to {action}"))?;
     let pgid = i32::try_from(child.id()).context("child process id did not fit in i32")?;
     let mut stdout = child
         .stdout
@@ -77,6 +123,7 @@ pub(crate) fn output_blocking_with_timeout(
     let mut stdout_eof = false;
     let mut stderr_eof = false;
     loop {
+        let previous_bytes = stdout_bytes.len() + stderr_bytes.len();
         if !stdout_eof {
             match drain_nonblocking(&mut stdout, &mut stdout_bytes) {
                 Ok(eof) => stdout_eof = eof,
@@ -98,26 +145,40 @@ pub(crate) fn output_blocking_with_timeout(
             }
         }
         if stdout_eof && stderr_eof {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    return Ok(Output {
-                        status,
-                        stdout: stdout_bytes,
-                        stderr: stderr_bytes,
-                    });
+            return match wait_for_exit(&mut child, deadline) {
+                Ok(Some(status)) => Ok(Output {
+                    status,
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                }),
+                Ok(None) => {
+                    terminate_blocking_process(&mut child, pgid);
+                    Err(timeout_error(action, timeout))
                 }
-                Ok(None) => {}
                 Err(error) => {
                     terminate_blocking_process(&mut child, pgid);
-                    return Err(error).with_context(|| format!("failed to wait for {action}"));
+                    Err(error).with_context(|| format!("failed to wait for {action}"))
                 }
-            }
+            };
         }
-        if StdInstant::now() >= deadline {
+        let now = StdInstant::now();
+        if now >= deadline {
             terminate_blocking_process(&mut child, pgid);
             return Err(timeout_error(action, timeout));
         }
-        thread::sleep(BLOCKING_POLL_INTERVAL);
+        // Continue draining a busy producer without waiting after every
+        // chunk. Each drain is still capped and the deadline is checked above,
+        // so continuous output cannot starve stderr or bypass the output limit.
+        if stdout_bytes.len() + stderr_bytes.len() == previous_bytes {
+            let open_pipes = [
+                (!stdout_eof).then(|| stdout.as_raw_fd()),
+                (!stderr_eof).then(|| stderr.as_raw_fd()),
+            ];
+            if let Err(error) = wait_for_output(open_pipes, deadline - now) {
+                terminate_blocking_process(&mut child, pgid);
+                return Err(error).with_context(|| format!("failed to wait for {action} output"));
+            }
+        }
     }
 }
 
@@ -137,8 +198,8 @@ async fn output_with_input(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = command
-        .spawn()
+    let child = spawn_retrying_busy(&mut command)
+        .await
         .with_context(|| format!("failed to {action}"))?;
     supervise_child(child, action, timeout, input).await
 }
@@ -360,19 +421,53 @@ fn drain_nonblocking(reader: &mut impl Read, output: &mut Vec<u8>) -> io::Result
     }
 }
 
+/// Blocks until an open pipe has data or hangs up, a signal arrives, or
+/// `timeout` passes. Pipes at EOF are left out because they stay readable.
+fn wait_for_output(open_pipes: [Option<RawFd>; 2], timeout: Duration) -> io::Result<()> {
+    // poll skips a negative descriptor.
+    let mut pollfds = open_pipes.map(|fd| libc::pollfd {
+        fd: fd.unwrap_or(-1),
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    // Round up so a sub-millisecond remainder does not spin at a zero timeout.
+    let timeout_ms = i32::try_from(timeout.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX);
+    if unsafe { libc::poll(pollfds.as_mut_ptr(), 2, timeout_ms) } < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Returns `None` if the process is still running at `deadline`. The exit
+/// status usually trails pipe EOF by microseconds, but a process can close its
+/// pipes long before it exits, so start with a short pause and back off.
+fn wait_for_exit(
+    child: &mut std::process::Child,
+    deadline: StdInstant,
+) -> io::Result<Option<ExitStatus>> {
+    let mut pause = EXIT_POLL_INITIAL_INTERVAL;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let now = StdInstant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(EXIT_POLL_MAX_INTERVAL);
+    }
+}
+
 fn terminate_blocking_process(child: &mut std::process::Child, pgid: i32) {
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
     }
     let _ = child.kill();
-    let deadline = StdInstant::now() + REAP_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) if StdInstant::now() < deadline => thread::sleep(BLOCKING_POLL_INTERVAL),
-            Ok(None) => return,
-        }
-    }
+    let _ = wait_for_exit(child, StdInstant::now() + REAP_TIMEOUT);
 }
 
 async fn terminate_command(
@@ -443,6 +538,78 @@ impl Drop for CancelOnDrop {
 mod tests {
     use super::*;
     use std::{fs, path::PathBuf, time::Instant};
+
+    /// A script whose own write handle is still open: `exec` must fail with
+    /// ETXTBSY until the handle closes.
+    fn busy_script(label: &str) -> (PathBuf, std::fs::File) {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = std::env::temp_dir().join(format!(
+            "computer-use-linux-busy-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        file.flush().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (path, file)
+    }
+
+    #[test]
+    fn blocking_spawn_waits_out_a_transient_text_file_busy() {
+        let (path, writer) = busy_script("std");
+        let direct = StdCommand::new(&path).spawn();
+        assert!(
+            direct.as_ref().err().is_some_and(is_text_file_busy),
+            "an open write handle must make exec fail with ETXTBSY: {direct:?}"
+        );
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            drop(writer);
+        });
+
+        let mut child = spawn_std_retrying_busy(&mut StdCommand::new(&path))
+            .expect("retry must outlast a 20 ms busy window");
+        assert!(child.wait().unwrap().success());
+        release.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn async_spawn_waits_out_a_transient_text_file_busy() {
+        let (path, writer) = busy_script("tokio");
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            drop(writer);
+        });
+
+        let mut child = spawn_retrying_busy(&mut Command::new(&path))
+            .await
+            .expect("retry must outlast a 20 ms busy window");
+        assert!(child.wait().await.unwrap().success());
+        release.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persistent_text_file_busy_is_still_reported() {
+        let (path, writer) = busy_script("persistent");
+        let started = Instant::now();
+
+        let error = spawn_std_retrying_busy(&mut StdCommand::new(&path)).unwrap_err();
+
+        assert!(is_text_file_busy(&error));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the retry budget must stay short"
+        );
+        drop(writer);
+        let _ = fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn timeout_kills_the_child_process() {
@@ -598,6 +765,160 @@ mod tests {
         assert!(output.status.success());
         assert!(output.stdout.len() >= 200_000);
         assert!(output.stderr.len() >= 200_000);
+    }
+
+    #[tokio::test]
+    async fn default_blocking_timeout_kills_the_process_group() {
+        let leader_path = temporary_pid_path("blocking-default-leader");
+        let descendant_path = temporary_pid_path("blocking-default-descendant");
+        let mut command = StdCommand::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "printf %s $$ > '{}'; sleep 60 & printf %s $! > '{}'; wait",
+                leader_path.display(),
+                descendant_path.display()
+            ),
+        ]);
+        let started = Instant::now();
+
+        let error = output_blocking(&mut command, "run blocking process tree").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("timed out after 2000 ms while trying to run blocking process tree"));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let leader = fs::read_to_string(&leader_path)
+            .expect("leader should record its pid")
+            .parse()
+            .expect("leader pid should be numeric");
+        let descendant = fs::read_to_string(&descendant_path)
+            .expect("descendant should record its pid")
+            .parse()
+            .expect("descendant pid should be numeric");
+        wait_for_process_exit(leader).await;
+        wait_for_process_exit(descendant).await;
+        let _ = fs::remove_file(leader_path);
+        let _ = fs::remove_file(descendant_path);
+    }
+
+    #[test]
+    fn blocking_output_returns_when_a_fast_command_exits() {
+        const RUNS: u32 = 100;
+        let started = Instant::now();
+        for _ in 0..RUNS {
+            let output = StdCommand::new("true").output().unwrap();
+            assert!(output.status.success());
+        }
+        let direct = started.elapsed();
+
+        let started = Instant::now();
+        for _ in 0..RUNS {
+            let output = output_blocking(&mut StdCommand::new("true"), "run true").unwrap();
+            assert!(output.status.success());
+        }
+        let blocking = started.elapsed();
+
+        // Both loops pay the same spawn cost, so compare only what the runner
+        // adds. Pausing 10 ms whenever a pass reads nothing would add over 1 s.
+        assert!(
+            blocking.saturating_sub(direct) < Duration::from_millis(500),
+            "{RUNS} runs of true took {blocking:?} through output_blocking and {direct:?} directly"
+        );
+    }
+
+    #[test]
+    fn blocking_output_drains_large_stdout_and_stderr() {
+        let mut command = StdCommand::new("sh");
+        command.args([
+            "-c",
+            "yes stdout | head -c 200000; yes stderr | head -c 200000 >&2",
+        ]);
+
+        let output = output_blocking_with_timeout(
+            &mut command,
+            "collect noisy output",
+            Duration::from_secs(5),
+        )
+        .expect("noisy command should complete");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 200_000);
+        assert_eq!(output.stderr.len(), 200_000);
+    }
+
+    #[test]
+    fn blocking_output_sleeps_while_one_pipe_stays_open() {
+        let mut command = StdCommand::new("sh");
+        command.args(["-c", "exec >&-; sleep 0.2"]);
+        let cpu_before = thread_cpu_time();
+
+        output_blocking(&mut command, "wait on stderr").unwrap();
+
+        let cpu = thread_cpu_time() - cpu_before;
+        assert!(
+            cpu < Duration::from_millis(50),
+            "waiting 200 ms used {cpu:?} of CPU"
+        );
+    }
+
+    #[test]
+    fn blocking_output_waits_for_a_leader_that_closed_its_pipes() {
+        let mut command = StdCommand::new("sh");
+        command.args(["-c", "exec >&- 2>&-; sleep 0.2; exit 3"]);
+        let started = Instant::now();
+
+        let output = output_blocking_with_timeout(
+            &mut command,
+            "wait for quiet leader",
+            Duration::from_secs(5),
+        )
+        .expect("leader should exit before the timeout");
+
+        assert_eq!(output.status.code(), Some(3));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn blocking_timeout_kills_a_leader_that_closed_its_pipes() {
+        let leader_path = temporary_pid_path("closed-pipes-leader");
+        let mut command = StdCommand::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "exec >&- 2>&-; printf %s $$ > '{}'; exec sleep 60",
+                leader_path.display()
+            ),
+        ]);
+        let started = Instant::now();
+
+        let error = output_blocking_with_timeout(
+            &mut command,
+            "run quiet leader",
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("timed out after 100 ms while trying to run quiet leader"));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let leader = wait_for_pid(&leader_path).await;
+        wait_for_process_exit(leader).await;
+        let _ = fs::remove_file(leader_path);
+    }
+
+    fn thread_cpu_time() -> Duration {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+            0
+        );
+        Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
     }
 
     fn temporary_pid_path(label: &str) -> PathBuf {

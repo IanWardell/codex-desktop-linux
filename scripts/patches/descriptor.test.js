@@ -84,7 +84,7 @@ test("descriptor factories validate the fresh descriptor contract", () => {
 
   assert.throws(
     () => webviewAssetPatch({ id: "missing-pattern", apply: (source) => source }),
-    /must define assetPattern or pattern/,
+    /must define assetNeedles, assetPattern or pattern/,
   );
   assert.throws(
     () => webviewAssetPatch({
@@ -150,4 +150,137 @@ test("missing required phase remains fail-closed", () => {
   assert.equal(report.patches[0].status, "failed-required");
   assert.equal(report.patches[0].unavailable, true);
   assert.equal(criticalFailuresFromReport(report).length, 1);
+});
+
+test("main-process descriptors patch only the rspack chunk that holds their anchor", () => {
+  const { applyMainProcessChunkPatchDescriptors } = require("./engine.js");
+  const descriptors = normalizePatchDescriptors([
+    mainBundlePatch({
+      id: "anchored",
+      apply(source) {
+        if (!source.includes("ANCHOR")) {
+          console.warn("WARN: anchor missing - skipping anchored patch");
+          return source;
+        }
+        return source.replace("ANCHOR", "PATCHED");
+      },
+    }),
+    mainBundlePatch({
+      id: "missing",
+      apply(source) {
+        console.warn("WARN: nothing to patch - skipping missing patch");
+        return source;
+      },
+    }),
+  ]);
+  const report = createPatchReport();
+  const chunks = applyMainProcessChunkPatchDescriptors(
+    [
+      { name: "early-bootstrap.js", source: "entry" },
+      { name: "early-bootstrap-916-0123456789abcdef.js", source: "x ANCHOR y" },
+    ],
+    descriptors,
+    {},
+    report,
+  );
+
+  assert.deepEqual(chunks.map(({ source }) => source), ["entry", "x PATCHED y"]);
+  const anchored = report.patches.find((patch) => patch.name === "anchored");
+  assert.equal(anchored.status, "applied");
+  assert.deepEqual(anchored.chunks, ["early-bootstrap-916-0123456789abcdef.js"]);
+  assert.equal(anchored.warnings, undefined);
+  const missing = report.patches.find((patch) => patch.name === "missing");
+  assert.equal(missing.status, "skipped-optional");
+  assert.match(missing.reason, /^missing matched no main-process chunk: nothing to patch/);
+});
+
+test("a main-process descriptor that throws on every chunk keeps its error", () => {
+  const { applyMainProcessChunkPatchDescriptors } = require("./engine.js");
+  const report = createPatchReport();
+  applyMainProcessChunkPatchDescriptors(
+    [{ name: "early-bootstrap.js", source: "entry" }],
+    normalizePatchDescriptors([mainBundlePatch({
+      id: "throws",
+      apply() {
+        throw new Error("expected one current contract");
+      },
+    })]),
+    {},
+    report,
+  );
+  assert.equal(report.patches[0].status, "skipped-optional");
+  assert.match(report.patches[0].reason, /expected one current contract/);
+});
+
+test("main-process chunk misses are not printed once the descriptor applies", () => {
+  const { applyMainProcessChunkPatchDescriptors } = require("./engine.js");
+  const printed = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => printed.push(args.join(" "));
+  try {
+    applyMainProcessChunkPatchDescriptors(
+      [
+        { name: "early-bootstrap.js", source: "entry" },
+        { name: "early-bootstrap-1-0123456789abcdef.js", source: "ANCHOR" },
+      ],
+      normalizePatchDescriptors([mainBundlePatch({
+        id: "quiet",
+        apply(source) {
+          if (!source.includes("ANCHOR")) {
+            console.warn("WARN: anchor missing - skipping quiet patch");
+            return source;
+          }
+          return "PATCHED";
+        },
+      })]),
+      {},
+      createPatchReport(),
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.deepEqual(printed, []);
+});
+
+test("webview descriptors find rspack async chunks by content needles", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const { applyWebviewAssetPatchDescriptors } = require("./engine.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "webview-needles-"));
+  try {
+    const assets = path.join(root, "webview", "assets");
+    fs.mkdirSync(path.join(assets, "async"), { recursive: true });
+    fs.writeFileSync(path.join(assets, "158624.372d9fdf73.js"), "entry ANCHOR_A");
+    fs.writeFileSync(path.join(assets, "async", "24191.7b05d5cf83.js"), "lazy ANCHOR_A ANCHOR_B");
+    fs.writeFileSync(path.join(assets, "async", "24192.7b05d5cf83.js"), "lazy ANCHOR_B");
+    const report = createPatchReport();
+    applyWebviewAssetPatchDescriptors(root, normalizePatchDescriptors([
+      webviewAssetPatch({
+        id: "needles",
+        assetNeedles: ["ANCHOR_A", "ANCHOR_B"],
+        apply: (source) => source.replace("lazy", "patched"),
+      }),
+      webviewAssetPatch({
+        id: "unique",
+        assetNeedles: ["ANCHOR_B"],
+        assetMatch: (source, assetName) => assetName.startsWith("async/") && !source.includes("ANCHOR_A"),
+        apply: (source) => source.replace("lazy", "unique"),
+      }),
+    ]), {}, report);
+    assert.equal(fs.readFileSync(path.join(assets, "async", "24191.7b05d5cf83.js"), "utf8"), "patched ANCHOR_A ANCHOR_B");
+    assert.equal(fs.readFileSync(path.join(assets, "async", "24192.7b05d5cf83.js"), "utf8"), "unique ANCHOR_B");
+    assert.equal(fs.readFileSync(path.join(assets, "158624.372d9fdf73.js"), "utf8"), "entry ANCHOR_A");
+    assert.deepEqual(report.patches.map(({ status }) => status), ["applied", "applied"]);
+    assert.equal(report.patches[1].assetName, "async/24192.7b05d5cf83.js");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("webview descriptors reject empty content needles", () => {
+  assert.throws(
+    () => webviewAssetPatch({ id: "bad", assetNeedles: [""], apply: (source) => source }),
+    /assetNeedles must be non-empty strings/,
+  );
 });

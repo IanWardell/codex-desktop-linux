@@ -22,9 +22,35 @@ bash -n install.sh launcher/start.sh.template scripts/install-deps.sh \
   scripts/rebuild-candidate.sh scripts/select-latest-package.sh \
   tests/install_deps_pacman_rust_matrix.sh
 bash -n scripts/lib/*.sh scripts/build-deb.sh scripts/build-rpm.sh scripts/build-pacman.sh scripts/build-appimage.sh
+bash -n scripts/build-gentoo.sh scripts/install-gentoo.sh
+node --test scripts/gentoo-native.test.js scripts/gentoo-install.test.js scripts/lib/gentoo-feature-support.test.js
 
 assert_contains packaging/linux/codex-desktop.desktop '^Name=ChatGPT Community$'
 assert_contains packaging/linux/codex-desktop.desktop '^Comment=Community Linux distribution based on OpenAI ChatGPT$'
+
+# The official app ignores --new-instance and CODEX_MULTI_LAUNCH: a second
+# launch only focuses the existing window. A "New Window" desktop action built
+# on them does nothing while the app runs (#1655), so no entry may offer one.
+for desktop_source in packaging/linux/codex-desktop.desktop \
+    packaging/appimage/codex-desktop.desktop flake.nix; do
+    assert_absent "$desktop_source" 'new-window|new-instance|CODEX_MULTI_LAUNCH'
+done
+desktop_fixture="$(mktemp -d "${TMPDIR:-/tmp}/codex-desktop-entry-smoke.XXXXXX")"
+(
+    eval "$(sed -n '/^sed_escape_replacement()/,/^}/p; /^package_with_updater_enabled()/,/^}/p; /^render_desktop_entry()/,/^}/p' scripts/lib/package-common.sh)"
+    PACKAGE_NAME=codex-desktop
+    DESKTOP_TEMPLATE=packaging/linux/codex-desktop.desktop
+    PACKAGE_WITH_UPDATER=1 render_desktop_entry "$desktop_fixture/with-updater.desktop"
+    PACKAGE_WITH_UPDATER=0 render_desktop_entry "$desktop_fixture/without-updater.desktop"
+)
+assert_contains "$desktop_fixture/with-updater.desktop" '^Actions=CheckForUpdates;InstallReadyUpdate;$'
+assert_absent "$desktop_fixture/without-updater.desktop" '^Actions=|^\[Desktop Action '
+assert_contains "$desktop_fixture/without-updater.desktop" '^Exec=.*/usr/bin/codex-desktop %u$'
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "$desktop_fixture/with-updater.desktop" "$desktop_fixture/without-updater.desktop" ||
+        fail "rendered desktop entries are invalid"
+fi
+rm -rf "$desktop_fixture"
 assert_contains install.sh 'CODEX_APP_DISPLAY_NAME:-ChatGPT Community'
 assert_contains install.sh 'cp .*ICON_SOURCE.*CODEX_APP_ID'
 assert_contains install.sh 'cp .*ICON_SOURCE.*resources/icon-chatgpt.png'
@@ -42,12 +68,68 @@ assert_contains Makefile 'scripts/select-latest-package.sh'
 assert_contains Makefile 'build-native-feature-helpers'
 assert_contains Makefile 'global-dictation-linux/Cargo.toml --target-dir global-dictation-linux/target'
 assert_absent Makefile "compgen -G \"\$\$1\" | sort -V"
+
+# A positional .deb argument equal to the UPSTREAM_DEB environment value must be
+# accepted as one input: the Makefile forwards UPSTREAM_DEB both through the
+# recipe environment and as the positional $(UPSTREAM_ARG), and install.sh used
+# to reject that documented combination as a duplicate input.
+smoke_parse_args_fixture() {
+    # $1 = UPSTREAM_DEB value, $2 = positional argument, $3 = output path
+    {
+        echo 'error() { echo "error: $*" >&2; exit 1; }'
+        echo "PROVIDED_UPSTREAM_DEB_PATH=\"$1\""
+        sed -n '/^parse_args()/,/^}/p' scripts/lib/install-helpers.sh
+        printf 'parse_args "%s"\n' "$2"
+    } > "$3"
+}
+smoke_parse_args_accepts_matching_env_positional() {
+    local fixture
+    fixture="$(mktemp)"
+    smoke_parse_args_fixture \
+        /tmp/chatgpt_26.915.31945_amd64.deb \
+        /tmp/chatgpt_26.915.31945_amd64.deb \
+        "$fixture"
+    if ! bash "$fixture"; then
+        rm -f "$fixture"
+        fail "parse_args rejected a positional .deb identical to UPSTREAM_DEB"
+    fi
+    rm -f "$fixture"
+}
+smoke_parse_args_rejects_conflicting_paths() {
+    local fixture
+    fixture="$(mktemp)"
+    smoke_parse_args_fixture \
+        /tmp/chatgpt_26.915.31945_amd64.deb \
+        /tmp/chatgpt_26.915.31029_amd64.deb \
+        "$fixture"
+    if bash "$fixture" 2>/dev/null; then
+        rm -f "$fixture"
+        fail "parse_args accepted conflicting upstream .deb paths"
+    fi
+    rm -f "$fixture"
+}
+smoke_parse_args_accepts_matching_env_positional
+smoke_parse_args_rejects_conflicting_paths
 assert_absent launcher/start.sh.template 'local content server'
 assert_contains packaging/linux/control 'official Linux runtime'
 assert_contains packaging/linux/codex-desktop.spec 'official runtime'
 assert_contains flake.nix 'systemd util-linux xdg-utils'
 assert_contains packaging/linux/codex-packaged-runtime.sh 'codex-update-manager check-now'
 assert_absent packaging/linux/codex-packaged-runtime.sh '--if-stale'
+assert_contains scripts/lib/install-helpers.sh 'sudo apt install nodejs npm curl dpkg-dev gnupg'
+# Anchored guards: assert executable code lines, not comment prose, so a
+# removed guard actually fails the smoke run even when the explanatory
+# comment keeps the words. (rg patterns: avoid unescaped regex metachars.)
+assert_contains scripts/lib/asar-patch.sh '^    command -v npx >/dev/null 2>&1 \|\| error'
+assert_contains scripts/lib/asar-patch.sh '^    asar_command=\("\$\(resolve_asar_command\)"\)$'
+assert_absent scripts/lib/asar-patch.sh 'asar_command=\(npx'
+assert_contains scripts/lib/asar-patch.sh '^        --unpack "\{\*\.node,\*\.so,\*\.dylib\}"'
+assert_contains scripts/lib/install-helpers.sh '^    if \[ -z "\$\{CODEX_ASAR_BIN:-\}" \] && ! command -v npx &>/dev/null; then$'
+assert_contains scripts/lib/asar-patch.sh 'list --is-pack "\$app_asar" > "\$WORK_DIR/app.asar.upstream-layout"'
+assert_contains scripts/lib/asar-patch.sh 'scripts/patches/lib/asar-layout.js'
+assert_contains scripts/lib/asar-patch.sh 'scripts/patches/lib/asar-layout.js" verify'
+assert_absent scripts/lib/asar-patch.sh 'cmp -s "\$WORK_DIR/app.asar.upstream-layout" "\$WORK_DIR/app.asar.output-layout"'
+assert_absent scripts/lib/asar-patch.sh "find . -type f -printf '%P\\n' | LC_ALL=C sort"
 
 selector_fixture="$(mktemp -d)"
 trap 'rm -rf -- "$selector_fixture"' EXIT
@@ -78,6 +160,35 @@ report.patches[0].status = "applied";
 fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
 NODE
 patch_report_has_changes "$asar_report" || fail "applied ASAR descriptors must be packed"
+
+# ASAR glob arguments must not pass through npx's shell: a brace glob such as
+# `{*.node,*.so,*.dylib}` is split into separate words there, so asar would
+# honor only the first alternative and silently drop the remaining unpack
+# rules. The resolved CLI is executed directly instead.
+asar_stub_dir="$selector_fixture/asar-stub"
+mkdir -p "$asar_stub_dir"
+cat > "$asar_stub_dir/asar" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$0"
+STUB
+cat > "$asar_stub_dir/npx" <<'STUB'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --yes|--package=@electron/asar) shift ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+PATH="$(cd "$(dirname "$0")" && pwd):$PATH" exec "$@"
+STUB
+chmod +x "$asar_stub_dir/asar" "$asar_stub_dir/npx"
+resolved_asar="$(export PATH="$asar_stub_dir:$PATH"; resolve_asar_command)"
+[ "$resolved_asar" = "$asar_stub_dir/asar" ] ||
+    fail "asar CLI resolution must return a directly executable path: $resolved_asar"
+configured_asar="$(export CODEX_ASAR_BIN="$asar_stub_dir/asar"; resolve_asar_command)"
+[ "$configured_asar" = "$asar_stub_dir/asar" ] ||
+    fail "CODEX_ASAR_BIN must be honored without npx resolution"
 record_patch_report_asar_hashes "$asar_report" upstream-sha output-sha true
 node - "$asar_report" <<'NODE'
 const fs = require("node:fs");
@@ -90,8 +201,11 @@ NODE
 node - <<'NODE'
 const { corePatchDescriptors } = require("./scripts/patches/runner.js");
 const descriptors = corePatchDescriptors();
-if (descriptors.length !== 0) {
-  throw new Error("official baseline core patch registry must be empty");
+if (descriptors.length !== 1 ||
+    descriptors[0].id !== "quit-confirmation-focus" ||
+    descriptors[0].ciPolicy !== "required-upstream" ||
+    descriptors[0].phase !== "extracted-app:pre-webview") {
+  throw new Error(`Unexpected default core patch registry: ${descriptors.map(({ id }) => id).join(", ")}`);
 }
 NODE
 
@@ -117,7 +231,13 @@ for (const architecture of ["amd64", "arm64"]) {
 NODE
 
 node --test launcher/start.test.js tests/deb-prerm.test.js scripts/lib/upstream-linux-package.test.js \
+  scripts/lib/install-verification.test.js \
   scripts/automation/upstream-linux-package-watchdog/test.js \
-  scripts/patch-linux-window-ui.test.js scripts/lib/linux-features.test.js
+  scripts/patch-linux-window-ui.test.js scripts/patches/runner.test.js \
+  scripts/patches/lib/asar-layout.test.js \
+  scripts/patches/lib/global-shortcuts-portal.test.js \
+  scripts/patches/lib/minified-js.test.js scripts/patches/lib/assets.test.js \
+  scripts/patches/core/*/test.js \
+  scripts/lib/linux-features.test.js
 
 echo "[smoke] official Linux-package source, launcher, feature registry, packages, and pins are coherent"

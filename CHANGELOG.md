@@ -7,6 +7,111 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Synchronize the embedded Computer Use backend to standalone v0.7.38. On
+  Sway the i3 backend scales window bounds from layout coordinates to capture
+  pixels when every active output has the same scale, with edges rounded
+  outward, and leaves them out with mixed scales or unreadable outputs;
+  before, a window crop or window-relative click on a scaled output hit the
+  wrong region. Disabled and non-desktop outputs no longer make the Sway
+  output layout unreadable. The backend runs `swaymsg` when `i3-msg` is
+  missing and takes the first of `I3SOCK` and `SWAYSOCK` that names a socket
+  file, then the newest i3 socket, then the newest `sway-ipc.*.sock`, so Sway
+  works without the i3 package. A failed `swaymsg` command reports the error
+  it printed on stdout.
+- Synchronize the embedded Computer Use backend to standalone v0.7.37. The
+  i3 backend also serves Sway: it lists and focuses native Wayland windows
+  (focus by `con_id`) with pids from the tree, and focuses X11 windows by
+  their decimal id, which Sway requires. A native Wayland window's
+  `window_id` is 2^32 plus its Sway container id, so it never collides with
+  an X11 id. A window counts as hidden only while it sits in the scratchpad,
+  so a shown Sway scratchpad window can be cropped and a hidden i3 one is
+  marked hidden. An element action with an exact window target is refused
+  when the cached tree was narrowed to one window but recorded none, or
+  recorded one another window backend listed. The lockfile moves off the
+  yanked async-executor 1.14.0. The screenshot
+  backend pin `CODEX_COMPUTER_USE_SCREENSHOT_BACKEND` also reads the
+  standalone `COMPUTER_USE_LINUX_SCREENSHOT_BACKEND`, and the indicator's
+  agent name override also reads `CODEX_COMPUTER_USE_AGENT_NAME`, like every
+  other embedded setting.
+- Synchronize the embedded Computer Use backend to standalone v0.7.36. List
+  and focus windows through `zwlr_foreign_toplevel_manager_v1` on wlroots
+  compositors without a dedicated backend, and send `press_key` chords
+  through `wtype` where no RemoteDesktop portal exists. Hyprland background
+  input releases a key left down by a failed batch and refuses modifier-only
+  chords. Same-pid windows and post-action trees close gaps in the element
+  ownership check, and an unraised window crop of an unfocused target is
+  refused. A compositor title that decorates the frame name (a Chromium
+  profile suffix) narrows the tree to that frame. When the window listing is
+  unavailable, `perform_action` and `set_value` with a window target and a
+  `pid` check ownership by the pid instead of refusing.
+  `CODEX_COMPUTER_USE_FORCE_PORTAL_KEYBOARD` keeps working for the new chord
+  route, and Hyprland background mode also reads
+  `CODEX_COMPUTER_USE_HYPRLAND_BACKGROUND`.
+- Synchronize the embedded Computer Use backend to standalone v0.7.35.
+  Accessibility trees use the compact node encoding by default, with
+  `verbose: true` for the full encoding. `get_app_state` takes
+  `interactive_only: true` and scopes the tree to the targeted window, and
+  the element action tools take the same app target `click` takes. v0.7.35
+  adds the capture-order refusal and Hyprland background mode below, plus the
+  EIS restore-grant and pixelflux fixes under Fixed.
+- Synchronize the embedded Computer Use backend to standalone v0.7.33. Drive
+  Selkies desktops through the pixelflux computer-use API, use the portal's
+  negotiated EIS pointer regions on GNOME, and bound wlroots output
+  discovery.
+- Refuse an unfocused targeted `get_app_state` screenshot before capturing
+  anything, instead of grabbing the desktop and raising a portal prompt only
+  to discard the image.
+- Hyprland background mode: with `CODEX_COMPUTER_USE_HYPRLAND_BACKGROUND=1`
+  (standalone alias `COMPUTER_USE_LINUX_HYPRLAND_BACKGROUND=1`),
+  targeted keyboard input goes through `send_key_state` on the control
+  socket without focusing the window, and unfocused targets are captured
+  with `grim -T`, including windows on hidden workspaces. Keys never appear
+  in process arguments, the indicator shows the input (masked unless the
+  field is confirmed non-secret), and delivery errors say how many presses
+  were confirmed so the caller sends only the remainder.
+- Synchronize the embedded Computer Use backend to standalone v0.7.32. Add
+  Selkies labwc window listing and activation, fix Konsole terminal paste and
+  KWin logical output geometry, and repair GNOME capture acknowledgement.
+  Native X11 pointer input now requires `xdotool`: clicks, scrolls and drags
+  use XTEST on the selected display and fail without a system-wide fallback
+  when `xdotool` is missing. Pace drag motion, preserve portal drags across
+  monitor gaps, and attempt button release after press or motion failures.
+- Synchronize the embedded Computer Use backend to standalone v0.7.31. Use
+  per-monitor COSMIC portal coordinates and wait for EIS input readiness.
+  Preserve and verify the target's focus across portal consent, read COSMIC
+  window and output geometry, and avoid opening the GNOME overview when
+  checking existing app focus.
+- Synchronize the embedded Computer Use backend to standalone v0.7.30. Wake
+  command readers when subprocesses finish instead of polling every 10 ms.
+- Synchronize the embedded Computer Use backend to standalone v0.7.29. Cache
+  desktop diagnostics for repeated `get_app_state` calls while rechecking
+  accessibility each time. Refresh diagnostics for verbose requests,
+  observation failures, failed actions and setup changes.
+- Synchronize the embedded Computer Use backend to standalone v0.7.28. Report
+  failed window lookup or activation as backend `unavailable` instead of
+  incorrectly identifying GNOME Shell Introspect.
+- Synchronize the embedded Computer Use backend to standalone v0.7.27. Bound
+  large accessibility-tree tool results to 32,000 bytes, spill the complete
+  compacted tree to a private file, and add `get_tree_page` for hosts that
+  cannot read spill files. Preserve element indices across pages.
+- Synchronize the embedded Computer Use backend to standalone v0.7.26. Find
+  focused Chromium contenteditable editors, return partial trees when
+  snapshots reach their deadline, and allow `max_nodes` up to 10000.
+- Synchronize the embedded Computer Use backend to standalone v0.7.25. Accept
+  explicit AT-SPI logical pointer coordinates through verified KWin geometry,
+  reject ambiguous same-process window ownership, and capture through an
+  already-running desktop portal without requiring a D-Bus activation file.
+
+- Synchronize the embedded Computer Use backend to standalone v0.7.24. Carry scoped semantic recovery, exact Unicode editable-text verification, Qt native actions, KWin fractional-scale and dialog targeting, and X11 dispatch monitoring. Preserve Codex identities, Chrome integration, avatar feedback and cancellation guards.
+
+- Synchronize the embedded Computer Use backend from v0.4.9 to standalone
+  v0.7.6 as `0.7.6-linux-alpha1`. Carry the accessibility setup/guard, native
+  AT-SPI actions, X11 geometry and screenshots, bounded KWin transactions,
+  safe typing/cancellation, optional completion cue and portal persistence
+  changes. Portal keyboard chords resolve modifiers and named keys through
+  the live keymap on GNOME; letters/digits stay physical and KDE retains its
+  keycode path. Preserve Codex DBus, Chrome, identity and operation guards.
+
 - The launcher sends at most one anonymous `/app-launch` count per UTC day to
   the public GoatCounter dashboard so maintainers can gauge whether the
   distribution is useful. The background request uses one fixed,
@@ -36,8 +141,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   XDG GlobalShortcuts and RemoteDesktop portals for press, release, and paste
   handling without direct input-device access or elevated permissions.
 
+### Fixed
+
+- AppShots focuses windows from the i3 backend the way the backend does: by
+  the decimal X11 id, or by `con_id` for a native Wayland window on Sway,
+  through `i3-msg`, or `swaymsg` when i3 is not installed, on the same IPC
+  socket. It sent a hex id, which Sway rejects, and always ran `i3-msg`. It
+  skips the X11 window capture for windows without an X11 id. On Sway it picks
+  a target from Xwayland stacking only when no native Wayland window is open
+  besides ChatGPT, and otherwise offers none instead of guessing.
+- The Chrome extension host retries an app-server start that fails with
+  "Text file busy" (ETXTBSY), as the main backend already does for its
+  helpers. exec fails that way while a thread that forked during the write
+  still holds the executable open, which made Chrome host tests flaky.
+- Keep the remote desktop restore grant when EIS setup fails after Start on a
+  non-GNOME session such as COSMIC, so persistence does not drop the grant
+  and prompt for consent again. The GNOME EIS fallback path already retained
+  it.
+- Connect the pixelflux client to the configured loopback host instead of
+  always dialing 127.0.0.1, so `[::1]:PORT` reaches an IPv6-only server. Read
+  screenshot dimensions from the PNG header instead of fully decoding the
+  image, cap the typing request timeout at two minutes, and refuse text past
+  the timeout budget before anything is sent instead of timing out mid-typing.
+
 ### Changed
 
+- Restored and adapted the required Quit-confirmation focus patch because the
+  current signed Linux package still opens its synchronous confirmation without
+  a parent window. The patch discovers the handler through its unique semantic
+  contract, uses a visible parent with reentrancy protection, and fails closed
+  when that contract drifts.
 - Remote mobile control now relies on the current upstream account-enrollment
   compatibility and Connections tab resolver instead of patching duplicate
   Linux-specific fallbacks into those paths.
@@ -50,6 +183,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Desktop entries no longer offer a "New Window" action. It relied on the
+  retired multi-instance launcher (`--new-instance`, `CODEX_MULTI_LAUNCH`),
+  which the official app ignores, so it did nothing while the app was running
+  (#1655). Use the app's own New Window command instead.
+- The app no longer stops at launch with "Organization settings could not be
+  loaded" on upstream 26.1021+. The remote-mobile-control patch added
+  `--remote-control` (or the `proxy` subcommand) to every app-server launch,
+  including the one-shot `--print-startup-config` check, which app-server
+  0.164 rejects. Startup checks now run without those arguments; the
+  long-running Desktop app-server still owns Remote Control.
+- The updater no longer leaks a ~2 GB `workspaces/<version>` directory per
+  release under `~/.cache/codex-update-manager`. Cache cleanup only pruned
+  superseded upstream `.deb` files, so every rebuilt candidate's extracted app
+  and package stayed on disk indefinitely (one long-running install reached
+  34 workspaces / 59 GB). Cleanup now also removes workspaces that no persisted
+  path still references, keeping the active build, the rebuilt package, the
+  rollback package, and any in-flight install transaction, and it never follows
+  a symlinked workspace root.
+- The documented `UPSTREAM_DEB=/path/to/chatgpt_<version>_<arch>.deb make build-app`
+  invocation (also `make rebuild`, `rebuild-install`, `inspect-upstream`, and
+  `rebuild-next`) no longer fails with "Only one upstream .deb path may be
+  provided". The Makefile forwards `UPSTREAM_DEB` to `install.sh` both through
+  the recipe environment and as the positional argument, and duplicate-input
+  detection treated that single documented input as two conflicting paths. A
+  positional argument is now rejected only when it differs from the
+  environment-provided path.
+- The NixOS module publishes the package's workspace runtime libraries through
+  `programs.nix-ld.libraries` when `programs.nix-ld` is enabled. Codex sources
+  a login-shell snapshot before every sandboxed command, and on such systems
+  that snapshot restores the host `NIX_LD_LIBRARY_PATH` over the value set by
+  the packaged Bubblewrap adapter, so the adapter's libraries never reached the
+  primary runtime's headless LibreOffice. The package exposes the list as
+  `passthru.workspaceRuntimeLibraries`; the module test and the NixOS VM test
+  cover the nix-ld path.
+- The Nix workspace runtime now lets the primary runtime's bundled headless
+  LibreOffice start on NixOS. Document conversions previously failed with
+  `liblcms2.so.2: cannot open shared object file` and, once that library was
+  present, `libcurl.so.4: version CURL_OPENSSL_4 not found`, because the
+  sandbox library path carried only the GnuTLS-compat curl needed by the
+  bundled Git. The path now includes `freetype` and `lcms2` and places the
+  stock curl ahead of the GnuTLS-compat build, so `libcurl.so.4` resolves with
+  OpenSSL symbol versions while `libcurl-gnutls.so.4` still reaches Git. The
+  `nix-runtime` checks and the VM smoke test run a document-runtime probe that
+  links all three libraries.
 - Default builds now repair the renderer module cycle in signed stable Linux
   `26.908.31748` that can leave the main window empty with
   `Initial route prefetch failed: n is not a function`. The required core
@@ -223,8 +400,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   kill and held the pipe open until the sleep expired, so even a CLI that
   answers `--version` in ~50 ms blocked the launch path for ~1 s. The
   watchdog now runs detached from the caller's stdout/stderr, cutting that
-  launch phase from ~1010 ms to ~74 ms and making the window (and GNOME's
-  startup feedback) appear about a second sooner on every cold start.
+- ASAR repacking no longer drops unpack rules for official packages that mark
+  whole directories as unpacked. The build invoked asar through
+  `npx --yes @electron/asar`, and npx re-parses its arguments through a shell
+  on POSIX; that shell expanded the `{*.node,*.so,*.dylib}` unpack glob and
+  multi-directory `--unpack-dir "{a,b}"` patterns into separate words, so asar
+  silently honored only the first alternative. The signed stable package
+  `26.924.22138` marks `node-hid/hidapi`, `node-hid/node_modules`,
+  `better-sqlite3/lib`, `node-pty/build`, and other directories as unpacked,
+  so repacking it failed the fail-closed layout verification and the candidate
+  was never promoted. The asar CLI is now resolved once and invoked directly,
+  which keeps glob arguments intact; the repacked archive preserves the
+  official pack/unpack layout and the `.unpacked` payload byte-for-byte.
 
 ### Changed
 
