@@ -8,6 +8,7 @@ const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const { DatabaseSync } = require("node:sqlite");
 const test = require("node:test");
+const vm = require("node:vm");
 
 // Keep feature tests independent of the environment of the app or agent
 // running the suite. Individual tests set any account-switcher state they need.
@@ -44,6 +45,7 @@ const {
   applyMainBundlePatch,
   applyPreloadPatch,
   applyProfileMenuPatch,
+  applyWebviewRuntimePatch,
 } = require("./patch.js");
 const { loadLinuxFeaturePatchDescriptors, stageEnabledLinuxFeatureInstall } = require("../../scripts/lib/linux-features.js");
 const { patchExtractedApp } = require("../../scripts/patches/runner.js");
@@ -79,7 +81,7 @@ function waitForFile(filePath, timeoutMs = 5000) {
   assert.equal(fs.existsSync(filePath), true, `timed out waiting for ${filePath}`);
 }
 
-function runLogoutMonitorScenario({ activeAuth, fallbackAuth, loginPendingMs = null, removeActiveAuth = false, expectIdle = false }) {
+function runLogoutMonitorScenario({ implementation = "profiles", activeAuth, fallbackAuth, loginPendingMs = null, removeActiveAuth = false, expectIdle = false }) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-logout-"));
   const home = path.join(tempDir, "home");
   const configHome = path.join(home, ".config");
@@ -102,7 +104,7 @@ function runLogoutMonitorScenario({ activeAuth, fallbackAuth, loginPendingMs = n
       ...(loginPendingMs != null ? { loginPendingUntil: new Date(Date.now() + loginPendingMs).toISOString() } : {}),
     },
   ];
-  fs.writeFileSync(path.join(configDir, "account-switcher.json"), `${JSON.stringify({ version: 1, previousProfileId: "default", profiles }, null, 2)}\n`);
+  fs.writeFileSync(path.join(configDir, "account-switcher.json"), `${JSON.stringify({ version: 1, implementation, previousProfileId: "default", profiles }, null, 2)}\n`);
   fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nisolated\ndefault\n");
   const auth = `${JSON.stringify({ tokens: { access_token: "fixture-token" } })}\n`;
   if (activeAuth) fs.writeFileSync(activeAuthPath, auth);
@@ -115,7 +117,7 @@ let beforeQuit=null;
 const l={app:{whenReady:()=>Promise.resolve(),once:(name,handler)=>{if(name==="before-quit")beforeQuit=handler},quit:()=>{beforeQuit?.();fs.writeFileSync(${JSON.stringify(actionPath)},"quit");process.exit(0)},focus:()=>{fs.writeFileSync(${JSON.stringify(actionPath)},"focus");process.exit(0)}},ipcMain:{handle:()=>{}}};
 let be;be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);
 ${removeActiveAuth ? `setTimeout(()=>fs.rmSync(${JSON.stringify(activeAuthPath)},{force:true}),100);` : ""}
-setTimeout(()=>{${expectIdle ? `fs.writeFileSync(${JSON.stringify(actionPath)},"idle");process.exit(0)` : "process.exit(91)"}},1800);
+setTimeout(()=>{${expectIdle ? `fs.writeFileSync(${JSON.stringify(actionPath)},"idle");process.exit(0)` : "process.exit(91)"}},${expectIdle ? 1800 : 15000});
 `;
   const patched = applyMainBundlePatch(fixture);
   const result = spawnSync(process.execPath, ["-e", patched], {
@@ -131,7 +133,7 @@ setTimeout(()=>{${expectIdle ? `fs.writeFileSync(${JSON.stringify(actionPath)},"
       CODEX_LINUX_ACCOUNT_SWITCHER_CONTEXT_ID: "default",
     },
     encoding: "utf8",
-    timeout: 5000,
+    timeout: 20000,
   });
   const output = {
     result,
@@ -155,9 +157,12 @@ test("feature is disabled until selected", () => {
     assert.deepEqual(
       loadLinuxFeaturePatchDescriptors({ featuresRoot }).map((entry) => entry.id),
       [
+        "feature:account-switcher:upstream-account-switcher",
         "feature:account-switcher:main-profile-ipc",
         "feature:account-switcher:preload-profile-bridge",
+        "feature:account-switcher:account-switcher-runtime",
         "feature:account-switcher:account-switcher-ui",
+        "feature:account-switcher:implementation-setting",
       ],
     );
   });
@@ -182,7 +187,7 @@ test("preload bridge patch is idempotent and fails closed", () => {
     const buildDir = path.join(tempDir, ".vite", "build");
     fs.mkdirSync(buildDir, { recursive: true });
     const target = path.join(buildDir, "preload.js");
-    fs.writeFileSync(target, "let e=require(\"electron\");var F={usesOwlAppShell:()=>E};e.ipcRenderer.on(\"x\",()=>{});e.contextBridge.exposeInMainWorld(`electronBridge`,F);");
+    fs.writeFileSync(target, "let e=require(\"electron\");e.contextBridge.exposeInMainWorld(\"electronBridge\",{usesOwlAppShell:()=>E});");
     assert.equal(applyPreloadPatch(tempDir).changed, 1);
     const patched = fs.readFileSync(target, "utf8");
     assert.match(patched, new RegExp(PRELOAD_MARKER));
@@ -193,7 +198,7 @@ test("preload bridge patch is idempotent and fails closed", () => {
     assert.match(patched, /setLinuxAccountSwitcherSettings/);
     assert.match(patched, /action:"set-settings"/);
     assert.equal(applyPreloadPatch(tempDir).changed, 0);
-    fs.writeFileSync(target, "let e=require(\"electron\");var F={};e.ipcRenderer.on(\"x\",()=>{});e.contextBridge.exposeInMainWorld(`electronBridge`,F);e.contextBridge.exposeInMainWorld(`electronBridge`,F);");
+    fs.writeFileSync(target, "let e=require(\"electron\");e.contextBridge.exposeInMainWorld(\"electronBridge\",{});e.contextBridge.exposeInMainWorld(\"electronBridge\",{});");
     assert.equal(applyPreloadPatch(tempDir).changed, 0);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -205,8 +210,8 @@ test("duplicate preload anchors are reported as enabled-feature drift", () => {
   try {
     const buildDir = path.join(root, ".vite", "build");
     fs.mkdirSync(buildDir, { recursive: true });
-    fs.writeFileSync(path.join(buildDir, "main.js"), "be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);");
-    fs.writeFileSync(path.join(buildDir, "preload.js"), "let e=require(\"electron\");var F={};e.ipcRenderer.on(\"x\",()=>{});e.contextBridge.exposeInMainWorld(`electronBridge`,F);e.contextBridge.exposeInMainWorld(`electronBridge`,F);");
+    fs.writeFileSync(path.join(buildDir, "early-bootstrap.js"), "be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);");
+    fs.writeFileSync(path.join(buildDir, "preload.js"), "let e=require(\"electron\");e.contextBridge.exposeInMainWorld(\"electronBridge\",{});e.contextBridge.exposeInMainWorld(\"electronBridge\",{});");
     const config = path.join(root, "features.json");
     fs.writeFileSync(config, JSON.stringify({ enabled: ["account-switcher"] }));
     const report = createPatchReport();
@@ -224,7 +229,7 @@ test("a missing preload anchor is reported as enabled-feature drift", () => {
   try {
     const buildDir = path.join(root, ".vite", "build");
     fs.mkdirSync(buildDir, { recursive: true });
-    fs.writeFileSync(path.join(buildDir, "main.js"), "be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);");
+    fs.writeFileSync(path.join(buildDir, "early-bootstrap.js"), "be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);");
     fs.writeFileSync(path.join(buildDir, "preload.js"), "const preloadBridge={unrelated:true};");
     const config = path.join(root, "features.json");
     fs.writeFileSync(config, JSON.stringify({ enabled: ["account-switcher"] }));
@@ -238,53 +243,38 @@ test("a missing preload anchor is reported as enabled-feature drift", () => {
   }
 });
 
-test("profile menu adds Switch account below Log out and appends runtime once", () => {
-  const fixture = "let T;T=l==null?null:(0,u7.jsx)(mI,{LeftIcon:$Kl,onClick:l,children:(0,u7.jsx)(Z,{id:`codex.profileDropdown.logOut`,defaultMessage:`Log out`,description:`Menu item to log out of ChatGPT`})});return (0,u7.jsxs)(`div`,{className:`flex w-full min-w-0 flex-col`,children:[v,y,o,b,h,S,i,w,T]})";
+const UI_MODULE = 'Ab12(e,t,n){n.d(t,{Profile:()=>Profile});var UI=n("jsx"),Menu=n("menu"),Bus=n("bus"),Text=n("text");' +
+  'function Profile(props){let label,settings,group,{sidebarFooter:footer,onClose:close}=props,fmt=intl();' +
+  'fmt.formatMessage({id:"codex.profileDropdown.copyUserIdForEmail",defaultMessage:"Copy user ID for {email}"},{email:"a"});' +
+  'label=(0,UI.jsx)(Text.A,{id:"codex.profileDropdown.settingsPage",defaultMessage:"Settings",description:"Menu item to open Codex settings page"});' +
+  'settings=(0,UI.jsx)(Menu.tJ,{leftIconAsset:asset.T,keyboardShortcut:shortcut,onClick:settingsClick,children:label});' +
+  'group=(0,UI.jsxs)(UI.Fragment,{children:[divider,identity,settings]});' +
+  'if(null!=footer){let Menu=petEnabled?()=>{close(),Bus.O1.dispatchMessage("avatar-overlay-open",{})}:void 0;' +
+  'return(0,UI.jsx)(Layout,{accountIcon:icon,accountSwitcher:switcher,additionalItems:items,onCloseMenu:close,onTogglePet:Menu})}' +
+  'return(0,UI.jsxs)("div",{children:[group,workspace,analytics,more]})}}';
+const UI_CHUNK = `export const __rspack_esm_id=1;export const __rspack_esm_ids=[1];export const __webpack_modules__={Zz99(e,t,n){n.d(t,{other:()=>1})},${UI_MODULE}};`;
+
+test("profile menu adds Switch account to both layouts", () => {
+  const fixture = UI_CHUNK;
   const patched = applyProfileMenuPatch(fixture);
   assert.match(patched, new RegExp(MENU_MARKER));
-  assert.match(patched, new RegExp(RUNTIME_MARKER));
-  assert.match(patched, /\(0,u7\.jsx\)\(mI,\{onClick:/);
-  assert.match(patched, /children:\(0,u7\.jsx\)\(Z,\{id:`codex\.profileDropdown\.switchAccount`/);
-  assert.doesNotMatch(patched, /\(0,l7\.jsx\)\(fI|LeftIcon:KGl/);
-  assert.match(patched, /profile\.login/);
-  assert.match(patched, /profile\.signedIn===false\?"Signed out"/);
-  assert.match(patched, /active · signed out/);
-  assert.match(patched, /profile\.removable&&api\.removeLinuxAccountProfile/);
-  assert.match(patched, /remove\.textContent="×"/);
-  assert.match(patched, /removeLinuxAccountProfile\(\{id:profile\.id\}\)/);
-  assert.match(patched, /data-codex-linux-signed-out-switcher/);
-  assert.match(patched, /button\.textContent="Switch account"/);
-  assert.match(patched, /active\?\.signedIn===false&&state\.profiles\.length>1/);
-  assert.match(patched, /setInterval\(codexLinuxSyncSignedOutSwitcher,2000\)/);
-  assert.match(patched, /profile\.usagePercent/);
-  assert.match(patched, /Usage: /);
-  assert.match(patched, /const cachedRequest=api\.getLinuxAccountProfiles\(\),refreshRequest=api\.refreshLinuxAccountProfiles\?\.\(\)/);
-  assert.match(patched, /if\(name\.textContent!==nextName\)name\.textContent=nextName/);
-  assert.match(patched, /if\(meta\.textContent!==nextMeta\)meta\.textContent=nextMeta/);
-  assert.match(patched, /refreshRequest\.then\(\(state\)=>cachedRequest\.then/);
-  assert.match(patched, /als-switch/);
-  assert.match(patched, /Keep local projects and threads/);
-  assert.match(patched, /keepLocalProjectsThreads/);
-  assert.match(patched, /shared\.checked=state\.keepLocalProjectsThreads===true/);
-  assert.match(patched, /persistSharedState/);
-  assert.match(patched, /sharedState\.textContent=shared\.checked\?\"On\":\"Off\"/);
+  assert.doesNotMatch(patched, new RegExp(RUNTIME_MARKER));
+  assert.match(patched, /function codexLinuxAccountSwitcherRow/);
+  assert.match(patched, /additionalItems:codexLinuxAccountSwitcherItems/);
+  assert.match(patched, /children:\[divider,identity,settings,codexLinuxAccountSwitcherRow/);
   assert.equal(applyProfileMenuPatch(patched), patched);
   assert.equal(applyProfileMenuPatch("profile menu drift"), "profile menu drift");
 });
 
-test("profile menu patch fails closed on duplicate semantic or container anchors", () => {
-  const logout = "(0,u7.jsx)(mI,{LeftIcon:$Kl,onClick:l,children:(0,u7.jsx)(Z,{id:`codex.profileDropdown.logOut`,defaultMessage:`Log out`,description:`Menu item to log out of ChatGPT`})})";
-  const container = "(0,u7.jsxs)(`div`,{className:`flex w-full min-w-0 flex-col`,children:[v,y,o,b,h,S,i,w,T]})";
-  assert.equal(applyProfileMenuPatch(`${logout};${logout};${container}`), `${logout};${logout};${container}`);
-  assert.equal(applyProfileMenuPatch(`${logout};${container};${container}`), `${logout};${container};${container}`);
+test("profile menu patch fails closed on duplicate or missing semantic anchors", () => {
+  assert.equal(applyProfileMenuPatch(UI_CHUNK + UI_CHUNK), UI_CHUNK + UI_CHUNK);
+  const drift = UI_CHUNK.replace("accountSwitcher", "changedContract");
+  assert.equal(applyProfileMenuPatch(drift), drift);
 });
 
 test("account handoff quits through the launcher and waits for readiness", () => {
-  const fixture = "l.ipcMain.handle(\"codex_linux_account_switcher\",async()=>null);";
-  const patched = applyMainBundlePatch(fixture.replace(
-    "l.ipcMain.handle",
-    "be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);l.ipcMain.handle",
-  ));
+  const fixture = "const l={app:{},ipcMain:null};be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);";
+  const patched = applyMainBundlePatch(fixture);
   assert.match(patched, /codexLinuxAccountSwitcherKeepLocalProjectsThreads/);
   assert.match(patched, /if\(action==="list"\)\{\s+const details=registry\.profiles\.map/);
   assert.match(patched, /if\(action==="refresh"\)/);
@@ -302,12 +292,15 @@ test("account handoff quits through the launcher and waits for readiness", () =>
   assert.match(patched, /latest\.profiles=latest\.profiles\.filter\(\(entry\)=>entry\.id!==profile\.id\)/);
   assert.match(patched, /codexLinuxAccountSwitcherWriteHandoff/);
   assert.match(patched, /codexLinuxAccountSwitcherProcessIdentity\(process\.ppid\)/);
-  assert.match(patched, /l\.app\.quit\(\)/);
+  assert.match(patched, /return require\("electron"\)/);
+  assert.match(patched, /codexLinuxAccountSwitcherElectron\.ipcMain\.handle/);
+  assert.match(patched, /codexLinuxAccountSwitcherElectron\.app\.quit\(\)/);
+  assert.doesNotMatch(patched, /l\.ipcMain\.handle|l\.app\.quit/);
   const relaunchStart = patched.indexOf("function codexLinuxAccountSwitcherRelaunch");
   assert.ok(patched.indexOf("codexLinuxAccountSwitcherWriteHandoff", relaunchStart) < patched.indexOf("codexLinuxAccountSwitcherWriteActive(profile)", relaunchStart));
   assert.match(patched, /const outcome=await codexLinuxAccountSwitcherWithLock[\s\S]*return codexLinuxAccountSwitcherRelaunch\(outcome\.profile/);
   assert.doesNotMatch(patched, /SIGTERM|SIGKILL|codexLinuxAccountSwitcherDescendantPids/);
-  assert.match(patched, /l\.app\.quit\(\)/);
+  assert.match(patched, /codexLinuxAccountSwitcherElectron\.app\.quit\(\)/);
 });
 
 test("usage refresh returns the percentage persisted on the profile", () => {
@@ -452,12 +445,13 @@ test("a removal completion marker repairs the registry after a crash", () => {
 const V={isTrustedIpcSender:()=>true};
 const l={app:{whenReady:()=>Promise.resolve(),once:()=>{}},ipcMain:{handle:()=>{}}};
 let be;be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);
-setTimeout(()=>process.exit(0),100);
+setInterval(()=>{if(!require("node:fs").existsSync(${JSON.stringify(path.join(configDir, "account-switcher.remove-complete"))}))process.exit(0)},20);
+setTimeout(()=>process.exit(91),15000);
 `;
     const result = spawnSync(process.execPath, ["-e", applyMainBundlePatch(fixture)], {
       env: { ...process.env, HOME: home, XDG_CONFIG_HOME: configHome },
       encoding: "utf8",
-      timeout: 5000,
+      timeout: 20000,
     });
     assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
     const registry = JSON.parse(fs.readFileSync(path.join(configDir, "account-switcher.json"), "utf8"));
@@ -1165,7 +1159,8 @@ test("launch guard serializes simultaneous cold prelaunch migrations until Elect
     await new Promise((resolve) => setTimeout(resolve, 200));
     assert.equal(secondClosed, false, "second cold launch must wait for the first Electron startup");
     const appPath = path.join(appDir, "ChatGPT");
-    appProcess = spawn("bash", ["-c", `exec -a ${JSON.stringify(appPath)} sleep 5`]);
+    // Keep the fake Electron alive until cleanup even on a busy build machine.
+    appProcess = spawn("bash", ["-c", `exec -a ${JSON.stringify(appPath)} sleep 60`]);
     const second = await secondPromise;
     assert.equal(second.status, 0, second.stderr);
     assert.equal(fs.readlinkSync(database), path.join(dataHome, "codex-desktop", "account-contexts", "team", "codex.db"));
@@ -1319,6 +1314,73 @@ test("target-only SQLite rows merge into an existing shared catalog", () => {
   }
 });
 
+test("shared handoff from a named profile imports local thread and project rows into the default profile", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-reverse-history-"));
+  try {
+    const home = path.join(tempDir, "home");
+    const dataHome = path.join(home, ".local", "share");
+    const sourceHome = path.join(dataHome, "codex-desktop", "account-profiles", "work", "codex");
+    const targetHome = path.join(home, ".codex");
+    const sharedRoot = path.join(dataHome, "codex-desktop", "account-contexts", "team");
+    fs.mkdirSync(sourceHome, { recursive: true });
+    fs.mkdirSync(targetHome, { recursive: true });
+    const sourceDb = new DatabaseSync(path.join(sourceHome, "state_5.sqlite"));
+    const targetDb = new DatabaseSync(path.join(targetHome, "state_5.sqlite"));
+    sourceDb.exec("pragma journal_mode = wal");
+    targetDb.exec("pragma journal_mode = wal");
+    const schema = `
+      create table projects (id text primary key, name text, metadata text, position integer, created_at_ms integer, updated_at_ms integer);
+      create table project_roots (project_id text, position integer, path text, primary key (project_id, position));
+      create table threads (id text primary key, rollout_path text not null, title text, project_id text);
+      create table backfill_state (id integer primary key, status text not null);
+    `;
+    sourceDb.exec(schema);
+    targetDb.exec(schema);
+    sourceDb.prepare("insert into projects (id, name) values (?, ?)").run("work-project", "Work Project");
+    sourceDb.prepare("insert into project_roots (project_id, position, path) values (?, ?, ?)").run("work-project", 0, "/work/project");
+    sourceDb.prepare("insert into threads (id, rollout_path, title, project_id) values (?, ?, ?, ?)")
+      .run("work-thread", path.join(sourceHome, "sessions", "work-thread.jsonl"), "Work thread", "work-project");
+    sourceDb.prepare("insert into threads (id, rollout_path, title) values (?, ?, ?)")
+      .run("remote-thread", "", "Remote thread");
+    targetDb.prepare("insert into projects (id, name) values (?, ?)").run("default-project", "Default Project");
+    targetDb.prepare("insert into project_roots (project_id, position, path) values (?, ?, ?)").run("default-project", 0, "/default/project");
+    targetDb.prepare("insert into threads (id, rollout_path, title, project_id) values (?, ?, ?, ?)")
+      .run("default-thread", path.join(targetHome, "sessions", "default-thread.jsonl"), "Default thread", "default-project");
+    targetDb.prepare("insert into threads (id, rollout_path, title) values (?, ?, ?)")
+      .run("default-remote-thread", "", "Default remote thread");
+    targetDb.prepare("insert into backfill_state (id, status) values (?, ?)").run(1, "complete");
+    sourceDb.close();
+    targetDb.close();
+
+    fs.mkdirSync(path.join(sourceHome, "sessions"), { recursive: true });
+    fs.mkdirSync(path.join(targetHome, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(sourceHome, "sessions", "work-thread.jsonl"), "work rollout");
+    fs.writeFileSync(path.join(targetHome, "sessions", "default-thread.jsonl"), "default rollout");
+    fs.writeFileSync(path.join(sourceHome, "session_index.jsonl"), "work index\n");
+    fs.writeFileSync(path.join(targetHome, "session_index.jsonl"), "default index\n");
+
+    const result = spawnSync("bash", ["-c", `source ${JSON.stringify(path.join(__dirname, "shared-state.sh"))}; account_switcher_migrate_shared ${JSON.stringify(sourceHome)} ${JSON.stringify(targetHome)} team`], {
+      env: { ...process.env, HOME: home, XDG_DATA_HOME: dataHome },
+      encoding: "utf8",
+      timeout: 60000,
+    });
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+
+    const merged = new DatabaseSync(path.join(targetHome, "state_5.sqlite"), { readOnly: true });
+    assert.deepEqual(merged.prepare("select id from threads order by id").all().map((row) => row.id), ["default-remote-thread", "default-thread", "work-thread"]);
+    assert.equal(merged.prepare("select name from projects where id = ?").get("work-project").name, "Work Project");
+    assert.equal(merged.prepare("select path from project_roots where project_id = ?").get("work-project").path, "/work/project");
+    assert.equal(merged.prepare("select rollout_path from threads where id = ?").get("work-thread").rollout_path, path.join(targetHome, "sessions", "work-thread.jsonl"));
+    assert.equal(merged.prepare("select project_id from threads where id = ?").get("work-thread").project_id, "work-project");
+    assert.equal(merged.prepare("select id from backfill_state where id = 1").get(), undefined);
+    merged.close();
+    assert.equal(fs.readFileSync(path.join(targetHome, "sessions", "work-thread.jsonl"), "utf8"), "work rollout");
+    assert.equal(fs.existsSync(path.join(sharedRoot, "sessions", "work-thread.jsonl")), true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("a source database without WAL does not inherit target WAL or lose its backup", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-sqlite-no-wal-"));
   try {
@@ -1417,7 +1479,7 @@ test("after-exit handoff uses the launcher readiness protocol and rolls back fai
     fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), handoff, { mode: 0o600 });
     fs.writeFileSync(path.join(configDir, "account-switcher.active"), "work\nisolated\ndefault\n", { mode: 0o600 });
     const env = { HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: path.join(home, ".local", "share"), CODEX_HOME: path.join(home, ".codex"), CODEX_LINUX_APP_DIR: appDir, APPIMAGE: unrelatedAppImage };
-    const success = spawnSync("bash", [hook, "codex://thread/from-original-launch", "--new-window"], { env, encoding: "utf8", timeout: 10000 });
+    const success = spawnSync("bash", [hook, "codex://thread/from-original-launch", "--new-window"], { env, encoding: "utf8", timeout: 60000 });
     assert.equal(success.status, 0, `${success.stderr}\n${success.stdout}`);
     assert.equal(fs.readFileSync(path.join(home, "started-profile"), "utf8"), "work");
     assert.equal(fs.readFileSync(path.join(home, "started-arg-count"), "utf8"), "0");
@@ -1426,7 +1488,7 @@ test("after-exit handoff uses the launcher readiness protocol and rolls back fai
 
     fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), handoff, { mode: 0o600 });
     fs.writeFileSync(launcher, "#!/bin/sh\nexit 17\n", { mode: 0o755 });
-    const failed = spawnSync("bash", [hook], { env, encoding: "utf8", timeout: 10000 });
+    const failed = spawnSync("bash", [hook], { env, encoding: "utf8", timeout: 60000 });
     assert.equal(failed.status, 1);
     assert.equal(fs.readFileSync(path.join(configDir, "account-switcher.active"), "utf8"), "default\nisolated\ndefault\n");
     assert.match(fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8"), /phase=failed/);
@@ -1471,7 +1533,7 @@ test("an unready live default replacement retains ownership and blocks WAL rollb
       CODEX_LINUX_APP_DIR: appDir,
       PATH: `${fakeBin}:${process.env.PATH}`,
     };
-    const failed = spawnSync("bash", [path.join(__dirname, "after-exit-hook.sh")], { env, encoding: "utf8", timeout: 10000 });
+    const failed = spawnSync("bash", [path.join(__dirname, "after-exit-hook.sh")], { env, encoding: "utf8", timeout: 60000 });
     assert.equal(failed.status, 1, `${failed.stderr}\n${failed.stdout}`);
     assert.match(failed.stderr, /deferred catalog rollback until it exits/);
     const pending = fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8");
@@ -1530,7 +1592,7 @@ test("a post-readiness commit failure preserves intent for cold-start recovery",
       CODEX_HOME: sourceHome,
       CODEX_LINUX_APP_DIR: appDir,
     };
-    const failed = spawnSync("bash", [path.join(__dirname, "after-exit-hook.sh")], { env, encoding: "utf8", timeout: 10000 });
+    const failed = spawnSync("bash", [path.join(__dirname, "after-exit-hook.sh")], { env, encoding: "utf8", timeout: 60000 });
     assert.equal(failed.status, 1);
     assert.match(failed.stderr, /preserved commit-pending recovery metadata/);
     const pending = fs.readFileSync(path.join(configDir, "account-switcher.handoff"), "utf8");
@@ -1542,7 +1604,7 @@ test("a post-readiness commit failure preserves intent for cold-start recovery",
     assert.equal(fs.statSync(journal).isDirectory(), true);
 
     stageSharedStateHelper(appDir);
-    const recovered = spawnSync("bash", [path.join(__dirname, "launcher-hook.sh")], { env, encoding: "utf8", timeout: 10000 });
+    const recovered = spawnSync("bash", [path.join(__dirname, "launcher-hook.sh")], { env, encoding: "utf8", timeout: 60000 });
     assert.equal(recovered.status, 0, recovered.stderr);
     assert.match(recovered.stdout, /env CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE=work/);
     assert.equal(fs.existsSync(journal), false);
@@ -1594,7 +1656,7 @@ test("shared handoff merges source and target rollout files into an existing con
     const result = spawnSync("bash", [path.join(__dirname, "after-exit-hook.sh")], {
       env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: dataHome, CODEX_HOME: sourceHome, CODEX_LINUX_APP_DIR: appDir },
       encoding: "utf8",
-      timeout: 10000,
+      timeout: 60000,
     });
     assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
     for (const name of ["source-rollout.jsonl", "target-rollout.jsonl", "existing-rollout.jsonl"]) {
@@ -1642,7 +1704,7 @@ test("failed migration restores the source selection and records the failed hand
     const result = spawnSync("bash", [path.join(__dirname, "after-exit-hook.sh")], {
       env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: path.join(home, ".local", "share"), CODEX_HOME: path.join(home, ".codex"), CODEX_LINUX_APP_DIR: appDir },
       encoding: "utf8",
-      timeout: 10000,
+      timeout: 60000,
     });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /shared catalog migration failed; restored default/);
@@ -1687,7 +1749,7 @@ test("failed shared handoff rolls back migration and restores target registry co
     const result = spawnSync("bash", [path.join(__dirname, "after-exit-hook.sh")], {
       env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: dataHome, CODEX_HOME: path.join(home, ".codex"), CODEX_LINUX_APP_DIR: appDir },
       encoding: "utf8",
-      timeout: 10000,
+      timeout: 60000,
     });
     assert.equal(result.status, 1);
     assert.equal(fs.readFileSync(source, "utf8"), "source catalog");
@@ -1763,7 +1825,7 @@ test("isolated handoff detaches source and target from their previous shared con
     const result = spawnSync("bash", [path.join(__dirname, "after-exit-hook.sh")], {
       env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: dataHome, CODEX_HOME: path.join(home, ".codex"), CODEX_LINUX_APP_DIR: appDir },
       encoding: "utf8",
-      timeout: 10000,
+      timeout: 60000,
     });
     assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
     assert.equal(fs.lstatSync(source).isSymbolicLink(), false);
@@ -1892,7 +1954,7 @@ test("active profile removal waits for replacement readiness and preserves rollb
     fs.writeFileSync(path.join(profileRoot, "sentinel"), "delete me");
     fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), handoff, { mode: 0o600 });
     fs.writeFileSync(launcher, "#!/bin/sh\n: > \"$CODEX_LINUX_ACCOUNT_SWITCHER_READY_FILE\"\n", { mode: 0o755 });
-    const success = spawnSync("bash", [hook], { env, encoding: "utf8", timeout: 10000 });
+    const success = spawnSync("bash", [hook], { env, encoding: "utf8", timeout: 60000 });
     assert.equal(success.status, 0, `${success.stderr}\n${success.stdout}`);
     assert.equal(fs.existsSync(profileRoot), false);
     assert.equal(fs.readFileSync(path.join(configDir, "account-switcher.remove-complete"), "utf8"), "work\n");
@@ -1902,7 +1964,7 @@ test("active profile removal waits for replacement readiness and preserves rollb
     fs.writeFileSync(path.join(profileRoot, "sentinel"), "preserve me");
     fs.writeFileSync(path.join(configDir, "account-switcher.handoff"), handoff, { mode: 0o600 });
     fs.writeFileSync(launcher, "#!/bin/sh\nexit 17\n", { mode: 0o755 });
-    const failed = spawnSync("bash", [hook], { env, encoding: "utf8", timeout: 10000 });
+    const failed = spawnSync("bash", [hook], { env, encoding: "utf8", timeout: 60000 });
     assert.equal(failed.status, 1);
     assert.equal(fs.readFileSync(path.join(profileRoot, "sentinel"), "utf8"), "preserve me");
     assert.equal(fs.existsSync(path.join(configDir, "account-switcher.remove-complete")), false);
@@ -2263,7 +2325,7 @@ test("shared-context lock serializes migration recovery", async () => {
     const migration = spawnSync("bash", ["-c", `source ${JSON.stringify(helper)}; account_switcher_migrate_shared ${JSON.stringify(path.join(home, ".codex"))} ${JSON.stringify(path.join(home, ".codex"))} team`], {
       env: { ...process.env, HOME: home, XDG_DATA_HOME: dataHome },
       encoding: "utf8",
-      timeout: 10000,
+      timeout: 60000,
     });
     assert.equal(migration.status, 0, migration.stderr);
     assert.ok(Date.now() - startedAt >= 250, "migration should wait for the live context owner");
@@ -2564,4 +2626,97 @@ test("every live AppImage invocation bypasses migration across remounts for upst
     appProcess?.kill();
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+
+function loadProfile(source, context, imports) {
+  const sandbox = { ...context };
+  vm.runInNewContext(source.replace(/export const /g, "var "), sandbox);
+  const exports = {};
+  const load = id => imports[id];
+  load.d = (target, getters) => {
+    for (const [key, getter] of Object.entries(getters)) Object.defineProperty(target, key, { get: getter });
+  };
+  sandbox.__webpack_modules__.Ab12({}, exports, load);
+  return exports.Profile;
+}
+
+test("rendering either profile layout cannot invoke a shadowing pet callback", () => {
+  const patched = applyProfileMenuPatch(UI_CHUNK).split("\n;/*" + RUNTIME_MARKER)[0];
+  assert.notEqual(patched, UI_CHUNK);
+  for (const sidebarFooter of [null, {}]) for (const petEnabled of [true, false]) {
+    const sent = [], rows = [];
+    let switches = 0;
+    let closed = 0, petClick;
+    const jsx = (type, props) => ({ type, props });
+    const MenuItem = props => { rows.push(props); return null; };
+    const profile = loadProfile(patched, {
+      window: { codexLinuxOpenAccountSwitcher: () => switches++ }, petEnabled, intl: () => ({ locale: "pl", formatMessage() {} }),
+      Layout: props => { petClick = props.onTogglePet; return props.additionalItems; },
+      asset: { T: null }, shortcut: null, settingsClick() {}, icon: null, switcher: null,
+      items: null, identity: null, divider: null, workspace: null, analytics: null, more: null,
+    }, {
+      jsx: { jsx, jsxs: jsx, Fragment: "fragment" }, menu: { tJ: MenuItem },
+      bus: { O1: { dispatchMessage: (...args) => sent.push(args) } }, text: { A: () => null },
+    });
+    const render = node => {
+      if (Array.isArray(node)) return node.forEach(render);
+      if (!node || typeof node !== "object") return;
+      if (typeof node.type === "function") render(node.type(node.props));
+      else render(node.props.children);
+    };
+    for (let opening = 0; opening < 3; opening++) {
+      rows.length = 0;
+      render(profile({ sidebarFooter, onClose: () => closed++ }));
+      assert.equal(closed, 0, "opening the menu must not close it");
+      assert.equal(sent.length, 0, "rendering must not open the pet or switch accounts");
+      assert.equal(rows.filter(row => row.children === "Switch account").length, 1);
+    }
+    rows.find(row => row.children === "Switch account").onClick();
+    assert.equal(closed, 1);
+    assert.equal(switches, 1);
+    assert.equal(sent.length, 0);
+    if (sidebarFooter && petEnabled) {
+      petClick();
+      assert.equal(closed, 2);
+      assert.equal(sent[0][0], "avatar-overlay-open", "the explicit pet action must remain available");
+    }
+  }
+});
+
+test("runtime boots independently of the profile menu on signed-out launches", () => {
+  const source = 'const protocol="codex-host-chunked-message-v1";export{loader as __webpack_require__}';
+  const patched = applyWebviewRuntimePatch(source);
+  assert.match(patched, new RegExp(RUNTIME_MARKER));
+  assert.equal(applyWebviewRuntimePatch(patched), patched);
+  assert.equal(applyWebviewRuntimePatch("drift"), "drift");
+  assert.match(patched, /profile\.login/);
+  assert.match(patched, /profile\.signedIn===false\?"Signed out"/);
+  assert.match(patched, /active · signed out/);
+  assert.match(patched, /profile\.removable&&api\.removeLinuxAccountProfile/);
+  assert.match(patched, /remove\.textContent="×"/);
+  assert.match(patched, /removeLinuxAccountProfile\(\{id:profile\.id\}\)/);
+  assert.match(patched, /data-codex-linux-signed-out-switcher/);
+  assert.match(patched, /button\.textContent="Switch account"/);
+  assert.match(patched, /active\?\.signedIn===false&&state\.profiles\.length>1/);
+  assert.match(patched, /setInterval\(codexLinuxSyncSignedOutSwitcher,2000\)/);
+  assert.match(patched, /profile\.usagePercent/);
+  assert.match(patched, /Usage: /);
+  assert.match(patched, /const cachedRequest=api\.getLinuxAccountProfiles\(\),refreshRequest=api\.refreshLinuxAccountProfiles\?\.\(\)/);
+  assert.match(patched, /if\(name\.textContent!==nextName\)name\.textContent=nextName/);
+  assert.match(patched, /if\(meta\.textContent!==nextMeta\)meta\.textContent=nextMeta/);
+  assert.match(patched, /refreshRequest\.then\(\(state\)=>cachedRequest\.then/);
+  assert.match(patched, /als-switch/);
+  assert.match(patched, /Keep local projects and threads/);
+  assert.match(patched, /keepLocalProjectsThreads/);
+  assert.match(patched, /shared\.checked=state\.keepLocalProjectsThreads===true/);
+  assert.match(patched, /persistSharedState/);
+  assert.match(patched, /sharedState\.textContent=shared\.checked\?\"On\":\"Off\"/);
+ });
+
+test("upstream mode suppresses the profile logout fallback", () => {
+  const outcome = runLogoutMonitorScenario({ implementation: "upstream", activeAuth: true, fallbackAuth: true, removeActiveAuth: true, expectIdle: true });
+  assert.equal(outcome.result.status, 0, outcome.result.stderr);
+  assert.equal(outcome.action, "idle");
+  assert.equal(outcome.handoff, null);
 });

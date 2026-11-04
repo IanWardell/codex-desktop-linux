@@ -1,11 +1,34 @@
-# Rapid Account Switcher
+# Account Switcher Modes
 
-This opt-in feature adds **Switch account** directly below **Log out** in the
+This opt-in feature adds **Switch account** to both layouts of the
 bottom-left profile menu. It relaunches Codex with a saved local profile,
 without calling upstream logout and without deleting the previous profile.
 
+In **Settings → General**, **Use upstream account switcher** chooses the
+implementation immediately. It defaults to **Off** (our profile switcher).
+The choice is saved in the private account-switcher registry and applies to
+all windows and profiles. An active account change must finish before changing
+this preference.
+
+With the toggle **On**, **Switch account** opens upstream's native account menu.
+It encrypts remembered ChatGPT credentials using Linux Secret Service and
+`secret-tool`, restarts the local app-server connection, and reloads the
+windows without relaunching the desktop app. Accounts use the current
+profile's chats, settings, and plugins. Upstream checks for active tasks and
+pending requests before switching. The package includes the `libsecret-tools`
+dependency on Debian/Ubuntu. The desktop keyring must be available.
+
+The two implementations keep separate saved-account lists. Enabling upstream
+mode does not import our saved profiles or migrate their history. Upstream's
+credential vault belongs to the currently launched profile. Switching back
+restores access to our profile list; it does not undo a login selected through
+upstream within the current profile. Our automatic logout fallback is disabled
+while upstream mode is selected.
+
 Each isolated profile has its own Electron user-data directory, `CODEX_HOME`,
-credentials, plugins, configuration, rollouts, and SQLite state. The first
+credentials, plugins, configuration, rollouts, and SQLite state. Local app-server
+connections use file-based credential storage inside that profile; remote
+connections retain upstream credential storage. The first
 profile is the existing default account. New profile data is stored under
 `${XDG_DATA_HOME:-~/.local/share}/codex-desktop/account-profiles/`.
 
@@ -23,23 +46,27 @@ needed to resume shared local threads are merged into the private context. The
 active profile then receives regular session files and a regular SQLite index
 inside its own `CODEX_HOME`; shared files are hard-linked where possible, so
 the app-server never receives a rollout path outside the active profile.
-Existing `state_*.sqlite` thread rows are rewritten from the shared session
-root to that active profile root while SQLite is offline, with WAL/SHM backup
-and rollback. The rollout backfill watermark is reset so the supported Codex
-startup scan indexes older shared sessions as well as newer ones. The local-project list, local
-thread-to-project assignments, descriptions, client bindings, and writable
-roots are copied through a private `local-project-state.json` sidecar; the
-rest of each profile's global state remains separate. Migration runs only while both
-profiles are offline. Per-context locks serialize migrations, while a separate
+When the destination already has a `state_*.sqlite` index, local thread rows
+whose rollout files are in the shared context, along with their local project
+rows, are merged from the active profile. Remote thread rows stay profile-local.
+Shared rollout paths are rewritten to the destination profile while SQLite is
+offline, with WAL/SHM backup and rollback. The rollout backfill watermark is
+reset so Codex also indexes shared sessions that have no existing row in the
+destination. The local-project list, thread-to-project assignments,
+descriptions, client bindings, and writable roots use a private
+`local-project-state.json` sidecar. The rest of each profile's global state
+remains separate. Migration runs only while both profiles are offline.
+Per-context locks serialize migrations, while a separate
 cold-launch guard remains held until Electron is visible so concurrent
 launchers cannot pass the offline check together. Lock, journal, and handoff
 owners include the Linux boot ID and process start time rather than trusting a
-reusable PID alone. Uncommitted journals provide rollback and crash recovery. A handoff commits
-its migration only after the replacement signals readiness. Commit intent and
-the path-contained journal identities remain in the handoff record until every
-context is committed, so a partial cleanup or lock failure is retried on the
-next offline launch instead of rolling back state used by the replacement. If an unready
-replacement remains alive, rollback is deferred until the next offline launch.
+reusable PID alone. Uncommitted journals provide rollback and crash recovery.
+A handoff commits its migration only after the replacement signals readiness.
+Commit intent and path-contained journal identities remain in the handoff
+record until every context is committed, so a partial cleanup or lock failure
+is retried on the next offline launch instead of rolling back state used by the
+replacement. If an unready replacement remains alive, rollback is deferred
+until the next offline launch.
 Closed SQLite rollback-journal files fail closed and must be recovered by
 SQLite before a shared-state migration can proceed. An untouched isolated
 profile does not enter the migration path, allowing SQLite itself to recover a

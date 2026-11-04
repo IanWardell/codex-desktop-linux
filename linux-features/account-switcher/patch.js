@@ -8,12 +8,19 @@ const {
   webviewAssetPatch,
 } = require("../../scripts/patches/descriptor.js");
 
+const { findMatchingBrace } = require("../../scripts/patches/lib/minified-js.js");
+const IDENT = "[A-Za-z_$][\\w$]*";
+
+const { applyMain: applyUpstreamMain } = require("./upstream-patch.js");
+const { settingsDescriptor } = require("./settings.js");
+
 const MAIN_MARKER = "codexLinuxAccountSwitcherIpcV1";
 const PRELOAD_MARKER = "codexLinuxAccountSwitcherBridgeV1";
 const MENU_MARKER = "codexLinuxAccountSwitcherProfileMenuV1";
 const RUNTIME_MARKER = "codexLinuxAccountSwitcherRuntimeV1";
 
 const MAIN_RUNTIME = String.raw`;/*${MAIN_MARKER}*/(function(){
+const codexLinuxAccountSwitcherElectron=(()=>{try{return require("electron")}catch{return typeof l==="undefined"?{}:l}})();
 const codexLinuxAccountSwitcherFs=require("node:fs");
 const codexLinuxAccountSwitcherPath=require("node:path");
 const codexLinuxAccountSwitcherOs=require("node:os");
@@ -30,6 +37,7 @@ const codexLinuxAccountSwitcherHandoffPath=codexLinuxAccountSwitcherPath.join(co
 const codexLinuxAccountSwitcherRemoveCompletePath=codexLinuxAccountSwitcherPath.join(codexLinuxAccountSwitcherConfigDir,"account-switcher.remove-complete");
 const codexLinuxAccountSwitcherBaseCodexHome=process.env.CODEX_LINUX_ACCOUNT_SWITCHER_BASE_CODEX_HOME||process.env.CODEX_HOME||codexLinuxAccountSwitcherPath.join(codexLinuxAccountSwitcherHome,".codex");
 const codexLinuxAccountSwitcherIdPattern=/^[a-z0-9][a-z0-9._-]{0,63}$/;
+globalThis.codexLinuxAccountSwitcherImplementation=()=>codexLinuxAccountSwitcherRead().implementation==="upstream"?"upstream":"profiles";
 function codexLinuxAccountSwitcherId(value){
   return typeof value==="string"&&value!=="."&&value!==".."&&codexLinuxAccountSwitcherIdPattern.test(value)?value:null;
 }
@@ -112,10 +120,10 @@ function codexLinuxAccountSwitcherPublic(profile,details={}){const signedIn=code
 function codexLinuxAccountSwitcherProfileInUse(profile){const root=codexLinuxAccountSwitcherProfilePath(profile.id),userData=codexLinuxAccountSwitcherPath.join(root,"electron");let entries=[];try{entries=codexLinuxAccountSwitcherFs.readdirSync("/proc",{withFileTypes:true})}catch{return false}for(const entry of entries){if(!entry.isDirectory()||!/^[0-9]+$/.test(entry.name))continue;const processRoot=codexLinuxAccountSwitcherPath.join("/proc",entry.name);try{const args=codexLinuxAccountSwitcherFs.readFileSync(codexLinuxAccountSwitcherPath.join(processRoot,"cmdline")).toString().split("\0");if(args.includes("--user-data-dir="+userData))return true}catch{}let fds=[];try{fds=codexLinuxAccountSwitcherFs.readdirSync(codexLinuxAccountSwitcherPath.join(processRoot,"fd"))}catch{}for(const fd of fds){try{const link=codexLinuxAccountSwitcherFs.readlinkSync(codexLinuxAccountSwitcherPath.join(processRoot,"fd",fd));if(link===root||link.startsWith(root+codexLinuxAccountSwitcherPath.sep))return true}catch{}}}return false}
 function codexLinuxAccountSwitcherDeleteProfile(profile){if(profile.id==="default")throw Error("The default account profile cannot be removed");if(codexLinuxAccountSwitcherProfileInUse(profile))throw Error("Account profile is still in use");codexLinuxAccountSwitcherFs.rmSync(codexLinuxAccountSwitcherProfilePath(profile.id),{recursive:true,force:true})}
 async function codexLinuxAccountSwitcherFinalizeRemoval(){let id;try{id=codexLinuxAccountSwitcherId(codexLinuxAccountSwitcherFs.readFileSync(codexLinuxAccountSwitcherRemoveCompletePath,"utf8").trim())}catch(error){if(error?.code!=="ENOENT")console.warn("WARN: account-switcher removal recovery failed: "+error.message);return}if(!id||id==="default"){console.warn("WARN: account-switcher ignored invalid removal completion");return}try{await codexLinuxAccountSwitcherWithLock((latest)=>{latest.profiles=latest.profiles.filter((entry)=>entry&&entry.id!==id);if(latest.previousProfileId===id)delete latest.previousProfileId});codexLinuxAccountSwitcherRemoveDurably(codexLinuxAccountSwitcherRemoveCompletePath)}catch(error){console.warn("WARN: account-switcher could not finalize profile removal: "+error.message)}}
-async function codexLinuxAccountSwitcherArmRemovalRecovery(){await codexLinuxAccountSwitcherFailedHandoffRecovery;await codexLinuxAccountSwitcherFinalizeRemoval();codexLinuxAccountSwitcherFs.watchFile(codexLinuxAccountSwitcherRemoveCompletePath,{interval:250},codexLinuxAccountSwitcherFinalizeRemoval);l.app?.once?.("before-quit",()=>codexLinuxAccountSwitcherFs.unwatchFile(codexLinuxAccountSwitcherRemoveCompletePath,codexLinuxAccountSwitcherFinalizeRemoval))}
+async function codexLinuxAccountSwitcherArmRemovalRecovery(){await codexLinuxAccountSwitcherFailedHandoffRecovery;await codexLinuxAccountSwitcherFinalizeRemoval();codexLinuxAccountSwitcherFs.watchFile(codexLinuxAccountSwitcherRemoveCompletePath,{interval:250},codexLinuxAccountSwitcherFinalizeRemoval);codexLinuxAccountSwitcherElectron.app?.once?.("before-quit",()=>codexLinuxAccountSwitcherFs.unwatchFile(codexLinuxAccountSwitcherRemoveCompletePath,codexLinuxAccountSwitcherFinalizeRemoval))}
 function codexLinuxAccountSwitcherSignalReady(){const ready=process.env.CODEX_LINUX_ACCOUNT_SWITCHER_READY_FILE;if(!ready)return;try{codexLinuxAccountSwitcherFs.mkdirSync(codexLinuxAccountSwitcherPath.dirname(ready),{recursive:true,mode:448});codexLinuxAccountSwitcherFs.writeFileSync(ready,String(process.pid)+"\n",{encoding:"utf8",mode:384})}catch(error){console.warn("WARN: account-switcher readiness signal failed: "+error.message)}}
-if(process.env.CODEX_LINUX_ACCOUNT_SWITCHER_READY_FILE&&l.app?.whenReady)l.app.whenReady().then(codexLinuxAccountSwitcherSignalReady).catch(()=>{});
-if(l.app?.whenReady)l.app.whenReady().then(codexLinuxAccountSwitcherArmRemovalRecovery).catch(()=>{});
+if(process.env.CODEX_LINUX_ACCOUNT_SWITCHER_READY_FILE&&codexLinuxAccountSwitcherElectron.app?.whenReady)codexLinuxAccountSwitcherElectron.app.whenReady().then(codexLinuxAccountSwitcherSignalReady).catch(()=>{});
+if(codexLinuxAccountSwitcherElectron.app?.whenReady)codexLinuxAccountSwitcherElectron.app.whenReady().then(codexLinuxAccountSwitcherArmRemovalRecovery).catch(()=>{});
 function codexLinuxAccountSwitcherFind(registry,id){const profile=registry.profiles.find((entry)=>entry&&entry.id===id);if(profile==null)throw Error("Unknown account profile");return profile}
 function codexLinuxAccountSwitcherEnvironment(profile){
   const environment={...process.env};
@@ -129,7 +137,7 @@ function codexLinuxAccountSwitcherEnvironment(profile){
 function codexLinuxAccountSwitcherRelaunch(profile,source,removeId,targetPrevious=profile){
   codexLinuxAccountSwitcherWriteHandoff(source,profile,removeId,targetPrevious);
   try{codexLinuxAccountSwitcherWriteActive(profile)}catch(error){codexLinuxAccountSwitcherRemoveDurably(codexLinuxAccountSwitcherHandoffPath);throw Error("Account handoff could not persist its target: "+error.message)}
-  try{l.app.quit()}catch(error){try{codexLinuxAccountSwitcherWriteActive(source)}catch{}codexLinuxAccountSwitcherRemoveDurably(codexLinuxAccountSwitcherHandoffPath);throw Error("Account handoff could not begin: "+error.message)}
+  try{codexLinuxAccountSwitcherElectron.app.quit()}catch(error){try{codexLinuxAccountSwitcherWriteActive(source)}catch{}codexLinuxAccountSwitcherRemoveDurably(codexLinuxAccountSwitcherHandoffPath);throw Error("Account handoff could not begin: "+error.message)}
   return{ok:true,restarting:true,profile:codexLinuxAccountSwitcherPublic(profile)};
 }
 function codexLinuxAccountSwitcherChooseAuthenticatedFallback(registry,active){
@@ -141,21 +149,36 @@ function codexLinuxAccountSwitcherArmLogoutFallback(){
   const activeId=process.env.CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE||"default",active=registry.profiles.find((profile)=>profile&&profile.id===activeId)||codexLinuxAccountSwitcherDefault(registry),authPath=codexLinuxAccountSwitcherAuthPath(active);
   let observedAuthenticated=codexLinuxAccountSwitcherHasAuth(active),pendingTimer=null,loginDeadlineTimer=null,finished=false;
   const stop=()=>{if(finished)return;finished=true;if(pendingTimer!=null)clearTimeout(pendingTimer);if(loginDeadlineTimer!=null)clearTimeout(loginDeadlineTimer);codexLinuxAccountSwitcherFs.unwatchFile(authPath,check)};
-  const fallback=async()=>{if(finished||codexLinuxAccountSwitcherHasAuth(active)){observedAuthenticated=true;return}stop();try{const outcome=await codexLinuxAccountSwitcherWithLock((latest)=>{codexLinuxAccountSwitcherDefault(latest);const source=latest.profiles.find((profile)=>profile&&profile.id===activeId)||codexLinuxAccountSwitcherDefault(latest),target=codexLinuxAccountSwitcherChooseAuthenticatedFallback(latest,source);delete source.loginPendingUntil;if(target){latest.previousProfileId=source.id;delete target.loginPendingUntil}return{source,target}});if(outcome.target){codexLinuxAccountSwitcherRelaunch(outcome.target,outcome.source);return}setTimeout(()=>{try{l.app.focus({steal:true})}catch{}},0)}catch(error){console.warn("WARN: account-switcher logout fallback failed: "+error.message)}};
+  const fallback=async()=>{if(globalThis.codexLinuxAccountSwitcherImplementation()==="upstream")return;if(finished||codexLinuxAccountSwitcherHasAuth(active)){observedAuthenticated=true;return}stop();try{const outcome=await codexLinuxAccountSwitcherWithLock((latest)=>{codexLinuxAccountSwitcherDefault(latest);const source=latest.profiles.find((profile)=>profile&&profile.id===activeId)||codexLinuxAccountSwitcherDefault(latest),target=codexLinuxAccountSwitcherChooseAuthenticatedFallback(latest,source);delete source.loginPendingUntil;if(target){latest.previousProfileId=source.id;delete target.loginPendingUntil}return{source,target}});if(outcome.target){codexLinuxAccountSwitcherRelaunch(outcome.target,outcome.source);return}setTimeout(()=>{try{codexLinuxAccountSwitcherElectron.app.focus({steal:true})}catch{}},0)}catch(error){console.warn("WARN: account-switcher logout fallback failed: "+error.message)}};
   const scheduleFallback=()=>{if(finished||pendingTimer!=null)return;pendingTimer=setTimeout(()=>{pendingTimer=null;fallback()},750)};
-  function check(){if(finished)return;if(codexLinuxAccountSwitcherHasAuth(active)){observedAuthenticated=true;if(pendingTimer!=null){clearTimeout(pendingTimer);pendingTimer=null}if(loginDeadlineTimer!=null){clearTimeout(loginDeadlineTimer);loginDeadlineTimer=null}codexLinuxAccountSwitcherWithLock((latest)=>{const current=latest.profiles.find((profile)=>profile&&profile.id===activeId);if(current)delete current.loginPendingUntil}).catch(()=>{});return}if(observedAuthenticated||!codexLinuxAccountSwitcherLoginPending(active))scheduleFallback()}
+  function check(){if(finished||globalThis.codexLinuxAccountSwitcherImplementation()==="upstream")return;if(codexLinuxAccountSwitcherHasAuth(active)){observedAuthenticated=true;if(pendingTimer!=null){clearTimeout(pendingTimer);pendingTimer=null}if(loginDeadlineTimer!=null){clearTimeout(loginDeadlineTimer);loginDeadlineTimer=null}codexLinuxAccountSwitcherWithLock((latest)=>{const current=latest.profiles.find((profile)=>profile&&profile.id===activeId);if(current)delete current.loginPendingUntil}).catch(()=>{});return}if(observedAuthenticated||!codexLinuxAccountSwitcherLoginPending(active))scheduleFallback()}
   codexLinuxAccountSwitcherFs.watchFile(authPath,{interval:250},check);
-  l.app?.once?.("before-quit",stop);
+  codexLinuxAccountSwitcherElectron.app?.once?.("before-quit",stop);
   const loginDeadline=Date.parse(active.loginPendingUntil||"");if(!observedAuthenticated&&Number.isFinite(loginDeadline)&&loginDeadline>Date.now())loginDeadlineTimer=setTimeout(()=>{loginDeadlineTimer=null;check()},Math.min(2147483647,loginDeadline-Date.now()+1));
   check();
 }
-if(l.app?.whenReady)l.app.whenReady().then(()=>codexLinuxAccountSwitcherFailedHandoffRecovery).then(codexLinuxAccountSwitcherArmLogoutFallback).catch(()=>{});
-l.ipcMain.handle(codexLinuxAccountSwitcherIpc,async(codexLinuxAccountSwitcherEvent,request={})=>{
+if(codexLinuxAccountSwitcherElectron.app?.whenReady)codexLinuxAccountSwitcherElectron.app.whenReady().then(()=>codexLinuxAccountSwitcherFailedHandoffRecovery).then(codexLinuxAccountSwitcherArmLogoutFallback).catch(()=>{});
+let codexLinuxAccountSwitcherMutationBusy=false;
+globalThis.codexLinuxAccountSwitcherProfileBusy=()=>codexLinuxAccountSwitcherMutationBusy;
+codexLinuxAccountSwitcherElectron.ipcMain.handle(codexLinuxAccountSwitcherIpc,async(codexLinuxAccountSwitcherEvent,request={})=>{
   if(!be(codexLinuxAccountSwitcherEvent))throw Error("Untrusted account-switcher IPC sender");
   await codexLinuxAccountSwitcherFailedHandoffRecovery;
   const action=typeof request.action==="string"?request.action:"list";
+  const mutates=["set-implementation","set-settings","create","remove","switch"].includes(action);
+  if(mutates&&codexLinuxAccountSwitcherMutationBusy)throw Error("Wait for the account change to finish");
+  if(mutates)codexLinuxAccountSwitcherMutationBusy=true;
+  try{
   const registry=codexLinuxAccountSwitcherRead();
   codexLinuxAccountSwitcherDefault(registry);
+  if(action==="implementation")return{implementation:globalThis.codexLinuxAccountSwitcherImplementation()};
+  if(action==="set-implementation"){
+    if(request.implementation!=="profiles"&&request.implementation!=="upstream")throw Error("Unknown account switcher implementation");
+    if(globalThis.codexLinuxUpstreamAccountSwitcherBusy?.())throw Error("Wait for the account change to finish");
+    if(codexLinuxAccountSwitcherFs.existsSync(codexLinuxAccountSwitcherHandoffPath))throw Error("Wait for the profile handoff to finish");
+    await codexLinuxAccountSwitcherWithLock((latest)=>{latest.implementation=request.implementation});
+    return{implementation:request.implementation};
+  }
+  if(globalThis.codexLinuxAccountSwitcherImplementation()==="upstream"&&action!=="list")throw Error("Profile switching is disabled while the upstream switcher is selected");
   if(action==="list"){
     const details=registry.profiles.map((profile)=>codexLinuxAccountSwitcherCachedDetails(profile));
     return{profiles:registry.profiles.map((profile,index)=>codexLinuxAccountSwitcherPublic(profile,details[index])),activeProfileId:process.env.CODEX_LINUX_ACCOUNT_SWITCHER_PROFILE||"default",keepLocalProjectsThreads:codexLinuxAccountSwitcherKeepLocalProjectsThreads(registry)}
@@ -187,13 +210,25 @@ l.ipcMain.handle(codexLinuxAccountSwitcherIpc,async(codexLinuxAccountSwitcherEve
     return codexLinuxAccountSwitcherRelaunch(outcome.profile,outcome.source,undefined,outcome.targetPrevious);
   }
   throw Error("Unknown account-switcher action");
+  }finally{if(mutates)codexLinuxAccountSwitcherMutationBusy=false}
 });
 })();`;
 
 const WEBVIEW_RUNTIME = String.raw`;/*${RUNTIME_MARKER}*/(()=>{
 if(window.__codexLinuxAccountSwitcherRuntime)return;
 window.__codexLinuxAccountSwitcherRuntime=true;
-window.codexLinuxOpenAccountSwitcher=()=>{
+window.codexLinuxOpenAccountSwitcher=async()=>{
+  const bridge=window.electronBridge;
+  try{
+    const {implementation}=await bridge.getLinuxAccountSwitcherImplementation();
+    if(implementation==="upstream"){
+      await bridge.sendMessageFromView({type:"mcp-request",hostId:"local",request:{id:"community-account-switcher-"+Date.now(),method:"community/accountSwitcher",params:{locale:document.documentElement.lang||"en"}}});
+      return;
+    }
+  }catch(error){console.warn("Could not open account switcher",error);return}
+  codexLinuxOpenProfileSwitcher();
+};
+const codexLinuxOpenProfileSwitcher=()=>{
   const api=window.electronBridge;
   if(!api?.getLinuxAccountProfiles)return;
   let overlay=document.querySelector("[data-codex-linux-account-switcher]");
@@ -216,17 +251,10 @@ window.codexLinuxOpenAccountSwitcher=()=>{
 };
 const codexLinuxSyncSignedOutSwitcher=async()=>{
   const api=window.electronBridge;if(!api?.getLinuxAccountProfiles)return;
-  try{const state=await api.getLinuxAccountProfiles(),active=state.profiles.find((profile)=>profile.id===state.activeProfileId),show=active?.signedIn===false&&state.profiles.length>1;let button=document.querySelector("[data-codex-linux-signed-out-switcher]");if(!show){button?.remove();return}if(button)return;button=document.createElement("button");button.type="button";button.dataset.codexLinuxSignedOutSwitcher="true";button.textContent="Switch account";button.setAttribute("aria-label","Switch account");button.style.cssText="position:fixed;left:16px;bottom:16px;z-index:2147482999;border:1px solid rgba(0,0,0,.18);border-radius:9px;background:#fff;color:#202020;box-shadow:0 4px 18px rgba(0,0,0,.14);padding:9px 12px;font:600 13px/1.2 system-ui,sans-serif;cursor:pointer";button.onclick=()=>window.codexLinuxOpenAccountSwitcher?.();document.body.append(button)}catch{}
+  try{const mode=await api.getLinuxAccountSwitcherImplementation();if(mode.implementation==="upstream"){document.querySelector("[data-codex-linux-signed-out-switcher]")?.remove();document.querySelector("[data-codex-linux-account-switcher]")?.remove();return}const state=await api.getLinuxAccountProfiles(),active=state.profiles.find((profile)=>profile.id===state.activeProfileId),show=active?.signedIn===false&&state.profiles.length>1;let button=document.querySelector("[data-codex-linux-signed-out-switcher]");if(!show){button?.remove();return}if(button)return;button=document.createElement("button");button.type="button";button.dataset.codexLinuxSignedOutSwitcher="true";button.textContent="Switch account";button.setAttribute("aria-label","Switch account");button.style.cssText="position:fixed;left:16px;bottom:16px;z-index:2147482999;border:1px solid rgba(0,0,0,.18);border-radius:9px;background:#fff;color:#202020;box-shadow:0 4px 18px rgba(0,0,0,.14);padding:9px 12px;font:600 13px/1.2 system-ui,sans-serif;cursor:pointer";button.onclick=()=>window.codexLinuxOpenAccountSwitcher?.();document.body.append(button)}catch{}
 };
 codexLinuxSyncSignedOutSwitcher();setInterval(codexLinuxSyncSignedOutSwitcher,2000);
 })();`;
-
-function replaceOnce(source, needle, replacement, description) {
-  const count = source.split(needle).length - 1;
-  if (count === 1) return source.replace(needle, replacement);
-  console.warn(`WARN: Expected one ${description}, found ${count} - skipping account-switcher patch`);
-  return source;
-}
 
 function applyMainBundlePatch(source) {
   if (source.includes(MAIN_MARKER)) return source;
@@ -252,95 +280,120 @@ function applyPreloadPatch(extractedDir) {
   }
   const source = fs.readFileSync(target, "utf8");
   if (source.includes(PRELOAD_MARKER)) return { matched: 1, changed: 0 };
-  const exposes = [...source.matchAll(/([A-Za-z_$][\w$]*)\.contextBridge\.exposeInMainWorld\(`electronBridge`,([A-Za-z_$][\w$]*)\)/g)];
+  const exposes = [...source.matchAll(/([A-Za-z_$][\w$]*)\.contextBridge\.exposeInMainWorld\("electronBridge",\{/g)];
   if (exposes.length !== 1) {
     console.warn(`WARN: Expected one Electron preload bridge exposure, found ${exposes.length} - skipping account-switcher patch`);
     return { matched: exposes.length, changed: 0 };
   }
-  const [, electron, bridge] = exposes[0];
-  const declaration = `${bridge}={`;
-  const declarationIndex = source.lastIndexOf(declaration, exposes[0].index);
-  const bridgeEnd = source.lastIndexOf(`};${electron}.ipcRenderer.on`, exposes[0].index);
-  const matched = declarationIndex >= 0 && bridgeEnd > declarationIndex ? 1 : 0;
-  if (matched !== 1) {
-    console.warn(`WARN: Expected one path-contained Electron preload bridge object, found ${matched} - skipping account-switcher patch`);
-    return { matched, changed: 0 };
-  }
-  const methods = `,getLinuxAccountProfiles:()=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"list"}),refreshLinuxAccountProfiles:()=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"refresh"}),createLinuxAccountProfile:t=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"create",...t}),removeLinuxAccountProfile:t=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"remove",...t}),setLinuxAccountSwitcherSettings:t=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"set-settings",...t}),switchLinuxAccountProfile:t=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"switch",...t})/*${PRELOAD_MARKER}*/`;
+  const [, electron] = exposes[0];
+  const bridgeStart = exposes[0].index + exposes[0][0].length;
+  const bridgeEnd = findMatchingBrace(source, bridgeStart - 1);
+  if (bridgeEnd === -1) return { matched: 0, changed: 0 };
+  const matched = 1;
+  const methods = `,getLinuxAccountSwitcherImplementation:()=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"implementation"}),setLinuxAccountSwitcherImplementation:implementation=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"set-implementation",implementation}),getLinuxAccountProfiles:()=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"list"}),refreshLinuxAccountProfiles:()=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"refresh"}),createLinuxAccountProfile:t=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"create",...t}),removeLinuxAccountProfile:t=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"remove",...t}),setLinuxAccountSwitcherSettings:t=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"set-settings",...t}),switchLinuxAccountProfile:t=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"switch",...t})/*${PRELOAD_MARKER}*/`;
   const patched = source.slice(0, bridgeEnd) + methods + source.slice(bridgeEnd);
   if (patched !== source) fs.writeFileSync(target, patched, "utf8");
   return { matched, changed: patched === source ? 0 : 1 };
 }
 
-function applyProfileMenuPatch(source) {
-  if (source.includes(MENU_MARKER)) return source;
-  const containerAnchor = "className:`flex w-full min-w-0 flex-col`,children:[";
-  const containerCount = source.split(containerAnchor).length - 1;
-  if (containerCount !== 1) return applyCompiledProfileMenuPatch(source);
-
-  const containerStart = source.indexOf(containerAnchor);
-  const nearbyStart = Math.max(0, containerStart - 1_500);
-  const nearby = source.slice(nearbyStart, containerStart);
-  const logoutPattern = /\(0,([A-Za-z_$][\w$]*)\.jsx\)\(([A-Za-z_$][\w$]*),\{[^{}]{0,300}children:\(0,\1\.jsx\)\(([A-Za-z_$][\w$]*),\{id:`codex\.profileDropdown\.logOut`,defaultMessage:`Log out`,description:`Menu item to log out of ChatGPT`\}\)\}\)/g;
-  const logoutMatches = [...nearby.matchAll(logoutPattern)];
-  if (logoutMatches.length !== 1) {
-    console.warn(`WARN: Expected one semantic profile menu logout anchor, found ${logoutMatches.length} - skipping account-switcher patch`);
-    return source;
-  }
-
-  const [, jsxRuntime, menuItem, message] = logoutMatches[0];
-  const childrenStart = containerStart + containerAnchor.length;
-  const childrenTail = source.slice(childrenStart, childrenStart + 500);
-  const childrenMatch = childrenTail.match(/^([A-Za-z_$][\w$]*(?:,[A-Za-z_$][\w$]*)*)\]\}\)/);
-  if (childrenMatch == null) {
-    console.warn("WARN: Expected one path-contained profile menu children anchor, found 0 - skipping account-switcher patch");
-    return source;
-  }
-
-  const needle = `${containerAnchor}${childrenMatch[0]}`;
-  const switchItem = `(0,${jsxRuntime}.jsx)(${menuItem},{onClick:()=>window.codexLinuxOpenAccountSwitcher?.(),children:(0,${jsxRuntime}.jsx)(${message},{id:\`codex.profileDropdown.switchAccount\`,defaultMessage:\`Switch account\`,description:\`Menu item to switch between local Codex account profiles\`})})`;
-  const replacement = `${containerAnchor}${childrenMatch[1]},${switchItem}]})/*${MENU_MARKER}*/`;
-  const patched = replaceOnce(source, needle, replacement, "path-contained profile menu children anchor");
-  // The extracted webview bundle currently ends with a source-map comment. A
-  // leading newline is required so the runtime is not swallowed by that
-  // comment and its `return` statements remain inside the IIFE.
-  return patched === source ? source : patched + "\n" + WEBVIEW_RUNTIME;
+function unique(source, pattern) {
+  const matches = [...source.matchAll(pattern)];
+  return matches.length === 1 ? matches[0] : null;
 }
 
-function applyCompiledProfileMenuPatch(source) {
-  const logoutId = "id:`codex.profileDropdown.logOut`,defaultMessage:`Log out`,description:`Menu item to log out of ChatGPT`";
-  const logoutIndex = source.indexOf(logoutId);
-  if (logoutIndex < 0 || source.indexOf(logoutId, logoutIndex + 1) >= 0) {
-    console.warn("WARN: Expected one compiled profile menu logout anchor - skipping account-switcher patch");
+// rspack chunks hold many module factories keyed by hashed ids:
+// `__webpack_modules__={abCd(e,t,n){...},...}`. Returns the factory that
+// contains `index`, with its require parameter and body bounds.
+function moduleFactoryAt(source, index) {
+  const objectStart = source.indexOf("__webpack_modules__={");
+  if (objectStart === -1) return null;
+  const header = new RegExp(`([A-Za-z0-9_$]+|"[^"]*")\\((${IDENT}(?:,${IDENT}){0,2})?\\)\\{`, "y");
+  let cursor = objectStart + "__webpack_modules__={".length;
+  while (cursor < source.length) {
+    header.lastIndex = cursor;
+    const match = header.exec(source);
+    if (!match) return null;
+    const open = cursor + match[0].length - 1;
+    const end = findMatchingBrace(source, open);
+    if (end === -1) return null;
+    if (index > open && index < end) {
+      const params = (match[2] ?? "").split(",");
+      return { bodyStart: open + 1, end, require: params[2] ?? null };
+    }
+    cursor = end + 1;
+    if (source[cursor] !== ",") return null;
+    cursor += 1;
+  }
+  return null;
+}
+
+// A module-scope import binding: `var a=n("ABep"),...` at the factory top.
+function moduleImport(source, factory, name) {
+  if (factory.require == null) return false;
+  const body = source.slice(factory.bodyStart, factory.end);
+  const pattern = new RegExp(`(?:\\bvar |,)${name.replace(/\$/g, "\\$")}=${factory.require.replace(/\$/g, "\\$")}\\("[^"]+"\\)`, "g");
+  return [...body.matchAll(pattern)].length === 1;
+}
+
+function applyProfileMenuPatch(source) {
+  if (source.includes(MENU_MARKER)) return source;
+  const dispatch = unique(source, new RegExp(`(${IDENT})\\.(${IDENT})\\.dispatchMessage\\("avatar-overlay-open",\\{\\}\\)`, "g"));
+  const jsx = unique(source, new RegExp(
+    `\\(0,(${IDENT})\\.jsx\\)\\((${IDENT}),\\{accountIcon:${IDENT},accountSwitcher:${IDENT},additionalItems:(${IDENT}),` +
+      `[\\s\\S]{0,500}?onCloseMenu:(${IDENT}),`, "g"));
+  const settings = unique(source, new RegExp(
+    `(${IDENT})=\\(0,${IDENT}\\.jsx\\)\\(${IDENT}\\.${IDENT},\\{id:"codex\\.profileDropdown\\.settingsPage",[^{}]{0,200}\\}\\)` +
+      `[\\s\\S]{0,350}?(${IDENT})=\\(0,(${IDENT})\\.jsx\\)\\((${IDENT})\\.(${IDENT}),` +
+      `\\{leftIconAsset:${IDENT}(?:\\.${IDENT})?,keyboardShortcut:${IDENT},onClick:${IDENT},children:\\1\\}\\)`, "g"));
+  const intl = unique(source, new RegExp(`(${IDENT})\\.formatMessage\\(\\{id:"codex\\.profileDropdown\\.copyUserIdForEmail"`, "g"));
+  const regular = settings == null ? null : unique(source, new RegExp(
+    `children:\\[(${IDENT}),(${IDENT}),${settings[2].replace(/\$/g, "\\$")}\\]`, "g"));
+  if (!dispatch || !jsx || !regular || !settings || !intl) {
+    console.warn("WARN: Account switcher profile-menu contract drifted - skipping patch");
     return source;
   }
-  const nearbyStart = Math.max(0, logoutIndex - 700);
-  const nearby = source.slice(nearbyStart, logoutIndex + logoutId.length);
-  const logoutPattern = /\(0,([A-Za-z_$][\w$]*)\.jsx\)\(([A-Za-z_$][\w$]*),\{[^{}]{0,500}children:\(0,\1\.jsx\)\(([A-Za-z_$][\w$]*),\{id:`codex\.profileDropdown\.logOut`,defaultMessage:`Log out`,description:`Menu item to log out of ChatGPT`\}\)\}\)/g;
-  const matches = [...nearby.matchAll(logoutPattern)];
-  if (matches.length !== 1) {
-    console.warn(`WARN: Expected one compiled semantic profile menu logout anchor, found ${matches.length} - skipping account-switcher patch`);
+  const [, jsxAlias, , additional, close] = jsx;
+  const [, , , runtimeAlias, menuModule, menuExport] = settings;
+  const [, busModule, busExport] = dispatch;
+  const factory = moduleFactoryAt(source, settings.index);
+  const sameModule = factory != null && [dispatch.index, jsx.index, regular.index, intl.index]
+    .every((index) => index > factory.bodyStart && index < factory.end);
+  if (!sameModule || runtimeAlias !== jsxAlias ||
+      ![jsxAlias, menuModule, busModule].every((name) => moduleImport(source, factory, name))) {
+    console.warn("WARN: Account switcher profile-menu module contract drifted - skipping patch");
     return source;
   }
-  const [, jsxRuntime, menuItem, message] = matches[0];
-  const assignments = [...nearby.slice(0, matches[0].index).matchAll(/let ([A-Za-z_$][\w$]*);/g)];
-  if (assignments.length === 0) {
-    console.warn("WARN: Expected one compiled logout assignment - skipping account-switcher patch");
+  // Minifiers reuse import aliases inside nested scopes (the sidebar branch can
+  // name the pet's onClick callback like the menu-item module). The row is a
+  // module-scope function, so it always resolves the module's import bindings;
+  // only the menu's close callback and intl object come from the call site.
+  const helpers = `/*${MENU_MARKER}*/function codexLinuxAccountSwitcherRow(close,intl){` +
+    `return(0,${jsxAlias}.jsx)(${menuModule}.${menuExport},{onClick:()=>{close();window.codexLinuxOpenAccountSwitcher?.()},` +
+    `children:"Switch account"})}` +
+    `function codexLinuxAccountSwitcherItems(items,close,intl){` +
+    `return(0,${jsxAlias}.jsxs)(${jsxAlias}.Fragment,{children:[items,codexLinuxAccountSwitcherRow(close,intl)]})}`;
+  const row = `codexLinuxAccountSwitcherRow(${close},${intl[1]})`;
+  // Keep the existing React memo dependencies: the action references the same
+  // onClose callback as the adjacent settings items and contains no account data.
+  const edits = [
+    { index: factory.bodyStart + (source.startsWith('"use strict";', factory.bodyStart) ? 13 : 0), old: "", replacement: helpers },
+    { index: jsx.index, old: jsx[0], replacement: jsx[0].replace(`additionalItems:${additional},`,
+      `additionalItems:codexLinuxAccountSwitcherItems(${additional},${close},${intl[1]}),`) },
+    { index: regular.index, old: regular[0], replacement: `children:[${regular[1]},${regular[2]},${settings[2]},${row}]` },
+  ].sort((a, b) => b.index - a.index);
+  for (const edit of edits) source = source.slice(0, edit.index) + edit.replacement + source.slice(edit.index + edit.old.length);
+  return source;
+}
+
+// Load before the profile menu, including on a cold signed-out launch.
+function applyWebviewRuntimePatch(source) {
+  if (source.includes(RUNTIME_MARKER)) return source;
+  if (!source.includes("codex-host-chunked-message-v1") ||
+      !/export\{[A-Za-z_$][\w$]* as __webpack_require__\}/.test(source)) {
+    console.warn("WARN: Account switcher webview entry contract drifted - skipping patch");
     return source;
   }
-  const logoutVariable = assignments.at(-1)[1];
-  const tail = source.slice(logoutIndex + logoutId.length, logoutIndex + logoutId.length + 2_000);
-  const childrenMatches = [...tail.matchAll(/children:\[([A-Za-z_$][\w$]*(?:,(?:[A-Za-z_$][\w$]*|null))*)\]/g)]
-    .filter((match) => match[1].split(",").includes(logoutVariable));
-  if (childrenMatches.length !== 1) {
-    console.warn(`WARN: Expected one compiled path-contained profile menu children anchor, found ${childrenMatches.length} - skipping account-switcher patch`);
-    return source;
-  }
-  const switchItem = `(0,${jsxRuntime}.jsx)(${menuItem},{onClick:()=>window.codexLinuxOpenAccountSwitcher?.(),children:(0,${jsxRuntime}.jsx)(${message},{id:\`codex.profileDropdown.switchAccount\`,defaultMessage:\`Switch account\`,description:\`Menu item to switch between local Codex account profiles\`})})`;
-  const match = childrenMatches[0];
-  const offset = logoutIndex + logoutId.length + match.index;
-  const replacement = `children:[${match[1]},${switchItem}]/*${MENU_MARKER}*/`;
-  return source.slice(0, offset) + replacement + source.slice(offset + match[0].length) + "\n" + WEBVIEW_RUNTIME;
+  return source + "\n" + WEBVIEW_RUNTIME;
 }
 
 function patchPreload(extractedDir) {
@@ -356,7 +409,9 @@ module.exports = {
   applyMainBundlePatch,
   applyPreloadPatch,
   applyProfileMenuPatch,
+  applyWebviewRuntimePatch,
   descriptors: [
+    mainBundlePatch({ id: "upstream-account-switcher", order: 29_090, ciPolicy: "opt-in", apply: applyUpstreamMain }),
     mainBundlePatch({ id: "main-profile-ipc", order: 29_100, ciPolicy: "opt-in", apply: applyMainBundlePatch }),
     extractedAppPatch({
       id: "preload-profile-bridge",
@@ -369,14 +424,22 @@ module.exports = {
         : result.changed ? "applied" : "already-applied",
     }),
     webviewAssetPatch({
+      id: "account-switcher-runtime",
+      order: 29_115,
+      ciPolicy: "opt-in",
+      assetNeedles: ["codex-host-chunked-message-v1", "as __webpack_require__}"],
+      missingDescription: "rspack webview runtime entry",
+      apply: applyWebviewRuntimePatch,
+    }),
+    webviewAssetPatch({
       id: "account-switcher-ui",
       order: 29_120,
       ciPolicy: "opt-in",
-      pattern: /^app-(?:initial|primary)-[^.]+\.js$/,
-      assetMatch: (source) => source.includes("codex.profileDropdown.logOut") && source.includes("className:`flex w-full min-w-0 flex-col"),
+      assetNeedles: ['id:"codex.profileDropdown.settingsPage"', 'id:"codex.profileDropdown.copyUserIdForEmail"', '"avatar-overlay-open"', 'onCloseMenu:'],
       missingDescription: "current profile-menu webview bundle",
       skipDescription: "account-switcher menu item",
       apply: applyProfileMenuPatch,
     }),
+    settingsDescriptor,
   ],
 };

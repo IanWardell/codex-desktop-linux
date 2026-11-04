@@ -826,7 +826,7 @@ account_switcher_materialize_session_index() {
 }
 
 account_switcher_rewrite_state_rollout_paths() {
-    local target_home="$1" shared_root="$2" journal="$3" index="$4" database suffix backup helper node found=0
+    local source_home="$1" target_home="$2" shared_root="$3" journal="$4" index="$5" database suffix backup helper node found=0
     helper="$(dirname -- "${BASH_SOURCE[0]}")/shared-state-sqlite.js"
     node="$(account_switcher_node_binary)"
     shopt -s nullglob
@@ -841,7 +841,7 @@ account_switcher_rewrite_state_rollout_paths() {
             cp -- "$backup" "$database$suffix"
         done
     done
-    (( found == 0 )) || "$node" "$helper" rewrite-rollout-paths "$target_home" "$shared_root" || return 1
+    (( found == 0 )) || "$node" "$helper" sync-local-history "$source_home" "$target_home" "$shared_root" || return 1
     shopt -u nullglob
     ACCOUNT_SWITCHER_MERGE_INDEX="$index"
 }
@@ -1074,7 +1074,7 @@ account_switcher_prepare_shared() {
             index="$ACCOUNT_SWITCHER_MERGE_INDEX"
         done
     fi
-    account_switcher_rewrite_state_rollout_paths "$target_home" "$shared_root" "$journal" "$index" || {
+    account_switcher_rewrite_state_rollout_paths "$source_home" "$target_home" "$shared_root" "$journal" "$index" || {
         account_switcher_restore_journal "$journal" || true
         account_switcher_context_lock_release "$lock" || true
         return 1

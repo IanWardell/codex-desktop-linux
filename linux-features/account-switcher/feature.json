@@ -1,7 +1,7 @@
 {
   "id": "account-switcher",
   "title": "Rapid Account Switcher",
-  "description": "Opt-in per-account Codex profiles with isolated credentials and an experimental shared local thread catalog.",
+  "description": "Choose between isolated account profiles with optional shared history and upstream encrypted login switching from General settings.",
   "defaultEnabled": false,
   "entrypoints": {
     "patchDescriptors": "./patch.js"
@@ -44,5 +44,19 @@
       "name": "account-switcher-final-exit.sh",
       "mode": "0755"
     }
+  },
+  "conflicts": [
+    "shared-app-server-socket"
+  ],
+  "packageDependencies": {
+    "deb": [
+      "libsecret-tools"
+    ],
+    "rpm": [
+      "libsecret"
+    ],
+    "pacman": [
+      "libsecret"
+    ]
   }
 }
