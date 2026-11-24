@@ -5,7 +5,6 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { detectLinuxTargetContext } = require("../lib/linux-target-context.js");
 const {
   createPatchReport,
   enabledFeatureFailuresFromReport,
@@ -17,63 +16,106 @@ const {
   patchExtractedApp,
   requiredPatchNamesForProfile,
 } = require("./runner.js");
+const { findMainProcessChunks } = require("./lib/assets.js");
+const {
+  findMatchingBrace,
+} = require("./lib/minified-js.js");
 
 const emptyConfig = path.join(__dirname, "..", "..", "linux-features", "features.example.json");
-const officialQuitBundle =
-  "let qrt=function({isWindows:e,disableQuitConfirmationPrompt:d,quitState:r,windows:i,settingsStore:x}){" +
-  "let S=!1;l.app.on(\"before-quit\",o=>{if(e||r.canQuitWithoutPrompt()||d){S=!0,i.markAppQuitting();return}" +
-  "let c={formatMessage:e=>e.defaultMessage};0!==l.dialog.showMessageBoxSync({type:\"warning\",message:\"Quit?\"," +
-  "buttons:[c.formatMessage({messageId:\"desktop.quitConfirmation.quit\",defaultMessage:\"Quit\"}),\"Cancel\"]," +
-  "detail:function({answer:e}){return e}({answer:\"Stop chats?\"})})?o.preventDefault():" +
-  "(r.markQuitApproved(),S=!0,i.markAppQuitting())})};function next(){}";
 
-function linuxTarget(id, versionId, desktop) {
-  return detectLinuxTargetContext({
-    env: {
-      CODEX_LINUX_TARGET_ID: id,
-      CODEX_LINUX_TARGET_VERSION_ID: versionId,
-      CODEX_LINUX_TARGET_DESKTOP: desktop,
-      CODEX_LINUX_TARGET_PACKAGE_FORMAT: id === "fedora" ? "rpm" : "deb",
-      PATH: "",
-    },
-    osReleaseFields: {},
-    atomic: false,
-  });
-}
+test("the official Linux baseline needs no core compatibility patch", () => {
+  assert.deepEqual(corePatchDescriptors(), []);
+  assert.deepEqual(allPatchPolicies({ featuresConfigPath: emptyConfig }), []);
+  assert.deepEqual(requiredPatchNamesForProfile("upstream-build", {
+    featuresConfigPath: emptyConfig,
+  }), []);
+});
 
-const fedoraKde = linuxTarget("fedora", "44", "KDE:Plasma");
-const ubuntuGnome = linuxTarget("ubuntu", "26.04", "ubuntu:GNOME");
+test("the signed baseline owns approved quit completion and shell startup", {
+  skip: process.env.CODEX_SIGNED_EXTRACTED_APP == null,
+}, () => {
+  const mainProcess = findMainProcessChunks(process.env.CODEX_SIGNED_EXTRACTED_APP);
+  assert.ok(mainProcess, "Expected the verified main-process chunks");
+  const chunks = mainProcess.chunks.map((name) => ({
+    name,
+    source: fs.readFileSync(path.join(mainProcess.buildDir, name), "utf8"),
+  }));
+  const uniqueOwner = (markers, description) => {
+    const owners = chunks.filter(({ source }) =>
+      markers.every((marker) => source.includes(marker)));
+    assert.equal(
+      owners.length,
+      1,
+      `Expected one ${description}; found ${owners.map(({ name }) => name).join(", ") || "none"}`,
+    );
+    return owners[0].source;
+  };
 
-test("the official Linux baseline registers required compatibility patches", () => {
-  assert.deepEqual(
-    corePatchDescriptors().map(({ id, ciPolicy, phase }) => ({ id, ciPolicy, phase })),
-    [{
-      id: "quit-confirmation-focus",
-      ciPolicy: "required-upstream",
-      phase: "extracted-app:pre-webview",
-    }],
+  const quitOwner = uniqueOwner([
+    "canQuitWithoutPrompt(){return this.allowQuitWithoutPrompt}",
+    "markQuitApproved(){this.allowQuitWithoutPrompt=!0}",
+    "hasPendingLocalGitReviewComments:",
+    '.app.on("before-quit",',
+  ], "native approved-quit lifecycle owner");
+  const identifier = "[A-Za-z_$][\\w$]*";
+  const lifecycleHeader = new RegExp(
+    `function\\(\\{[^{}]*quitState:(?<quitState>${identifier}),` +
+      `windows:(?<windows>${identifier}),[^{}]*` +
+      `hasPendingLocalGitReviewComments:(?<pending>${identifier}),[^{}]*\\}\\)\\{`,
+    "gu",
   );
-  assert.deepEqual(
-    allPatchPolicies({ featuresConfigPath: emptyConfig }),
-    [{
-      name: "quit-confirmation-focus",
-      ciPolicy: "required-upstream",
-      phase: "extracted-app:pre-webview",
-    }],
+  const lifecycleMatches = [...quitOwner.matchAll(lifecycleHeader)];
+  assert.equal(lifecycleMatches.length, 1, "Expected one native quit lifecycle owner");
+  const { quitState, windows, pending } = lifecycleMatches[0].groups;
+  const lifecycleOpen = lifecycleMatches[0].index + lifecycleMatches[0][0].length - 1;
+  const lifecycleClose = findMatchingBrace(quitOwner, lifecycleOpen);
+  assert.ok(lifecycleClose > lifecycleOpen, "Expected a complete native quit lifecycle owner");
+  const lifecycleBody = quitOwner.slice(lifecycleOpen, lifecycleClose + 1);
+  const beforeQuitPattern = new RegExp(
+    `${identifier}\\.app\\.on\\("before-quit",(?<event>${identifier})=>\\{`,
+    "gu",
   );
-  assert.deepEqual(
-    requiredPatchNamesForProfile("upstream-build", {
-      featuresConfigPath: emptyConfig,
-      linuxTarget: fedoraKde,
-    }),
-    ["quit-confirmation-focus"],
+  const beforeQuitMatches = [...lifecycleBody.matchAll(beforeQuitPattern)];
+  assert.equal(beforeQuitMatches.length, 1, "Expected one native before-quit handler");
+  const handlerOpen = beforeQuitMatches[0].index + beforeQuitMatches[0][0].length - 1;
+  const handlerClose = findMatchingBrace(lifecycleBody, handlerOpen);
+  assert.ok(handlerClose > handlerOpen, "Expected a complete native before-quit handler");
+  const handlerBody = lifecycleBody.slice(handlerOpen, handlerClose + 1);
+  const approvalGate = `!${quitState}.canQuitWithoutPrompt()`;
+  const pendingCheck = `${pending}()`;
+  const localApproval = `${quitState}.markQuitApproved()`;
+  const quittingTransition = `${windows}.markAppQuitting()`;
+  assert.equal(handlerBody.split(approvalGate).length - 1, 1);
+  const pendingMatches = [...handlerBody.matchAll(new RegExp(`(?<![\\w$.])${pending}\\(\\)`, "g"))];
+  assert.equal(pendingMatches.length, 1);
+  assert.equal(handlerBody.split(localApproval).length - 1, 1);
+  assert.equal(handlerBody.split(quittingTransition).length - 1, 1);
+  assert.ok(handlerBody.indexOf(approvalGate) < pendingMatches[0].index);
+  assert.ok(pendingMatches[0].index < handlerBody.indexOf(localApproval));
+  assert.ok(handlerBody.indexOf(localApproval) < handlerBody.indexOf(quittingTransition));
+
+  const shellOwner = uniqueOwner([
+    "main app.whenReady resolved",
+    "shell environment hydrated",
+  ], "upstream shell-startup owner");
+  const readyPattern = new RegExp(
+    `await ${identifier}\\.app\\.whenReady\\(\\),${identifier}\\(` +
+      `"main app\\.whenReady resolved"`,
+    "gu",
   );
-  assert.deepEqual(
-    requiredPatchNamesForProfile("upstream-build", {
-      featuresConfigPath: emptyConfig,
-      linuxTarget: ubuntuGnome,
-    }),
-    ["quit-confirmation-focus"],
+  const shellStartPattern = new RegExp(
+    `(?:let|const) ${identifier}=Date\\.now\\(\\),${identifier}=\\(0,` +
+      `${identifier}\\.${identifier}\\)\\(\\),${identifier}=${identifier}=>\\{` +
+      `${identifier}\\("shell environment hydrated"`,
+    "gu",
+  );
+  const readyMatches = [...shellOwner.matchAll(readyPattern)];
+  const shellStartMatches = [...shellOwner.matchAll(shellStartPattern)];
+  assert.equal(readyMatches.length, 1, "Expected one awaited main app readiness boundary");
+  assert.equal(shellStartMatches.length, 1, "Expected one shell-environment startup call");
+  assert.ok(
+    shellStartMatches[0].index > readyMatches[0].index,
+    "Shell-environment startup must follow awaited app readiness",
   );
 });
 
@@ -89,64 +131,27 @@ test("runner context exposes enabled feature IDs", () => {
   }
 });
 
-test("the default core registry repairs Quit and shell startup without changing webview assets", () => {
+test("an empty core registry leaves unmatched application assets unchanged", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "runner-baseline-"));
   try {
     const mainDir = path.join(root, ".vite", "build");
     const webviewDir = path.join(root, "webview", "assets");
     fs.mkdirSync(mainDir, { recursive: true });
     fs.mkdirSync(webviewDir, { recursive: true });
-    const main = path.join(mainDir, "main.js");
     const webview = path.join(webviewDir, "app-initial-A.js");
-    fs.writeFileSync(main, officialQuitBundle);
-    const shell = path.join(mainDir, "shell-env-fixture.js");
-    fs.writeFileSync(shell, "async function load(a,b){let start=Date.now();e.app.isPackaged||clean();" +
-      "let abort=new AbortController;log(\"Failed to load shell env\",{resultSource:\"load\"})}");
+    const main = path.join(mainDir, "early-bootstrap.js");
+    fs.writeFileSync(main, "const officialMain=true;\n");
     fs.writeFileSync(webview, "official-webview\n");
+    const mainBefore = fs.readFileSync(main);
+    const webviewBefore = fs.readFileSync(webview);
     const report = createPatchReport();
     patchExtractedApp(root, {
       report,
       featuresConfigPath: emptyConfig,
-      linuxTarget: fedoraKde,
     });
-    assert.match(fs.readFileSync(main, "utf8"), /function codexLinuxQuitDialogParent\(/);
-    assert.equal(fs.readFileSync(webview, "utf8"), "official-webview\n");
-    assert.match(fs.readFileSync(shell, "utf8"), /await new Promise\(setImmediate\)/);
-    assert.equal(report.patches.length, 1);
-    assert.equal(report.patches[0].name, "quit-confirmation-focus");
-    assert.equal(report.patches[0].status, "applied");
-    assert.equal(report.patches[0].ciPolicy, "required-upstream");
-    assert.equal(report.patches[0].sourceKind, "core");
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("portable artifacts include the shell repair when built on Ubuntu GNOME", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "runner-portable-shell-repair-"));
-  try {
-    const mainDir = path.join(root, ".vite", "build");
-    fs.mkdirSync(mainDir, { recursive: true });
-    const main = path.join(mainDir, "main.js");
-    const shell = path.join(mainDir, "shell-env-fixture.js");
-    const shellSource = "async function load(a,b){let start=Date.now();e.app.isPackaged||clean();" +
-      "let abort=new AbortController;log(\"Failed to load shell env\",{resultSource:\"load\"})}";
-    fs.writeFileSync(main, officialQuitBundle);
-    fs.writeFileSync(shell, shellSource);
-    const report = createPatchReport();
-
-    patchExtractedApp(root, {
-      report,
-      featuresConfigPath: emptyConfig,
-      linuxTarget: ubuntuGnome,
-    });
-
-    assert.match(fs.readFileSync(main, "utf8"), /function codexLinuxQuitDialogParent\(/);
-    assert.match(fs.readFileSync(shell, "utf8"), /await new Promise\(setImmediate\)/);
-    assert.deepEqual(
-      report.patches.map(({ name, status }) => ({ name, status })),
-      [{ name: "quit-confirmation-focus", status: "applied" }],
-    );
+    assert.deepEqual(fs.readFileSync(main), mainBefore);
+    assert.deepEqual(fs.readFileSync(webview), webviewBefore);
+    assert.deepEqual(report.patches, []);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -163,11 +168,7 @@ test("missing main bundle records enabled feature drift", (t) => {
 
   const entry = report.patches.find((patch) =>
     patch.name === "feature:frameless-titlebar:main-process");
-  const coreEntry = report.patches.find((patch) =>
-    patch.name === "quit-confirmation-focus");
   assert.ok(entry);
-  assert.ok(coreEntry);
-  assert.equal(coreEntry.status, "failed-required");
   assert.equal(entry.status, "skipped-optional");
   assert.equal(entry.enforceWhenEnabled, true);
   assert.equal(entry.unavailable, true);
@@ -178,7 +179,6 @@ test("missing main bundle records enabled feature drift", (t) => {
 });
 
 test("main-process chunks are the rspack early-bootstrap entry and its numbered chunks", () => {
-  const { findMainProcessChunks } = require("./lib/assets.js");
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "runner-rspack-chunks-"));
   try {
     const buildDir = path.join(root, ".vite", "build");

@@ -280,15 +280,22 @@ function applyPreloadPatch(extractedDir) {
   }
   const source = fs.readFileSync(target, "utf8");
   if (source.includes(PRELOAD_MARKER)) return { matched: 1, changed: 0 };
-  const exposes = [...source.matchAll(/([A-Za-z_$][\w$]*)\.contextBridge\.exposeInMainWorld\("electronBridge",\{/g)];
+  const exposes = [...source.matchAll(new RegExp(
+    `(${IDENT})\\.contextBridge\\.exposeInMainWorld\\("electronBridge",(${IDENT})\\)`, "g"))];
   if (exposes.length !== 1) {
     console.warn(`WARN: Expected one Electron preload bridge exposure, found ${exposes.length} - skipping account-switcher patch`);
     return { matched: exposes.length, changed: 0 };
   }
-  const [, electron] = exposes[0];
-  const bridgeStart = exposes[0].index + exposes[0][0].length;
-  const bridgeEnd = findMatchingBrace(source, bridgeStart - 1);
-  if (bridgeEnd === -1) return { matched: 0, changed: 0 };
+  const [, electron, bridge] = exposes[0];
+  const declarations = [...source.slice(0, exposes[0].index).matchAll(new RegExp(
+    `(?:\\b(?:let|const|var) |,)${bridge.replace(/\$/g, "\\$")}=\\{`, "g"))];
+  if (declarations.length !== 1) return { matched: 0, changed: 0 };
+  const bridgeStart = declarations[0].index + declarations[0][0].length - 1;
+  const bridgeEnd = findMatchingBrace(source, bridgeStart);
+  if (bridgeEnd === -1 || bridgeEnd >= exposes[0].index ||
+      !source.slice(bridgeStart, bridgeEnd).includes("sendMessageFromView:")) {
+    return { matched: 0, changed: 0 };
+  }
   const matched = 1;
   const methods = `,getLinuxAccountSwitcherImplementation:()=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"implementation"}),setLinuxAccountSwitcherImplementation:implementation=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"set-implementation",implementation}),getLinuxAccountProfiles:()=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"list"}),refreshLinuxAccountProfiles:()=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"refresh"}),createLinuxAccountProfile:t=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"create",...t}),removeLinuxAccountProfile:t=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"remove",...t}),setLinuxAccountSwitcherSettings:t=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"set-settings",...t}),switchLinuxAccountProfile:t=>${electron}.ipcRenderer.invoke("codex_linux_account_switcher",{action:"switch",...t})/*${PRELOAD_MARKER}*/`;
   const patched = source.slice(0, bridgeEnd) + methods + source.slice(bridgeEnd);
@@ -307,7 +314,7 @@ function unique(source, pattern) {
 function moduleFactoryAt(source, index) {
   const objectStart = source.indexOf("__webpack_modules__={");
   if (objectStart === -1) return null;
-  const header = new RegExp(`([A-Za-z0-9_$]+|"[^"]*")\\((${IDENT}(?:,${IDENT}){0,2})?\\)\\{`, "y");
+  const header = new RegExp(`([A-Za-z0-9_$]+|"[^"]*")(?:(?:\\((${IDENT}(?:,${IDENT}){0,2})?\\))|(?::(\\()?function\\((${IDENT}(?:,${IDENT}){0,2})?\\)))\\{`, "y");
   let cursor = objectStart + "__webpack_modules__={".length;
   while (cursor < source.length) {
     header.lastIndex = cursor;
@@ -317,10 +324,11 @@ function moduleFactoryAt(source, index) {
     const end = findMatchingBrace(source, open);
     if (end === -1) return null;
     if (index > open && index < end) {
-      const params = (match[2] ?? "").split(",");
+      const params = (match[2] ?? match[4] ?? "").split(",");
       return { bodyStart: open + 1, end, require: params[2] ?? null };
     }
     cursor = end + 1;
+    if (match[3] != null && source[cursor] === ")") cursor += 1;
     if (source[cursor] !== ",") return null;
     cursor += 1;
   }
@@ -335,25 +343,49 @@ function moduleImport(source, factory, name) {
   return [...body.matchAll(pattern)].length === 1;
 }
 
+function namedFunctionAt(source, index) {
+  const pattern = new RegExp(`function (${IDENT})\\(${IDENT}\\)\\{`, "g");
+  let owner = null;
+  for (const match of source.matchAll(pattern)) {
+    if (match.index > index) break;
+    const open = match.index + match[0].length - 1;
+    const end = findMatchingBrace(source, open);
+    if (end >= index) owner = { name: match[1], start: match.index, end: end + 1 };
+  }
+  return owner;
+}
+
 function applyProfileMenuPatch(source) {
   if (source.includes(MENU_MARKER)) return source;
   const dispatch = unique(source, new RegExp(`(${IDENT})\\.(${IDENT})\\.dispatchMessage\\("avatar-overlay-open",\\{\\}\\)`, "g"));
   const jsx = unique(source, new RegExp(
     `\\(0,(${IDENT})\\.jsx\\)\\((${IDENT}),\\{accountIcon:${IDENT},accountSwitcher:${IDENT},additionalItems:(${IDENT}),` +
       `[\\s\\S]{0,500}?onCloseMenu:(${IDENT}),`, "g"));
-  const settings = unique(source, new RegExp(
+  const legacySettings = unique(source, new RegExp(
     `(${IDENT})=\\(0,${IDENT}\\.jsx\\)\\(${IDENT}\\.${IDENT},\\{id:"codex\\.profileDropdown\\.settingsPage",[^{}]{0,200}\\}\\)` +
       `[\\s\\S]{0,350}?(${IDENT})=\\(0,(${IDENT})\\.jsx\\)\\((${IDENT})\\.(${IDENT}),` +
       `\\{leftIconAsset:${IDENT}(?:\\.${IDENT})?,keyboardShortcut:${IDENT},onClick:${IDENT},children:\\1\\}\\)`, "g"));
+  const currentSettings = unique(source, new RegExp(
+    `(${IDENT})=\\(0,(${IDENT})\\.jsx\\)\\(${IDENT}\\.${IDENT},\\{id:"codex\\.profileDropdown\\.settingsPage",[^{}]{0,200}\\}\\)` +
+      `[\\s\\S]{0,450}?(${IDENT})=\\(0,\\2\\.jsx\\)\\((${IDENT})\\.(${IDENT}),` +
+      `\\{leftIconAsset:${IDENT}(?:\\.${IDENT})?,\\.\\.\\.${IDENT},children:\\1\\}\\)`, "g"));
+  const settings = currentSettings ?? legacySettings;
   const intl = unique(source, new RegExp(`(${IDENT})\\.formatMessage\\(\\{id:"codex\\.profileDropdown\\.copyUserIdForEmail"`, "g"));
-  const regular = settings == null ? null : unique(source, new RegExp(
-    `children:\\[(${IDENT}),(${IDENT}),${settings[2].replace(/\$/g, "\\$")}\\]`, "g"));
+  const settingsOwner = currentSettings == null ? null : namedFunctionAt(source, currentSettings.index);
+  const currentRegular = settingsOwner == null ? null : unique(source, new RegExp(
+    `(${IDENT})=\\(0,${currentSettings[2]}\\.jsx\\)\\(${settingsOwner.name},\\{[^{}]{1,300}\\}\\)` +
+      `[\\s\\S]{0,500}?children:\\[(${IDENT}),(${IDENT}),null,\\1\\]`, "g"));
+  const legacyRegular = legacySettings == null ? null : unique(source, new RegExp(
+    `children:\\[(${IDENT}),(${IDENT}),(?:null,)?${legacySettings[2].replace(/\$/g, "\\$")}\\]`, "g"));
+  const regular = currentRegular ?? legacyRegular;
   if (!dispatch || !jsx || !regular || !settings || !intl) {
     console.warn("WARN: Account switcher profile-menu contract drifted - skipping patch");
     return source;
   }
   const [, jsxAlias, , additional, close] = jsx;
-  const [, , , runtimeAlias, menuModule, menuExport] = settings;
+  const runtimeAlias = currentSettings?.[2] ?? legacySettings?.[3];
+  const menuModule = currentSettings?.[4] ?? legacySettings?.[4];
+  const menuExport = currentSettings?.[5] ?? legacySettings?.[5];
   const [, busModule, busExport] = dispatch;
   const factory = moduleFactoryAt(source, settings.index);
   const sameModule = factory != null && [dispatch.index, jsx.index, regular.index, intl.index]
@@ -379,17 +411,27 @@ function applyProfileMenuPatch(source) {
     { index: factory.bodyStart + (source.startsWith('"use strict";', factory.bodyStart) ? 13 : 0), old: "", replacement: helpers },
     { index: jsx.index, old: jsx[0], replacement: jsx[0].replace(`additionalItems:${additional},`,
       `additionalItems:codexLinuxAccountSwitcherItems(${additional},${close},${intl[1]}),`) },
-    { index: regular.index, old: regular[0], replacement: `children:[${regular[1]},${regular[2]},${settings[2]},${row}]` },
+    { index: regular.index, old: regular[0], replacement: currentRegular == null
+      ? regular[0].slice(0, -1) + `,${row}]`
+      : regular[0].replace(`children:[${regular[2]},${regular[3]},null,${regular[1]}]`,
+        `children:[${regular[2]},${regular[3]},null,${regular[1]},${row}]`) },
   ].sort((a, b) => b.index - a.index);
   for (const edit of edits) source = source.slice(0, edit.index) + edit.replacement + source.slice(edit.index + edit.old.length);
   return source;
 }
 
 // Load before the profile menu, including on a cold signed-out launch.
+// The detached window ships a separate renderer with the same boot protocol.
+function isAccountSwitcherWebviewEntry(source, assetName = "") {
+  return !assetName.includes("/") &&
+    !source.includes("initializeDetachedWindow") &&
+    source.includes("codex-host-chunked-message-v1") &&
+    /export\{[A-Za-z_$][\w$]* as __webpack_require__\}/.test(source);
+}
+
 function applyWebviewRuntimePatch(source) {
   if (source.includes(RUNTIME_MARKER)) return source;
-  if (!source.includes("codex-host-chunked-message-v1") ||
-      !/export\{[A-Za-z_$][\w$]* as __webpack_require__\}/.test(source)) {
+  if (!isAccountSwitcherWebviewEntry(source)) {
     console.warn("WARN: Account switcher webview entry contract drifted - skipping patch");
     return source;
   }
@@ -428,6 +470,7 @@ module.exports = {
       order: 29_115,
       ciPolicy: "opt-in",
       assetNeedles: ["codex-host-chunked-message-v1", "as __webpack_require__}"],
+      assetMatch: isAccountSwitcherWebviewEntry,
       missingDescription: "rspack webview runtime entry",
       apply: applyWebviewRuntimePatch,
     }),

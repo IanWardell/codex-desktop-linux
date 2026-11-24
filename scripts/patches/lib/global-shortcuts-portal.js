@@ -457,7 +457,7 @@ function installPortalBackend(source) {
     new RegExp(`${escapeRegExp(accessReady)}&&\\(${IDENT}\\|\\|${IDENT}\\)&&${IDENT}\\.forEach\\((${IDENT})=>\\{\\1\\(\\)\\}\\),${IDENT}\\}`, "u"),
     match => match.replace(/,([\w$]+)\}$/u, ",codexLinuxGlobalShortcutsPortalSchedule(),$1}"), "application access publication");
   const quitting = new RegExp(
-    `markAppQuitting:\\(\\)=>\\{(?=(?:${IDENT}(?:\\?\\.|\\.)markAppQuitting\\(\\),){2,}${IDENT}\\.dispose\\(\\)\\})`,
+    `markAppQuitting:\\(\\)=>\\{(?=[^{}]{0,240}?(?:${IDENT}(?:\\?\\.|\\.)markAppQuitting\\(\\),){2,}${IDENT}\\.dispose\\(\\)\\})`,
     "u",
   );
   uniqueAnchor(quitting, "accepted application quit before window cleanup");
@@ -466,7 +466,7 @@ function installPortalBackend(source) {
   // Accepted quit (will-quit): upstream disposes the shortcut owners and then
   // drains asynchronously. Stop the portal session before that disposal and
   // make the drain wait for the helper to release its session.
-  const quitLifecycle = new RegExp(`function(?: ${IDENT})?\\(\\{(?:${IDENT}:${IDENT},)*hotkeyWindowLifecycleManager:(?<hotkey>${IDENT}),globalDictationLifecycleManager:(?<dictation>${IDENT}),(?:${IDENT}:${IDENT},)*flushAndDisposeContext:${IDENT},disposables:${IDENT}(?:,${IDENT}:${IDENT})*\\}\\)\\{`, "u");
+  const quitLifecycle = new RegExp(`function(?: ${IDENT})?\\(\\{(?:${IDENT}:${IDENT},)*hotkeyWindowLifecycleManager:(?<hotkey>${IDENT}),globalDictationLifecycleManager:(?<dictation>${IDENT}),(?:${IDENT}:${IDENT},)*flushAndDisposeContext:${IDENT},(?:${IDENT}:${IDENT},)*disposables:${IDENT}(?:,${IDENT}:${IDENT})*\\}\\)\\{`, "u");
   const quitHeader = uniqueAnchor(quitLifecycle, "accepted application quit lifecycle");
   const quitOpen = quitHeader.index + quitHeader[0].length - 1;
   const quitClose = findMatchingBrace(patched, quitOpen);

@@ -17,7 +17,7 @@ const {
 const { applyAgentWorkspaceMainBridgePatch } = require("../agent-workspace/patch.js");
 const { applyMainBundlePatch: applyReadAloudMainBundlePatch } = require("../read-aloud/patch.js");
 
-// Signed stable 26.1029.61003 (rspack) startup and view-message contracts, with
+// Current signed stable rspack startup and view-message contracts, with
 // Electron services supplied by the harness. This exercises the actual patched
 // control flow and the preference route.
 const windowModeFixture = 'class MessageHandler{' + "setPrimaryWindowMode(e,t){let r=ea.BrowserWindow.fromWebContents(e);if(!r||r.isDestroyed())return;let n=this.windowManager.getPrimaryWindow();if(!n||n.isDestroyed()||n.id!==r.id)return;if(!this.shouldShowPrimaryWindow()&&!r.isVisible())return void r.once(\"show\",()=>this.setPrimaryWindowMode(e,t));let i=\"onboarding\"!==t.mode?null:\"v2\"===t.onboardingVariant?{width:1090,height:760}:{width:560,height:560};if(ra()(this.primaryWindowMode,t)){null!=i&&this.showPrimaryWindow(r);return}if(this.primaryWindowMode=t,null!=i){null==this.primaryWindowRestoreBounds&&(this.primaryWindowRestoreBounds={bounds:r.getNormalBounds(),wasMaximized:r.isMaximized(),wasFullScreen:r.isFullScreen()}),r.isFullScreen()&&r.setFullScreen(!1),r.isMaximized()&&r.unmaximize(),r.setResizable(!0);let e=ea.screen.getDisplayMatching(r.getNormalBounds()).workAreaSize,t=\"win32\"===process.platform?{width:Math.max(0,r.getBounds().width-r.getContentBounds().width),height:Math.max(0,r.getBounds().height-r.getContentBounds().height)}:{width:0,height:0},n={width:e.width-t.width,height:e.height-t.height},s={width:Math.min(i.width,n.width),height:Math.min(i.height,n.height)},a=\"win32\"===process.platform,o=a&&(s.width>=.9*n.width||s.height>=.9*n.height),l=this.windowManager.getPrimaryMinimumSize();r.setMaximizable(a),r.setFullScreenable(!1),r.setMinimumSize(Math.min(l.width,s.width),Math.min(l.height,s.height)),r.setSize(s.width,s.height),o||r.center(),this.showPrimaryWindow(r),o&&r.maximize();return}if(r.setResizable(!0),r.setMaximizable(!0),r.setFullScreenable(!0),this.primaryWindowRestoreBounds){let{bounds:e,wasMaximized:t,wasFullScreen:n}=this.primaryWindowRestoreBounds;this.primaryWindowRestoreBounds=null;let i=this.windowManager.getPrimaryMinimumSize();r.setMinimumSize(i.width,i.height);let s={...e,width:Math.max(e.width,i.width),height:Math.max(e.height,i.height)};r.isMaximized()&&r.unmaximize(),r.setBounds(s),t&&r.maximize(),n&&r.setFullScreen(!0)}this.windowManager.syncPrimaryMinimumSize(),this.showPrimaryWindow(r)}showPrimaryWindow(e){e.isVisible()||(e.show(),e.focus())}" + '}';
@@ -29,8 +29,8 @@ class WindowManager{install(F,x){if(x){this.pendingRestoredMaximization=new Set;
 function eR7(){return eR5&&eR2?.isReady()===!0}
 async function startup(e={isBackgroundLaunch:false}){let V=await (0,m.O)({moduleDir:__dirname}),unused=0;
 let options={canHideLastWindowToTray:eR7,isRemoteHostedPIPEnabled:noop,shouldShowPrimaryWindow:()=>!e.isBackgroundLaunch};
-let Ke="1"===process.env.CODEX_ELECTRON_START_IN_BACKGROUND,qe=(e,t=!0)=>{if(!t){e.showInactive(),_e.handleInitialWindowVisible();return}e.isMinimized()&&e.restore(),e.show(),_e.handleInitialWindowVisible(),e.focus()},Je=async(e,t)=>{try{U.hotkeyWindowLifecycleManager.hide();let t=U.getPrimaryWindow()??await Ce("/");if(null==t)return;qe(t)}catch(e){throw e}},Ye=async(e,t)=>{if(!xe)return null;U.hotkeyWindowLifecycleManager.hide();let n=U.getPrimaryWindow(),r=n??await Ce(e);return null==r?null:(qe(r),r)},Qe=()=>setup;(L||"linux"===process.platform)&&Qe();
-let st=We.deepLinks.isWakeOnlyLaunch()&&!eX?null:await U.ensureWindow({background:e.isBackgroundLaunch});st?.once("show",()=>{_e.handleInitialWindowVisible()}),null==st||e.isBackgroundLaunch||qe(st,!Ke);
+let Ke="1"===process.env.CODEX_ELECTRON_START_IN_BACKGROUND,qe=(e,t=!0)=>{if(!t){e.showInactive(),_e.handleInitialWindowVisible();return}e.isMinimized()&&e.restore(),e.show(),_e.handleInitialWindowVisible(),e.focus()},Je=async(e,t)=>{try{U.hotkeyWindowLifecycleManager.hide();let t=U.getPrimaryWindow()??await Ce("/");if(null==t)return;qe(t)}catch(e){throw e}},Ye=async(e,t)=>{let r=await (async(e,t)=>{if(!xe)return null;U.hotkeyWindowLifecycleManager.hide();let n=U.getPrimaryWindow(),r=n??await Ce(e);return null==r?null:(qe(r),r)})(e,t);return r},Qe=()=>setup;(L||"linux"===process.platform)&&Qe();
+let st=We.deepLinks.isWakeOnlyLaunch()&&!eX?null:await U.ensureWindow({background:e.isBackgroundLaunch}),persistenceId=null==st?null:U.windowManager.getPersistenceWindowId(st);st?.once("show",()=>{_e.handleInitialWindowVisible()}),null==st||e.isBackgroundLaunch||qe(st,!Ke);
 e.onInteractiveLaunch=()=>{null==st||st.isDestroyed()||qe(st),noop()};
 let backfill={shouldShow:()=>!e.isBackgroundLaunch&&!We.deepLinks.isWakeOnlyLaunch()},progress={shouldShow:()=>!e.isBackgroundLaunch&&!We.deepLinks.isWakeOnlyLaunch()};
 await beforeFinish?.(Je,Ye,e.onInteractiveLaunch);
@@ -139,6 +139,14 @@ test("main patch fails closed when the fetch route owner is missing, duplicated 
   }
 });
 
+test("main patch requires the current persisted startup-window contract", () => {
+  const source = startupFixture();
+  const drifted = source.replace(",persistenceId=null==st?null:U.windowManager.getPersistenceWindowId(st)", "");
+  const result = captureWarnings(() => applyMainPatch(drifted));
+  assert.equal(result.value, drifted);
+  assert.deepEqual(result.warnings, ["WARN: Start minimized to tray startup contract missing or ambiguous"]);
+});
+
 async function runStartup({ preference = true, onlyOnBoot = false, env = {}, cgroup = "0::/user.slice/app.slice/app-codex.scope\n", platform = "linux", argv = ["ChatGPT"], ready = true, existing = false, setup = Promise.resolve(), beforeFinish = null, background = false, upstreamBackground = false } = {}) {
   const calls = [];
   const mockWindow = {
@@ -148,7 +156,7 @@ async function runStartup({ preference = true, onlyOnBoot = false, env = {}, cgr
   };
   let primary = existing ? mockWindow : null;
   const U = {
-    windowManager: {},
+    windowManager: { getPersistenceWindowId: () => "primary" },
     getPrimaryWindow: () => primary,
     ensureWindow: async ({background = false} = {}) => {
       if (primary && !background) { primary.show(); primary.focus(); }
@@ -222,6 +230,15 @@ test("second launch reveals the hidden window through the upstream handler", asy
   const { calls, handlers } = await runStartup();
   await handlers.secondInstance();
   assert.deepEqual(calls, ["hideHotkey", "show", "attribution", "focus"]);
+});
+
+test("an explicit desktop New Window launch opens visibly with tray startup enabled", async () => {
+  const argv = ["ChatGPT", "--codex-community-new-window"];
+  const regular = await runStartup({ argv });
+  const autostart = await runStartup({ onlyOnBoot: true, argv: [...argv, "--codex-autostart"] });
+  for (const { calls } of [regular, autostart]) {
+    assert.deepEqual(calls, ["show", "attribution", "focus"]);
+  }
 });
 
 test("boot-only works independently, overrides all-starts preference, and leaves manual starts visible", async () => {
@@ -484,7 +501,7 @@ test("activation during startup cancels the hidden decision before final reveal"
   const calls = [];
   const window = { show:()=>calls.push("show"), focus:()=>{}, isMinimized:()=>false, isDestroyed:()=>false, once(){} };
   const context = { process:{platform:"linux",argv:["ChatGPT"],env:{}},m:{O:async()=>({globalState:{getStored:key=>key===SETTINGS_KEY}})},
-    U:{windowManager:{},ensureWindow:async()=>window,getPrimaryWindow:()=>null,hotkeyWindowLifecycleManager:{hide(){}}},
+    U:{windowManager:{getPersistenceWindowId:()=>"primary"},ensureWindow:async()=>window,getPrimaryWindow:()=>null,hotkeyWindowLifecycleManager:{hide(){}}},
     eR5:true,eR2:{isReady:()=>true},We:{deepLinks:{isWakeOnlyLaunch:()=>false,queueProcessArgs:()=>true}},eX:false,L:false,xe:false,setup,Ce:async()=>null,noop(){},__dirname:"/",_e:{handleInitialWindowVisible(){}},
     setTimeout,clearTimeout,beforeFinish:null,w(){},set activate(value){activate=value;} };
   const running = vm.runInNewContext(`${patched};startup()`,context);
@@ -584,19 +601,24 @@ test("complete patched startup validates renderer replay, readiness and each act
   assert.deepEqual(valid.warnings, []);
 });
 
-// Shapes of the signed 26.1029.61003 rspack General settings chunk, locale
+// Shapes of the current signed rspack General settings chunk, locale
 // loader and catalog chunks.
 function settingsFixture() {
   return 'export const __rspack_esm_id=572868;export const __rspack_esm_ids=[572868];export const __webpack_modules__={' +
     'G3wX(e,t,a){let s;a.d(t,{GeneralSettings:()=>aR});var n=a("ABep"),r=a("QosV"),m=a("zd8w"),x=a("oyxz"),b=a("Wf1j"),ed=a("iRMi"),F=a("RxZZ"),f=a("DBCl"),N=a("F0xz"),P=a("AWNZ");' +
     'function aJ(e){let t,a,s,i,o,l,c=(0,r.c)(15),{appName:d}=e,h=(0,b.A)(),{platform:p}=(0,ed.V)(),m=(0,F.iK)(f.U6S.macMenuBarEnabled);if("macOS"!==p)return null;' +
     't=(0,n.jsx)(x.A,{id:"settings.general.macMenuBar.label"}),a=(0,n.jsx)(x.A,{id:"settings.general.macMenuBar.description",values:{appName:d}});let y=!1!==m;' +
-    'i=h.formatMessage({id:"settings.general.macMenuBar.ariaLabel",defaultMessage:"Show {appName} in the menu bar"},{appName:d}),o=(0,n.jsx)(N.l,{checked:y,onChange:s,ariaLabel:i}),l=(0,n.jsx)(P.ic,{label:t,description:a,control:o});return l}' +
+    'i=h.formatMessage({id:"settings.general.macMenuBar.ariaLabel",defaultMessage:"Show {appName} in the menu bar"},{appName:d}),o=(0,n.jsx)(N.l,{checked:y,onChange:s,ariaLabel:i}),l=(0,n.jsx)(P.ic,{entry:f.setting,description:a,control:o});return l}' +
     'function a1(){let[e,t]=(0,m.useState)(!1);return e}' +
     'function aR(){return(0,n.jsxs)(n.Fragment,{children:[(0,n.jsx)(aJ,{appName:v.C}),(0,n.jsx)(t6,{})]})}' +
     'function az(){return(0,n.jsxs)(n.Fragment,{children:[(0,n.jsx)(aJ,{appName:"ChatGPT"}),(0,n.jsx)(aK,{})]})}' +
     '},Other(e,t,a){var q=a("zzzz")}};\n//# sourceMappingURL=572868.36a6c86221.js.map';
 }
+
+test("settings contract rejects the retired label-based row", () => {
+  const { settingsContract } = require("./patch.js");
+  assert.equal(settingsContract(settingsFixture().replace("entry:f.setting", "label:t")), null);
+});
 
 function localeLoaderFixture(locales) {
   const entries = locales.map((locale, index) =>
@@ -643,7 +665,7 @@ test("settings patch injects both toggles into the owning module factory, is ide
   assert.match(patched, /return l\}function codexLinuxStartMinimizedPost\(/);
   assert.match(patched, /\(0,ed\.V\)\(\),\[codexLinuxEnabled,codexLinuxSetEnabled\]=\(0,m\.useState\)\(!1\)/);
   assert.match(patched, /codexLinuxIntl=\(0,b\.A\)\(\)/);
-  assert.match(patched, /\(0,n\.jsx\)\(P\.ic,\{label:codexLinuxLabel,/);
+  assert.match(patched, /\(0,n\.jsx\)\(P\.ic,\{entry:\{id:/);
   assert.match(patched, /\(0,n\.jsx\)\(N\.l,\{checked:codexLinuxEnabled,/);
   for (const appName of ["v.C", '"ChatGPT"']) {
     assert.ok(patched.includes(`(0,n.jsx)(aJ,{appName:${appName}}),(0,n.jsx)(codexLinuxStartMinimizedSetting,{}),(0,n.jsx)(codexLinuxStartMinimizedBootOnlySetting,{})`), appName);
@@ -760,7 +782,7 @@ function componentHarness(post, bootOnly = false, platform = "linux", messages =
   };
   const context = { React, platformHook: () => ({ platform }),
     intlHook: () => ({ formatMessage: ({ id, defaultMessage }) => messages[id] ?? defaultMessage }),
-    j: { jsx: (type, props) => ({ type, props }) }, Row: "row", Toggle: "toggle", codexLinuxStartMinimizedPost: post };
+    j: { jsx: (type, props) => { if (type === "row") { assert.equal(typeof props.entry.title.localizedText, "string"); assert.equal(props.anchored, false); } return { type, props }; } }, Row: "row", Toggle: "toggle", codexLinuxStartMinimizedPost: post };
   const renderFn = vm.runInNewContext(`${settingComponent({row:"Row",toggle:"Toggle",react:"React",platformHook:"platformHook",jsx:"j",intlHook:"intlHook"}, bootOnly)};${bootOnly ? "codexLinuxStartMinimizedBootOnlySetting" : "codexLinuxStartMinimizedSetting"}`, context);
   const render = () => { cursor = 0; const result = renderFn(); mounted = true; return result; };
   return { render, load: async () => { effects.forEach(callback => callback()); await new Promise(resolve => setImmediate(resolve)); } };
@@ -795,7 +817,7 @@ test("both toggle names, descriptions and accessibility labels use the active lo
     const messages = {};
     const harness = componentHarness(async () => ({ value: false }), bootOnly, "linux", messages);
     const english = harness.render();
-    assert.equal(english.props.label, bootOnly ? "Start minimized to tray only on boot" : "Start minimized to tray");
+    assert.equal(english.props.entry.title.localizedText, bootOnly ? "Start minimized to tray only on boot" : "Start minimized to tray");
     assert.equal(english.props.description, bootOnly
       ? "Hide the main window only when started automatically at login. Manual launches open normally. Takes priority over Start minimized to tray; does not enable autostart."
       : "Start with the main window hidden in the system tray. Applies after quitting and restarting the app, unless the boot-only option is enabled.");
@@ -808,14 +830,14 @@ test("both toggle names, descriptions and accessibility labels use the active lo
       LABEL_IDS.forEach((id, index) => { messages[id] = labels[index]; });
       DESCRIPTION_IDS.forEach((id, index) => { messages[id] = descriptions[index]; });
       const translated = harness.render();
-      assert.equal(translated.props.label, labels[Number(bootOnly)], locale);
-      assert.equal(translated.props.control.props.ariaLabel, translated.props.label, locale);
+      assert.equal(translated.props.entry.title.localizedText, labels[Number(bootOnly)], locale);
+      assert.equal(translated.props.control.props.ariaLabel, translated.props.entry.title.localizedText, locale);
       assert.equal(translated.props.description, descriptions[Number(bootOnly)], locale);
       assert.equal(translated.props.control.props.disabled, english.props.control.props.disabled, locale);
     }
     LABEL_IDS.forEach(id => { delete messages[id]; });
     DESCRIPTION_IDS.forEach(id => { delete messages[id]; });
-    assert.equal(harness.render().props.label, english.props.label);
+    assert.equal(harness.render().props.entry.title.localizedText, english.props.entry.title.localizedText);
     assert.equal(harness.render().props.description, english.props.description);
   }
 });
@@ -961,21 +983,11 @@ test(
     const signed = path.join(process.env.CODEX_SIGNED_EXTRACTED_APP, "webview", "assets");
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "start-minimized-signed-"));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const asyncDir = path.join(root, "webview", "assets", "async");
-    fs.mkdirSync(asyncDir, { recursive: true });
-    const copied = [];
-    for (const name of fs.readdirSync(path.join(signed, "async")).filter(file => file.endsWith(".js"))) {
-      const source = fs.readFileSync(path.join(signed, "async", name), "utf8");
-      if (['"settings.general.macMenuBar.label"', '"../locales/', ".macMenuBarEnabled"].some(needle => source.includes(needle))) {
-        fs.writeFileSync(path.join(asyncDir, name), source);
-        copied.push(name);
-      }
-    }
+    const assets = path.join(root, "webview", "assets");
+    fs.cpSync(signed, assets, { recursive: true });
     assert.deepEqual(applySettingsPatch(root), { changed: true });
-    const changed = copied.filter(name =>
-      fs.readFileSync(path.join(asyncDir, name), "utf8") !== fs.readFileSync(path.join(signed, "async", name), "utf8"));
-    assert.equal(changed.length, Object.keys(LABEL_TRANSLATIONS).length + 1);
-    const settings = changed.map(name => fs.readFileSync(path.join(asyncDir, name), "utf8"))
+    const settings = fs.readdirSync(path.join(assets, "async")).filter(name => name.endsWith(".js"))
+      .map(name => fs.readFileSync(path.join(assets, "async", name), "utf8"))
       .filter(source => source.includes("function codexLinuxStartMinimizedSetting("));
     assert.equal(settings.length, 1);
     const check = spawnSync(process.execPath, ["--input-type=module", "--check"], { input: settings[0], encoding: "utf8" });

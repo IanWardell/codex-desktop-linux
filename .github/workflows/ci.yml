@@ -30,18 +30,9 @@ jobs:
       - name: Guided installer tests
         run: python3 scripts/feature-picker.test.py
       - name: Node tests
-        run: |
-          node --test scripts/ci/*.test.js
-          node --test scripts/lib/upstream-linux-package.test.js \
-            scripts/lib/install-verification.test.js
-          node --test scripts/lib/package-common.test.js
-          node --check scripts/ci/verify-official-linux-features.js
-          node --test scripts/automation/upstream-linux-package-watchdog/test.js
-          node --test scripts/patch-linux-window-ui.test.js scripts/patches/descriptor.test.js \
-            scripts/patches/lib/global-shortcuts-portal.test.js \
-            scripts/patches/lib/minified-js.test.js scripts/patches/lib/assets.test.js \
-            scripts/patches/core/*/test.js \
-            scripts/lib/linux-features.test.js linux-features/*/test.js
+        # Syntax-checks every tracked .js file, then runs every *.test.js and
+        # test.js in a fresh TMPDIR and fails when a run leaves anything there.
+        run: bash scripts/ci/run-node-checks.sh all
       - name: Smoke tests
         run: bash tests/scripts_smoke.sh
 
@@ -61,7 +52,8 @@ jobs:
       - name: Install private D-Bus test session
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dbus python3-gi
+          sudo apt-get install -y --no-install-recommends dbus python3-gi \
+            gir1.2-gtk-3.0 at-spi2-core xvfb tmux screen openbox xterm xinput x11-utils wmctrl xdotool
       - name: Test embedded Computer Use in isolation
         env:
           CARGO_BUILD_JOBS: '2'

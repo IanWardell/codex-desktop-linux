@@ -11,7 +11,8 @@ const identifier = String.raw`[A-Za-z_$][\w$]*`;
 const call = String.raw`(?:\(0,${identifier}\.${identifier}\)|${identifier})`;
 const classifierHead = new RegExp(
   String.raw`function(?: ${identifier})?\(\{unit:(?<unit>${identifier}),hasFollowingFinalAnswer:(?<following>${identifier}),` +
-    String.raw`keepMcpAppEntriesPersistent:(?<keep>${identifier}),mcpServerStatuses:(?<statuses>${identifier}),renderMcpApps:(?<render>${identifier})\}\)\{` +
+    String.raw`keepMcpAppEntriesPersistent:(?<keep>${identifier}),mcpServerStatuses:(?<statuses>${identifier}),` +
+    String.raw`renderMcpApps:(?<render>${identifier})\}\)\{` +
     String.raw`if\("standalone"!==\k<unit>\.kind\)return!1;let (?<item>${identifier})=\k<unit>\.item\.item;return`,
   "g",
 );
@@ -31,35 +32,53 @@ function classifierShape(source, match) {
     `${keep}&&${render}&&"mcp-tool-call"===${item}.type&&`,
     `mcpServerStatuses:${statuses}}))`,
   ];
+  const assistant = new RegExp(
+    String.raw`"assistant-message"===${i}\.type\?(?<patched>!0\|\|)?${call}\(${i}\):!!\(`,
+    "g",
+  );
   if (!tools.every((part) => body.split(part).length === 2) ||
-      !new RegExp(String.raw`"mcp-tool-call"===${i}\.type&&${call}\(${i}\)\|\|"assistant-message"===${i}\.type`).test(body)) {
+      !new RegExp(String.raw`"mcp-tool-call"===${i}\.type&&${call}\(${i}\)`).test(body)) {
     return null;
   }
-  const assistant = [...body.matchAll(new RegExp(String.raw`\|\|"assistant-message"===${i}\.type&&${call}\(${i}\)\|\|"dynamic-tool-call"===`, "g"))];
-  const assistantPatched = body.split(`||"assistant-message"===${item}.type||"dynamic-tool-call"===`).length - 1;
+  const assistants = [...body.matchAll(assistant)];
   const user = `||"user-message"===${item}.type&&("pending"===${item}.steeringStatus||!0===${item}.followsInterruptedFinalAnswer||` +
+    `"accepted"===${item}.steeringStatus&&null==${item}.questionReplies&&null==${item}.codexDelegation&&!${item}.isToolOutput&&!${item}.isHistoricalSteering||` +
     `!0===${item}.wasInHistoryPreview||"not-sent"===${item}.deliveryStatus||!0===${item}.hookFeedback||!${following})}`;
-  const userPatched = `||"user-message"===${item}.type}`;
-  const original = assistant.length === 1 && assistantPatched === 0 && body.endsWith(user);
-  const patched = assistant.length === 0 && assistantPatched === 1 && body.endsWith(userPatched);
+  const currentUser = user.slice(0, -1) + ")}";
+  const userPatched = `||"user-message"===${item}.type${currentUser}`;
+  const original = assistants.length === 1 && assistants[0].groups.patched == null && body.endsWith(currentUser);
+  const patched = assistants.length === 1 && assistants[0].groups.patched != null && body.endsWith(userPatched);
   if (!original && !patched) return null;
-  return { start: match.index, body, item, original, assistant: assistant[0]?.[0], user, userPatched };
+  return { start: match.index, body, item, original, assistant: assistants[0], user: currentUser, userPatched };
 }
 
 function applyAuthoredMessageVisibilityPatch(source) {
+  const current = new RegExp(
+    String.raw`(?<prefix>"standalone"===(${identifier})\.kind&&\(\(0,${identifier}\.${identifier}\)\(\2\.item\.item,[^)]+\)\|\|\((?<item>${identifier})=\2\.item\.item,(?<before>${identifier})=[^,;]+,"assistant-message"===\k<item>\.type\?)(?<assistant>\(0,${identifier}\.${identifier}\)\(\k<item>\))(?<middle>:"user-message"===\k<item>\.type&&\()(?<user>"pending"===\k<item>\.steeringStatus[\s\S]{0,500}?!\k<before>)(?<suffix>\)\)\)\?${identifier}\.push\(\2\):${identifier}\.push\(\2\))`,
+    "g",
+  );
+  const currentMatches = [...source.matchAll(current)];
+  if (currentMatches.length === 1) {
+    const match = currentMatches[0];
+    if (match.groups.assistant.startsWith("!0||") && match.groups.user.startsWith("!0||")) return source;
+    const replacement = `${match.groups.prefix}!0||${match.groups.assistant}${match.groups.middle}!0||${match.groups.user}${match.groups.suffix}`;
+    return source.slice(0, match.index) + replacement + source.slice(match.index + match[0].length);
+  }
   const shapes = [...source.matchAll(classifierHead)].map((match) => classifierShape(source, match));
-  const current = shapes.filter((shape) => shape?.original);
+  const original = shapes.filter((shape) => shape?.original);
   const patched = shapes.filter((shape) => shape != null && !shape.original);
   if (shapes.length === 1 && patched.length === 1) return source;
-  if (shapes.length !== 1 || current.length !== 1) {
-    console.warn(`WARN: authored-message-visibility: expected one complete activity classifier, found ${current.length} original and ${patched.length} patched of ${shapes.length}. ${recovery}`);
+  if (shapes.length !== 1 || original.length !== 1) {
+    console.warn(`WARN: authored-message-visibility: expected one complete activity classifier, found ${original.length} original and ${patched.length} patched of ${shapes.length}. ${recovery}`);
     return source;
   }
-  const [{ start, body, item, assistant, user, userPatched }] = current;
+  const [{ start, body, assistant, user, userPatched }] = original;
   const replacement = body
-    .replace(assistant, `||"assistant-message"===${item}.type||"dynamic-tool-call"===`)
+    .slice(0, assistant.index + assistant[0].indexOf("?") + 1) + "!0||" +
+    body.slice(assistant.index + assistant[0].indexOf("?") + 1);
+  const patchedBody = replacement
     .slice(0, -user.length) + userPatched;
-  return source.slice(0, start) + replacement + source.slice(start + body.length);
+  return source.slice(0, start) + patchedBody + source.slice(start + body.length);
 }
 
 module.exports = {

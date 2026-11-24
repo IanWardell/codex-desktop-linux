@@ -23,7 +23,7 @@ function webpackFactory(source, index) {
   const head = "__webpack_modules__={";
   const start = source.indexOf(head);
   if (start < 0) return null;
-  const entry = new RegExp(`(?:[\\w$]+|"(?:[^"\\\\]|\\\\.)*")\\((${ID}(?:,${ID}){0,2})?\\)\\{`, "y");
+  const entry = new RegExp(`(?:[\\w$]+|"(?:[^"\\\\]|\\\\.)*")(?:(?:\\((${ID}(?:,${ID}){0,2})?\\))|(?::(\\()?function\\((${ID}(?:,${ID}){0,2})?\\)))\\{`, "y");
   let cursor = start + head.length;
   for (;;) {
     entry.lastIndex = cursor;
@@ -32,8 +32,9 @@ function webpackFactory(source, index) {
     const open = entry.lastIndex - 1;
     const end = findMatchingBrace(source, open);
     if (end < 0) return null;
-    if (index > open && index < end) return { open, end, params: (match[1] ?? "").split(",") };
+    if (index > open && index < end) return { open, end, params: (match[1] ?? match[3] ?? "").split(",") };
     cursor = end + 1;
+    if (match[2] != null && source[cursor] === ")") cursor += 1;
     if (source[cursor] !== ",") return null;
     cursor += 1;
   }
@@ -49,7 +50,7 @@ function factoryImport(factory, requireName, alias) {
 // namespace. All aliases are captured from the current menu-bar setting and its
 // own module factory, never from chunk or module ids.
 function settingsContract(source) {
-  const owner = unique(source, new RegExp(`function (${ID})\\((${ID})\\)\\{.{0,300}?\\{platform:(${ID})\\}=(${CALLEE})\\(\\),(${ID})=(${CALLEE})\\((${MEMBER})\\.macMenuBarEnabled\\);if\\("macOS"!==\\3\\)return null;`, "g"));
+  const owner = unique(source, new RegExp(`function (${ID})\\((${ID})\\)\\{.{0,600}?\\{platform:(${ID})\\}=(${CALLEE})\\(\\),.{0,200}?(${ID})=(${CALLEE})\\((${MEMBER})\\.macMenuBarEnabled\\);if\\("macOS"!==\\3\\)return null;`, "g"));
   if (!owner || !";{}".includes(source[owner.index - 1])) return null;
   const factory = webpackFactory(source, owner.index);
   const requireName = factory?.params[2];
@@ -58,7 +59,7 @@ function settingsContract(source) {
   const end = findMatchingBrace(source, source.indexOf("{", owner.index));
   if (end < 0 || end > factory.end) return null;
   const body = source.slice(owner.index, end + 1);
-  const row = unique(body, new RegExp(`\\(0,(${ID})\\.jsx\\)\\((${MEMBER}),\\{label:${ID},description:${ID},control:${ID}\\}`, "g"));
+  const row = unique(body, new RegExp(`\\(0,(${ID})\\.jsx\\)\\((${MEMBER}),\\{entry:${MEMBER},description:${ID},control:${ID}\\}`, "g"));
   const toggle = unique(body, new RegExp(`\\(0,${ID}\\.jsx\\)\\((${MEMBER}),\\{checked:${ID},onChange:${ID},ariaLabel:${ID}\\}`, "g"));
   const intlUse = unique(body, new RegExp(`(${ID})\\.formatMessage\\(\\{id:"settings\\.general\\.macMenuBar\\.ariaLabel"`, "g"));
   const intl = intlUse && unique(body, new RegExp(`(?<![\\w$.])${escapeRegExp(intlUse[1])}=(${CALLEE})\\(\\)`, "g"));
@@ -79,7 +80,7 @@ function settingsContract(source) {
 }
 
 function settingComponent({ row, toggle, react, platformHook, jsx }) {
-  return `function ${UI}(){let {platform}=${platformHook}(),[enabled,setEnabled]=${react}.useState(false),[pending,setPending]=${react}.useState(true),[error,setError]=${react}.useState(null);${react}.useEffect(()=>{let live=true;window.electronBridge.getLinuxAccountSwitcherImplementation().then(state=>{if(live){setEnabled(state.implementation==="upstream");setPending(false)}}).catch(()=>{if(live)setError("Could not load account switcher preference")});return()=>{live=false}},[]);if(platform!=="linux")return null;let change=async value=>{if(pending)return;setPending(true);try{let state=await window.electronBridge.setLinuxAccountSwitcherImplementation(value===true?"upstream":"profiles");setEnabled(state.implementation==="upstream");setError(null);document.querySelector("[data-codex-linux-account-switcher]")?.remove()}catch{setError("Could not change switcher. Finish any account change and try again.")}finally{setPending(false)}};let label="Use upstream account switcher",description="Off: separate account profiles with optional shared history. On: encrypted saved logins sharing the current profile's chats and settings. Applies immediately; saved profiles remain available.";return(0,${jsx}.jsx)(${row},{label,description:error??description,control:(0,${jsx}.jsx)(${toggle},{checked:enabled,disabled:pending,onChange:change,ariaLabel:label})})}`;
+  return `function ${UI}(){let {platform}=${platformHook}(),[enabled,setEnabled]=${react}.useState(false),[pending,setPending]=${react}.useState(true),[error,setError]=${react}.useState(null);${react}.useEffect(()=>{let live=true;window.electronBridge.getLinuxAccountSwitcherImplementation().then(state=>{if(live){setEnabled(state.implementation==="upstream");setPending(false)}}).catch(()=>{if(live)setError("Could not load account switcher preference")});return()=>{live=false}},[]);if(platform!=="linux")return null;let change=async value=>{if(pending)return;setPending(true);try{let state=await window.electronBridge.setLinuxAccountSwitcherImplementation(value===true?"upstream":"profiles");setEnabled(state.implementation==="upstream");setError(null);document.querySelector("[data-codex-linux-account-switcher]")?.remove()}catch{setError("Could not change switcher. Finish any account change and try again.")}finally{setPending(false)}};let label="Use upstream account switcher",description="Off: separate account profiles with optional shared history. On: encrypted saved logins sharing the current profile's chats and settings. Applies immediately; saved profiles remain available.";return(0,${jsx}.jsx)(${row},{entry:{id:"codex-linux-account-switcher",title:{localizedText:label}},anchored:!1,description:error??description,control:(0,${jsx}.jsx)(${toggle},{checked:enabled,disabled:pending,onChange:change,ariaLabel:label})})}`;
 }
 
 function patchSettingsSource(source) {

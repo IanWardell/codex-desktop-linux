@@ -15,7 +15,7 @@ const SIDEBAR_STYLE =
   '{animationName:"none",animationTimeline:"auto","--bottom-fade":"calc(var(--spacing) * 10)"}';
 
 const SIDEBAR_ASSET_NEEDLES = [".sidebarScroll,className:", "vertical-scroll-fade-mask", "[contain:layout_paint]"];
-const TAB_ASSET_NEEDLES = ["animateLayout:", 'dragActivator:"tab"', "isWorkspaceHome"];
+const TAB_ASSET_NEEDLES = [".render({disabled:", "animateLayout:", "animatePosition:"];
 const MARKDOWN_STYLESHEET_NEEDLES = ["[data-markdown-animated]", ".FadeListDecoration-", ".ImageEnter-"];
 const WEBVIEW_STYLESHEET_DIRECTORIES = ["", "async"];
 const SIDEBAR_WARNING =
@@ -30,8 +30,8 @@ function markdownRules(source) {
   const fadeTargets =
     `:is\\(\\.FadeIn-${CSS_HASH},\\.HorizontalRule-${CSS_HASH},\\.ListItem-${CSS_HASH},\\.TableRow-${CSS_HASH},\\.Blockquote-${CSS_HASH}\\)`;
   const unpatched = new RegExp(
-    `(${root(`(${CSS_HASH})`)} ${fadeTargets})\\{opacity:1;animation:fade-in-${CSS_HASH} ([^{};]+) both;animation-delay:var\\(--fade-delay,0s\\)\\}` +
-      `(${root("\\2")} \\.FadeListDecoration-${CSS_HASH}::marker)\\{animation:fade-in-marker-${CSS_HASH} \\3 forwards;animation-delay:var\\(--fade-delay,0s\\)\\}`,
+    `(${root(`(${CSS_HASH})`)} ${fadeTargets})\\{opacity:1;animation:([^{};]+) both;animation-delay:var\\(--fade-delay,0s\\)\\}` +
+      `(${root("\\2")} \\.FadeListDecoration-${CSS_HASH}::marker)\\{animation:[^{};]+ forwards;animation-delay:var\\(--fade-delay,0s\\)\\}`,
     "gu",
   );
   const patched = new RegExp(
@@ -122,14 +122,15 @@ function applyLinuxMarkdownAnimationStylesheetPatch(extractedDir) {
 
 function layoutAnimationFlags(source) {
   const currentPattern = new RegExp(
-    `animateLayout:(?<expression>!(${JS_IDENT})\\.isWorkspaceHome&&(${JS_IDENT})\\.animateLayout),` +
-      `animateExit:!\\2\\.isWorkspaceHome&&\\3\\.animateExit,closeButtonTabIndex:-1,` +
-      `controller:${JS_MEMBER},dragActivator:"tab",tab:\\2`,
+    `(?<tab>${JS_IDENT})\\.render\\(\\{disabled:\\k<tab>\\.disabled,isActive:${JS_IDENT},` +
+      `isClosable:\\k<tab>\\.isClosable,isPresented:[^,]+,isRenaming:[^,]+,` +
+      `animateLayout:(?<expression>${JS_IDENT}),animateExit:[^,]+,animatePosition:[^,]+,animateWidth:`,
     "gu",
   );
   const patchedPattern = new RegExp(
-    `animateLayout:(?<expression>!1),animateExit:!(${JS_IDENT})\\.isWorkspaceHome&&(${JS_IDENT})\\.animateExit,` +
-      `closeButtonTabIndex:-1,controller:${JS_MEMBER},dragActivator:"tab",tab:\\2`,
+    `(?<tab>${JS_IDENT})\\.render\\(\\{disabled:\\k<tab>\\.disabled,isActive:${JS_IDENT},` +
+      `isClosable:\\k<tab>\\.isClosable,isPresented:[^,]+,isRenaming:[^,]+,` +
+      `animateLayout:(?<expression>!1),animateExit:[^,]+,animatePosition:[^,]+,animateWidth:`,
     "gu",
   );
   return [...source.matchAll(currentPattern), ...source.matchAll(patchedPattern)].map((match) => ({

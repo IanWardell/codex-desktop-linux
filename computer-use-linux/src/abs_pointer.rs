@@ -7,7 +7,9 @@
 //!
 //! Here we create our own uinput device that exposes a true `ABS_X`/`ABS_Y`
 //! axis whose range matches the full screenshot's pixel dimensions. The
-//! compositor maps that range across its logical output layout. Callers keep
+//! compositor maps that range across its logical output layout. It also
+//! exposes `REL_WHEEL`/`REL_HWHEEL` so scroll events travel with the same
+//! pointer state as the motion that positioned the cursor. Callers keep
 //! using capture-pixel coordinates, which can differ from logical coordinates
 //! on scaled outputs. Returned landings describe the emitted coordinates;
 //! they are not a readback of the compositor's actual pointer position.
@@ -18,7 +20,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use evdev::{
     uinput::VirtualDevice, AbsInfo, AbsoluteAxisCode, AttributeSet, EventType, InputEvent, KeyCode,
-    PropType, UinputAbsSetup,
+    PropType, RelativeAxisCode, UinputAbsSetup,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +28,85 @@ use evdev::{
 pub(crate) struct PointerLanding {
     pub(crate) requested: (i32, i32),
     pub(crate) emitted: (i32, i32),
+}
+
+/// Where a drag pressed and where it released, after edge clamping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "drag endpoints may be clamped; inspect requested and emitted coordinates"]
+pub(crate) struct DragLanding {
+    pub(crate) start: PointerLanding,
+    pub(crate) end: PointerLanding,
+}
+
+/// Where a capture sits inside the compositor's output layout, in capture
+/// pixels. A portal that captures one output of several returns an image
+/// smaller than the layout, while the compositor maps an absolute device
+/// across the whole layout: the device then needs the layout's size, and
+/// every capture coordinate the output's offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CapturePlacement {
+    pub(crate) layout_width: i32,
+    pub(crate) layout_height: i32,
+    pub(crate) offset_x: i32,
+    pub(crate) offset_y: i32,
+}
+
+/// How a capture relates to the layout the compositor maps an absolute
+/// device across.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CaptureFit {
+    /// The capture covers the whole layout (the usual case): the device is
+    /// sized to the capture.
+    WholeLayout,
+    /// The capture is one output of several, at a known place.
+    Placed(CapturePlacement),
+    /// The capture matches neither the layout nor a known output. A device
+    /// sized to it would scale every point, so none may be created.
+    Unsupported(String),
+}
+
+/// How a `width`×`height` capture fits the output layout; an error when the
+/// layout could not be read. May run a compositor CLI, so call it off the
+/// async runtime.
+pub(crate) fn detect_placement(width: i32, height: i32) -> Result<CaptureFit> {
+    if cfg!(test) {
+        return Ok(CaptureFit::WholeLayout);
+    }
+    crate::windowing::backends::umbriel::capture_fit(width, height)
+}
+
+/// The buttons, wheel axes and properties the device declares next to its
+/// absolute X/Y axes.
+struct DeviceCapabilities {
+    keys: AttributeSet<KeyCode>,
+    relative_axes: AttributeSet<RelativeAxisCode>,
+    props: AttributeSet<PropType>,
+}
+
+impl DeviceCapabilities {
+    fn new() -> Self {
+        Self {
+            keys: AttributeSet::from_iter([
+                KeyCode::BTN_LEFT,
+                KeyCode::BTN_RIGHT,
+                KeyCode::BTN_MIDDLE,
+            ]),
+            // Wheel axes keep scroll events on the same device as the motion
+            // that positioned the pointer. A wheel sent through ydotool's
+            // device right after this one jumped the cursor can be routed
+            // with a stale pointer position and dropped. The kernel drops
+            // events for codes a device did not declare, so a wheel without
+            // these axes would be dropped silently too.
+            relative_axes: AttributeSet::from_iter([
+                RelativeAxisCode::REL_WHEEL,
+                RelativeAxisCode::REL_HWHEEL,
+            ]),
+            // INPUT_PROP_DIRECT marks the device as a direct (absolute)
+            // pointer so libinput maps its axes to screen coordinates rather
+            // than treating it as a relative touchpad.
+            props: AttributeSet::from_iter([PropType::DIRECT]),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,28 +143,63 @@ impl AbsPointerGeometry {
     }
 }
 
+/// Where the pointer's events go: the uinput device, or a recorder in tests.
+pub(crate) trait PointerEvents: Send {
+    fn emit(&mut self, events: &[InputEvent]) -> std::io::Result<()>;
+}
+
+impl PointerEvents for VirtualDevice {
+    fn emit(&mut self, events: &[InputEvent]) -> std::io::Result<()> {
+        VirtualDevice::emit(self, events)
+    }
+}
+
 pub struct AbsPointer {
-    device: VirtualDevice,
+    device: Box<dyn PointerEvents>,
     geometry: AbsPointerGeometry,
+    placement: Option<CapturePlacement>,
 }
 
 impl AbsPointer {
     /// Create the absolute pointer sized to the capture's `width`×`height`.
     /// Waits 500 ms for libinput to enumerate the device before its first event.
     pub fn create(width: i32, height: i32) -> Result<Self> {
+        // uinput devices are kernel-wide: a unit test's cleared environment
+        // would not keep this one off the developer's desktop.
+        if cfg!(test) {
+            anyhow::bail!("unit tests do not create real uinput devices");
+        }
         let geometry = AbsPointerGeometry::from_dimensions(width, height);
-        let (max_x, max_y) = geometry.axis_maxima();
+        // An unreadable layout or an unplaceable capture fails the device:
+        // sized to one output of several, it would scale every point.
+        let placement = match detect_placement(width, height)
+            .context("failed to read the output layout for the absolute pointer")?
+        {
+            CaptureFit::WholeLayout => None,
+            CaptureFit::Placed(placement) => Some(placement),
+            CaptureFit::Unsupported(reason) => {
+                anyhow::bail!("the capture cannot be placed in the output layout: {reason}")
+            }
+        };
+        // The axis range covers what the compositor maps the device across:
+        // the capture, or the whole layout when the capture is one output.
+        let (max_x, max_y) = match placement {
+            Some(placement) => {
+                AbsPointerGeometry::from_dimensions(placement.layout_width, placement.layout_height)
+                    .axis_maxima()
+            }
+            None => geometry.axis_maxima(),
+        };
         // value, min, max, fuzz, flat, resolution. resolution=1 unit/px.
         let abs_x =
             UinputAbsSetup::new(AbsoluteAxisCode::ABS_X, AbsInfo::new(0, 0, max_x, 0, 0, 1));
         let abs_y =
             UinputAbsSetup::new(AbsoluteAxisCode::ABS_Y, AbsInfo::new(0, 0, max_y, 0, 0, 1));
-        let keys =
-            AttributeSet::from_iter([KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT, KeyCode::BTN_MIDDLE]);
-        // INPUT_PROP_DIRECT marks the device as a direct (absolute) pointer so
-        // libinput maps its axes to screen coordinates rather than treating it
-        // as a relative touchpad.
-        let props = AttributeSet::from_iter([PropType::DIRECT]);
+        let DeviceCapabilities {
+            keys,
+            relative_axes,
+            props,
+        } = DeviceCapabilities::new();
 
         let device = VirtualDevice::builder()
             .context("uinput builder (is /dev/uinput writable?)")?
@@ -91,6 +207,7 @@ impl AbsPointer {
             .with_properties(&props)?
             .with_absolute_axis(&abs_x)?
             .with_absolute_axis(&abs_y)?
+            .with_relative_axes(&relative_axes)?
             .with_keys(&keys)?
             .build()
             .context("failed to create uinput absolute pointer device")?;
@@ -98,18 +215,63 @@ impl AbsPointer {
         // Give udev/libinput time to enumerate the new device.
         sleep(Duration::from_millis(500));
 
-        Ok(Self { device, geometry })
+        Ok(Self {
+            device: Box::new(device),
+            geometry,
+            placement,
+        })
+    }
+
+    /// A pointer sized to `width`×`height` that sends its events to `device`.
+    #[cfg(test)]
+    pub(crate) fn with_events(
+        device: impl PointerEvents + 'static,
+        width: i32,
+        height: i32,
+    ) -> Self {
+        Self {
+            device: Box::new(device),
+            geometry: AbsPointerGeometry::from_dimensions(width, height),
+            placement: None,
+        }
+    }
+
+    /// A pointer for a `width`×`height` capture placed inside a larger layout.
+    #[cfg(test)]
+    pub(crate) fn with_events_placed(
+        device: impl PointerEvents + 'static,
+        width: i32,
+        height: i32,
+        placement: CapturePlacement,
+    ) -> Self {
+        Self {
+            device: Box::new(device),
+            geometry: AbsPointerGeometry::from_dimensions(width, height),
+            placement: Some(placement),
+        }
     }
 
     pub fn matches_dimensions(&self, width: i32, height: i32) -> bool {
         self.geometry.matches_dimensions(width, height)
     }
 
+    /// Where this device places its capture inside the output layout. A
+    /// caller compares it with `detect_placement` to replace a device made
+    /// before an output was turned on or off.
+    pub(crate) fn placement(&self) -> Option<CapturePlacement> {
+        self.placement
+    }
+
     /// Move the pointer to capture-pixel coordinates `(x, y)` and report
     /// both the requested point and the values emitted after edge clamping.
     pub(crate) fn move_to(&mut self, x: i32, y: i32) -> Result<PointerLanding> {
         let landing = self.geometry.landing_for(x, y);
-        let (emitted_x, emitted_y) = landing.emitted;
+        // The landing stays in capture pixels; only the device events carry
+        // the capture's offset inside the layout.
+        let (offset_x, offset_y) = self
+            .placement
+            .map_or((0, 0), |placement| (placement.offset_x, placement.offset_y));
+        let (emitted_x, emitted_y) = (landing.emitted.0 + offset_x, landing.emitted.1 + offset_y);
         self.device
             .emit(&[
                 InputEvent::new_now(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, emitted_x),
@@ -117,6 +279,19 @@ impl AbsPointer {
             ])
             .context("failed to emit absolute motion")?;
         Ok(landing)
+    }
+
+    /// Scroll the wheel by `(dx, dy)` notches at the pointer's current
+    /// position. `dy` is positive for scroll-up, `dx` positive for
+    /// scroll-right, matching the kernel's `REL_WHEEL`/`REL_HWHEEL` convention.
+    pub(crate) fn wheel(&mut self, dx: i32, dy: i32) -> Result<()> {
+        self.device
+            .emit(&[
+                InputEvent::new_now(EventType::RELATIVE.0, RelativeAxisCode::REL_HWHEEL.0, dx),
+                InputEvent::new_now(EventType::RELATIVE.0, RelativeAxisCode::REL_WHEEL.0, dy),
+            ])
+            .context("failed to emit wheel motion")?;
+        Ok(())
     }
 
     /// Move to `(x, y)` then press+release `button` `count` times.
@@ -131,11 +306,8 @@ impl AbsPointer {
         sleep(Duration::from_millis(30));
         let code = button.key_code();
         for _ in 0..count.max(1) {
-            if let Err(error) = self
-                .device
-                .emit(&[InputEvent::new_now(EventType::KEY.0, code, 1)])
-            {
-                return Err(self.release_after_error(code, error.into()));
+            if let Err(error) = self.press_button(code) {
+                return Err(self.release_after_error(code, error));
             }
             sleep(Duration::from_millis(30));
             if let Err(error) = self.release_button(code) {
@@ -146,23 +318,19 @@ impl AbsPointer {
         Ok(landing)
     }
 
-    /// Press at `(start)`, move to `(end)`, release — a drag with `button`.
-    pub fn drag(
+    /// Press at `(start)`, move to `(end)`, release: a drag with `button`.
+    /// Reports where the press and the release were emitted after clamping.
+    pub(crate) fn drag(
         &mut self,
         start: (i32, i32),
         end: (i32, i32),
         button: PointerButton,
-    ) -> Result<()> {
+    ) -> Result<DragLanding> {
         let code = button.key_code();
-        // Drag currently reports backend success only; retain the landing
-        // values explicitly so their intentional omission stays visible.
-        let _start_landing = self.move_to(start.0, start.1)?;
+        let start_landing = self.move_to(start.0, start.1)?;
         sleep(Duration::from_millis(30));
-        if let Err(error) = self
-            .device
-            .emit(&[InputEvent::new_now(EventType::KEY.0, code, 1)])
-        {
-            return Err(self.release_after_error(code, error.into()));
+        if let Err(error) = self.press_button(code) {
+            return Err(self.release_after_error(code, error));
         }
         sleep(Duration::from_millis(40));
         for (x, y) in crate::pointer_path::drag_points(start, end) {
@@ -174,7 +342,17 @@ impl AbsPointer {
         if let Err(error) = self.release_button(code) {
             return Err(self.release_after_error(code, error));
         }
-        Ok(())
+        // The path's last motion is `end`, so the release goes there.
+        Ok(DragLanding {
+            start: start_landing,
+            end: self.geometry.landing_for(end.0, end.1),
+        })
+    }
+
+    fn press_button(&mut self, code: u16) -> Result<()> {
+        self.device
+            .emit(&[InputEvent::new_now(EventType::KEY.0, code, 1)])
+            .context("failed to emit absolute pointer button press")
     }
 
     fn release_button(&mut self, code: u16) -> Result<()> {
@@ -183,6 +361,9 @@ impl AbsPointer {
             .context("failed to emit absolute pointer button release")
     }
 
+    /// A failed write may still have reached the device, so a button that
+    /// was pressed, or whose press failed, could be held down. Send one more
+    /// release and say whether it went through.
     fn release_after_error(&mut self, code: u16, error: anyhow::Error) -> anyhow::Error {
         match self.release_button(code) {
             Ok(()) => anyhow!("{error:#}; sent a best-effort button release"),
@@ -221,8 +402,11 @@ impl PointerButton {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{AbsPointerGeometry, PointerButton};
+pub(crate) mod tests {
+    use super::{
+        AbsPointer, AbsPointerGeometry, CapturePlacement, EventType, InputEvent, KeyCode,
+        PointerButton, PointerEvents, PointerLanding, RelativeAxisCode,
+    };
 
     #[test]
     fn axis_range_ends_at_last_desktop_pixel() {
@@ -277,5 +461,242 @@ mod tests {
                 "{button} must fall through instead of becoming a left click"
             );
         }
+    }
+
+    /// Records every event and fails the emit calls whose 0-based index is in
+    /// `fail_calls`, the way a uinput write can fail midway through a click.
+    #[derive(Clone, Default)]
+    pub(crate) struct RecordedEvents {
+        events: std::sync::Arc<std::sync::Mutex<Vec<(u16, u16, i32)>>>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail_calls: Vec<usize>,
+    }
+
+    impl RecordedEvents {
+        pub(crate) fn failing_on(fail_calls: &[usize]) -> Self {
+            Self {
+                fail_calls: fail_calls.to_vec(),
+                ..Self::default()
+            }
+        }
+
+        /// The button events (`EV_KEY`) seen so far, as `(code, value)`.
+        fn button_events(&self) -> Vec<(u16, i32)> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _, _)| *kind == EventType::KEY.0)
+                .map(|(_, code, value)| (*code, *value))
+                .collect()
+        }
+
+        /// Every event seen so far, as `(type, code, value)`.
+        pub(crate) fn all_events(&self) -> Vec<(u16, u16, i32)> {
+            self.events.lock().unwrap().clone()
+        }
+
+        /// The wheel events (`EV_REL`) seen so far, as `(code, value)`.
+        pub(crate) fn wheel_events(&self) -> Vec<(u16, i32)> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _, _)| *kind == EventType::RELATIVE.0)
+                .map(|(_, code, value)| (*code, *value))
+                .collect()
+        }
+    }
+
+    impl PointerEvents for RecordedEvents {
+        fn emit(&mut self, events: &[InputEvent]) -> std::io::Result<()> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.events.lock().unwrap().extend(
+                events
+                    .iter()
+                    .map(|event| (event.event_type().0, event.code(), event.value())),
+            );
+            if self.fail_calls.contains(&call) {
+                return Err(std::io::Error::other("uinput write failed"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_placed_capture_offsets_events_but_not_the_landing() {
+        let recorded = RecordedEvents::default();
+        let mut pointer = AbsPointer::with_events_placed(
+            recorded.clone(),
+            2880,
+            1800,
+            CapturePlacement {
+                layout_width: 2880,
+                layout_height: 3600,
+                offset_x: 0,
+                offset_y: 1800,
+            },
+        );
+        let landing = pointer.move_to(100, 322).unwrap();
+        assert_eq!(landing.emitted, (100, 322));
+        let motion = recorded
+            .all_events()
+            .into_iter()
+            .filter(|(kind, _, _)| *kind == EventType::ABSOLUTE.0)
+            .map(|(_, _, value)| value)
+            .collect::<Vec<_>>();
+        assert_eq!(motion, vec![100, 2122]);
+    }
+
+    #[test]
+    fn click_releases_the_button_after_a_failed_press() {
+        // Call 0 is the motion, call 1 the press. A failed write may still
+        // have reached the device, so the button must not stay down.
+        let events = RecordedEvents::failing_on(&[1]);
+        let mut pointer = AbsPointer::with_events(events.clone(), 100, 100);
+
+        let error = pointer.click(10, 10, PointerButton::Left, 1).unwrap_err();
+        let error = format!("{error:#}");
+
+        let left = KeyCode::BTN_LEFT.0;
+        assert_eq!(events.button_events(), [(left, 1), (left, 0)]);
+        assert!(error.contains("uinput write failed"), "{error}");
+        assert!(
+            error.contains("sent a best-effort button release"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn click_retries_a_failed_release() {
+        // Call 2 is the release. Try it once more and say whether it worked.
+        let events = RecordedEvents::failing_on(&[2, 3]);
+        let mut pointer = AbsPointer::with_events(events.clone(), 100, 100);
+
+        let error = pointer.click(10, 10, PointerButton::Left, 2).unwrap_err();
+        let error = format!("{error:#}");
+
+        let left = KeyCode::BTN_LEFT.0;
+        assert_eq!(events.button_events(), [(left, 1), (left, 0), (left, 0)]);
+        assert!(
+            error.contains("best-effort button release also failed"),
+            "{error}"
+        );
+    }
+
+    /// A drag reports both endpoints after the clamp, and its last motion,
+    /// where the release goes, is the clamped end (#398).
+    #[test]
+    fn drag_reports_where_both_endpoints_landed() {
+        let events = RecordedEvents::default();
+        let mut pointer = AbsPointer::with_events(events.clone(), 100, 100);
+
+        let landing = pointer
+            .drag((-5, 10), (150, 60), PointerButton::Left)
+            .unwrap();
+
+        assert_eq!(
+            landing.start,
+            PointerLanding {
+                requested: (-5, 10),
+                emitted: (0, 10),
+            }
+        );
+        assert_eq!(
+            landing.end,
+            PointerLanding {
+                requested: (150, 60),
+                emitted: (99, 60),
+            }
+        );
+        let motion: Vec<i32> = events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(kind, _, _)| *kind == EventType::ABSOLUTE.0)
+            .map(|(_, _, value)| *value)
+            .collect();
+        assert_eq!(motion[..2], [0, 10]);
+        assert_eq!(motion[motion.len() - 2..], [99, 60]);
+    }
+
+    /// udev's input_id calls absolute X/Y with mouse buttons an absolute
+    /// mouse, before its touchscreen test, so INPUT_PROP_DIRECT does not
+    /// make this a touchscreen. A touch or tool button, or BTN_0/BTN_1 with
+    /// a wheel (a tablet pad), would change that. The wheel axes must be
+    /// declared, or the kernel drops the wheel events.
+    #[test]
+    fn device_declares_a_wheel_and_stays_an_absolute_mouse() {
+        use super::{DeviceCapabilities, PropType};
+        let capabilities = DeviceCapabilities::new();
+        for axis in [RelativeAxisCode::REL_WHEEL, RelativeAxisCode::REL_HWHEEL] {
+            assert!(capabilities.relative_axes.contains(axis), "{axis:?}");
+        }
+        for axis in [RelativeAxisCode::REL_X, RelativeAxisCode::REL_Y] {
+            assert!(!capabilities.relative_axes.contains(axis), "{axis:?}");
+        }
+        assert!(capabilities.keys.contains(KeyCode::BTN_LEFT));
+        for key in [
+            KeyCode::BTN_0,
+            KeyCode::BTN_1,
+            KeyCode::BTN_TOUCH,
+            KeyCode::BTN_TOOL_PEN,
+            KeyCode::BTN_TOOL_FINGER,
+        ] {
+            assert!(!capabilities.keys.contains(key), "{key:?}");
+        }
+        assert!(capabilities.props.contains(PropType::DIRECT));
+    }
+
+    /// Wheel deltas go out as `REL_HWHEEL`/`REL_WHEEL` pairs on the same
+    /// device that emitted the last motion, so the compositor routes them
+    /// with that device's pointer position.
+    #[test]
+    fn wheel_emits_relative_axis_events_from_the_pointer_device() {
+        let events = RecordedEvents::default();
+        let mut pointer = AbsPointer::with_events(events.clone(), 100, 100);
+
+        pointer.wheel(2, -3).unwrap();
+
+        assert_eq!(
+            events.wheel_events(),
+            [
+                (RelativeAxisCode::REL_HWHEEL.0, 2),
+                (RelativeAxisCode::REL_WHEEL.0, -3),
+            ]
+        );
+    }
+
+    /// A failed wheel write surfaces as an error instead of being swallowed,
+    /// mirroring how motion failures abort the action.
+    #[test]
+    fn wheel_reports_a_failed_emit() {
+        let events = RecordedEvents::failing_on(&[0]);
+        let mut pointer = AbsPointer::with_events(events, 100, 100);
+
+        let error = format!("{:#}", pointer.wheel(0, -1).unwrap_err());
+
+        assert!(error.contains("failed to emit wheel motion"), "{error}");
+        assert!(error.contains("uinput write failed"), "{error}");
+    }
+
+    #[test]
+    fn drag_releases_the_button_after_failed_motion_and_reports_it() {
+        // Call 0 moves to the start, call 1 presses, call 2 is the first step.
+        let events = RecordedEvents::failing_on(&[2]);
+        let mut pointer = AbsPointer::with_events(events.clone(), 100, 100);
+
+        let error = pointer
+            .drag((10, 10), (50, 50), PointerButton::Left)
+            .unwrap_err();
+        let error = format!("{error:#}");
+
+        let left = KeyCode::BTN_LEFT.0;
+        assert_eq!(events.button_events(), [(left, 1), (left, 0)]);
+        assert!(
+            error.contains("sent a best-effort button release"),
+            "{error}"
+        );
     }
 }

@@ -28,9 +28,7 @@ function copyFeatureHelpers(sourceRoot, targetRoot) {
 
 for (const [fileMode, directoryMode] of [[0o644, 0o755], [0o600, 0o700], [0o755, 0o755]]) {
   test(`package permission restoration traverses directory resources with mode ${fileMode.toString(8)}`, (t) => {
-    const base = path.join(os.homedir(), ".cache/codex-desktop-dev");
-    fs.mkdirSync(base, { recursive: true });
-    const root = fs.mkdtempSync(path.join(base, "codex-package-directory-mode-"));
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-package-directory-mode-"));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const app = path.join(root, "opt/codex-desktop");
     const featuresRoot = path.join(root, "linux-features");
@@ -584,7 +582,11 @@ function createReadAloudBuilderFixture(t, enabled, installer = true) {
 
 function assertReadAloudFile(file, expected) {
   assert.deepEqual(fs.readFileSync(file), expected.bytes, file);
-  assert.equal(fs.statSync(file).mode & 0o777, expected.mode, file);
+  const mode = fs.statSync(file).mode & 0o777;
+  // Packaging retains owner access and read/execute bits, while removing
+  // group/other write access from executable hooks and runners.
+  assert.equal(mode & 0o022, 0, `${file}: group/other write access`);
+  assert.equal(mode, expected.mode & ~0o022, `${file}: packaged permissions`);
 }
 
 function stageReadAloudApp(source, app, env) {

@@ -17,13 +17,17 @@ for its limitations.
 It supports:
 
 - app listing and accessibility trees through AT-SPI
-- screenshots through GNOME Shell DBus, the Codex GNOME Shell extension, or XDG Desktop Portal
+- screenshots through pixelflux when configured, then GNOME Shell DBus, the
+  Codex GNOME Shell extension, XDG Desktop Portal, native X11 or
+  `gnome-screenshot`, and through `grim` in Hyprland background mode
 - window listing and focusing on GNOME, KWin/Plasma 5 and 6, Hyprland, Niri,
-  COSMIC, i3 and Sway, labwc with Selkies IPC, other wlroots compositors through
+  Umbriel, COSMIC, i3 and Sway, labwc with Selkies IPC, other wlroots compositors through
   wlr-foreign-toplevel-management, and generic X11/EWMH window managers; GNOME
-  extension and X11 windows can also be moved and resized
-- keyboard, text, click, scroll, and drag input through `/dev/uinput`, XDG
-  RemoteDesktop portal, `xdotool` on X11, or `ydotool`
+  extension and X11 windows can also be moved and resized (on X11, the size is
+  the client area and decorations add to it)
+- keyboard, text, click, scroll, and drag input through pixelflux when
+  configured, `/dev/uinput`, the XDG RemoteDesktop portal, `xdotool` on X11,
+  `wtype`, KDE clipboard paste, or `ydotool`
 - pointer-direction feedback for the built-in V2 pet after successful click,
   scroll, and drag actions
 
@@ -41,7 +45,7 @@ keyboard input without a focus event. It follows the same single-dispatch path
 with an explicit monitoring warning. A no-fixed-focus session can still dispatch
 without that PointerRoot warning.
 
-The embedded backend tracks Computer Use 0.7.38. WebKitGTK AT-SPI socket children are resolved through their well-known bus names, and bounded indexed action reads avoid stalled `GetActions` calls. Native action matching uses stable machine-readable `GetName` values, including for Qt controls. Failed desktop actions and intentional refusals map to MCP `isError: true`; a successful action remains successful when only its post-action observation fails.
+The embedded backend tracks Computer Use 0.7.59. On GNOME Wayland and KDE Plasma Wayland (KWin 6.3 and later), background `click`, `drag` and `scroll` go through a virtual pen and touchscreen, so the user's mouse pointer does not move; a tap still focuses the window, and apps without tablet support never see the pen. `type_text` and `press_key` with `delivery: "background"` reach an AT-SPI element, a DevTools browser tab (`CODEX_COMPUTER_USE_DEVTOOLS`, standalone alias `COMPUTER_USE_LINUX_DEVTOOLS`, a loopback port or a `DevToolsActivePort` path) or a terminal by tty without moving the user's keyboard focus. On X11 and sway 1.10 and later the agent gets its own seat for whole-window keys, and `click` and `scroll` with `delivery: "background"` use its pointer; Hyprland uses `sendkeystate`. GNOME, KDE Plasma, COSMIC, niri, labwc and river run one seat and have no agent-seat route. The first background call per session that no route can serve sends nothing and explains why; a retry uses normal focused input. On Umbriel, screenshots capture every output through `dms screenshot all` when DMS is installed, and the uinput pointer covers the whole output layout when a capture is one output of several. A `screenshot` with `monitor` (a 0-based index in reading order) captures one monitor at its own resolution and reports its origin as `monitor_x`/`monitor_y`. WebKitGTK AT-SPI socket children are resolved through their well-known bus names, and bounded indexed action reads avoid stalled `GetActions` calls. Native action matching uses stable machine-readable `GetName` values, including for Qt controls. Failed desktop actions and intentional refusals map to MCP `isError: true`; a successful action remains successful when only its post-action observation fails.
 
 Explicit `x/y` clicks use screenshot capture pixels by default. On KWin Wayland, `coordinate_space: "atspi"` accepts a global AT-SPI screen point together with `element_index` or a semantic selector. Unsupported backends and ambiguous window ownership return an error before pointer input. An already-running desktop portal does not need an activation service file.
 
@@ -71,6 +75,30 @@ the image block for pixels. Mutating tools (`click`, `type_text`, `press_key`,
 (`true`, `"screen"`, or `"window"`) and `include_tree=true` to return
 post-action observation in the same result.
 
+Since the v0.7.52 sync, `screenshot`, `get_app_state` and every
+`screenshot_after` capture also take `screenshot_file_path`, an absolute path
+where the image is saved instead of returned as image content. The result
+keeps the screenshot metadata and adds `file_path`: in the caption for
+`screenshot`, and as `screenshot.file_path` for the other tools. The parent directory must
+exist, and the extension must match `format` (`.png`, or `.jpg`/`.jpeg`).
+File output only creates a new file: an existing entry is refused, and the
+image moves into place from a temp file in the same directory. A bad path is
+refused before any capture or input. A failed write is the `screenshot`
+error, `screenshot_error` on `get_app_state`, and `screenshot_error` with `ok`
+kept on a mutating tool; the image is never returned inline instead. Over
+HTTP (`mcp --listen`) the parameter is refused. The in-app adapter does not
+pass it.
+
+Since the v0.7.52 sync, GNOME `type_text` no longer refuses text only because
+one keyboard layout group lacks a key for a character, such as Latin text with
+`us` and `il` groups. The portal route still refuses it. The text then goes
+into the focused editable field of the verified target window through AT-SPI
+EditableText, and that window must be active. The call reports `ok: true` only
+when the field reads back the inserted text and the rest of its text
+unchanged; the message then starts with "Typed through AT-SPI EditableText".
+Password fields, focus outside an editable field, and text with a newline, tab
+or other control character keep the refusal.
+
 `doctor` reports an XDG portal interface only when the portal exports its
 methods: Screenshot needs `Screenshot`, ScreenCast needs `CreateSession`,
 `SelectSources`, and `Start`, and InputCapture needs `GetZones`, `Enable`, and
@@ -94,6 +122,21 @@ closes the query connection instead of leaving a blocked worker behind. Unix
 sockets, literal IP addresses, and `localhost` need no resolver helper. A remote
 hostname in `DISPLAY` requires `getent ahosts` for bounded name resolution;
 missing or failed resolution reports the X11 route as unavailable.
+
+Since the v0.7.48 sync, every tree result carries a `snapshot_id`:
+`get_app_state`, an `include_tree` observation and `get_tree_page`. The backend
+caches one tree, and each new tree replaces it. `click`, `scroll`,
+`perform_action` and `set_value` take the `snapshot_id` with an
+`element_index` (or, except on `scroll`, a selector), and `get_tree_page`
+takes it too. A call that names a replaced snapshot is refused before any
+window is raised or input is sent, since the index could name another element
+by then. Without `snapshot_id`, the element resolves in the latest tree. An
+`element_identifier` and a full capture-space `x`/`y` point are not checked; a
+`coordinate_space: "atspi"` click is, since it maps through the element. Each
+backend process has its own id prefix, so an id from before a restart is
+refused. The host bridge pages a large tree with the snapshot's id, so a tree
+replaced while it is paged comes back marked partial instead of mixing two
+trees.
 
 Element-targeted `click`, `scroll`, `perform_action` and `set_value` refuse an
 `element_index` or `element_identifier` from another app or window and ask for
@@ -131,8 +174,12 @@ the desktop is not GNOME, KDE or COSMIC. The portal stays
 preferred when it exists, when a portal keyboard session is already active, or
 with `CODEX_COMPUTER_USE_FORCE_PORTAL_KEYBOARD=1` (standalone alias
 `COMPUTER_USE_LINUX_FORCE_PORTAL_KEYBOARD=1`); the `*_FORCE_YDOTOOL_KEYBOARD=1`
-and `*_FORCE_XDOTOOL_KEYBOARD=1` names also skip `wtype`. A failed or denied
-portal request is never replayed through `wtype`.
+names also skip `wtype`, and so do the `*_FORCE_XDOTOOL_KEYBOARD=1` names when
+`xdotool` is installed and `DISPLAY` is set. A failed or denied portal request
+is never replayed through `wtype`. A `wtype` or `xdotool` on `PATH` without an
+execute bit is not selected, so input takes the next route. A selected `wtype`
+that cannot start (a missing interpreter, a `noexec` mount) makes `type_text`
+fall back to ydotool, since nothing was typed.
 
 On X11, `type_text` keeps xdotool's 12 ms per-character delay so XTEST events
 stay ordered. `CODEX_COMPUTER_USE_XDOTOOL_TYPE_DELAY_MS` overrides it; the
@@ -328,18 +375,33 @@ or screenshots:
 `doctor` evaluates pointer and keyboard portal capability independently. A
 keyboard-only or pointer-only RemoteDesktop implementation remains useful when
 its supported modality is complete, but pointer-only support does not make
-keyboard readiness green.
+keyboard readiness green. The keyboard check is reported as
+`portals.remote_desktop_keyboard`. `doctor` does not list `wtype` as an input
+backend when keyboard input goes elsewhere: with `*_FORCE_PORTAL_KEYBOARD=1`, or
+with `*_FORCE_XDOTOOL_KEYBOARD=1` when `xdotool` and `DISPLAY` are available.
 
 Niri window listing and exact focus prefer `niri msg` and fall back to direct
 JSON IPC over the active session socket. The Computer Use backend hydrates
 `NIRI_SOCKET` for GUI starts. If it is unset, socket discovery requires a
 unique socket matching `WAYLAND_DISPLAY`; ambiguous or stale sockets are
 refused. The `niri` binary is optional when the direct socket is reachable.
+Portal pointer input on niri maps coordinates with niri's logical output
+layout, read the same way, before it falls back to wlr-output-management.
 Window positions account for output origin, window offsets and a uniform known
 scale. If niri omits a position or output scaling is unknown or mixed, bounds
 are absent or keep null coordinates rather than guessing. Listing and exact
 focus remain available in those cases; use fresh full-screen screenshot
 coordinates for input.
+
+Umbriel window listing and exact focus use the `umbriel` CLI (`umbriel
+windows --json`, `umbriel msg window-focus`), which needs `UMBRIEL_SOCKET`. The
+backend reads it from the session's environment for GUI starts, or finds
+`umbriel-$WAYLAND_DISPLAY.sock` in `XDG_RUNTIME_DIR`. Windows carry pids and
+workspaces; a minimized window or one on a workspace that is not shown is
+`hidden`. With one enabled output, bounds are scaled to capture pixels with
+`umbriel outputs --json`. With several, bounds are left out: the Umbriel portal
+captures one output, so where a window sits in the capture is unknown. Listing
+and exact focus still work.
 
 The former `x11-ewmh-computer-use` alternative has been retired. The retained
 `computer-use-linux` backend owns generic X11/EWMH support on both official
@@ -362,6 +424,39 @@ You can also run the backend directly:
 ./codex-app/resources/plugins/openai-bundled/plugins/unified-computer-use/bin/codex-computer-use-linux screenshot
 ```
 
+`codex-computer-use-linux --help` lists every command but the `abs-test`
+development probe. Every command prints its own help with `-h` or `--help` and
+exits without touching the desktop. The whole command line is checked before
+anything runs: an unknown command, flag or argument count exits 2. `--` ends
+flags, so `state -- -name` reads the app named `-name`. Since the v0.7.45 sync,
+`setup --help` no longer runs setup and `setup-window-targeting --help` no
+longer installs the extension.
+
+Since the v0.7.46 sync, the `codex-computer-use-cosmic` and
+`codex-computer-use-indicator` helpers check their command line the same way.
+The backend starts both. The COSMIC helper takes its five commands, and
+`activate-window` takes `--window-id ID`. The indicator takes no arguments.
+Both print help on `-h` or `--help`, and anything else exits 2 before the
+helper connects to the compositor.
+
+`setup-window-targeting` and the `setup_window_targeting` tool install the
+Codex GNOME Shell extension and set `requires_shell_reload` when GNOME Shell
+must load it again, which takes a log out and back in. While the extension
+is enabled, or its state cannot be read, a changed `extension.js` needs one,
+and so does a changed `metadata.json` field GNOME Shell acts on, such as
+`shell-version`. Since the v0.7.46 sync, a change only
+to the display fields `name`, `description`, `url`, `version-name` or
+`donations` does not.
+
+Since the v0.7.47 sync, setup writes the user copy of the extension to
+`$XDG_DATA_HOME/gnome-shell/extensions`, where GNOME Shell loads user
+extensions, and to `~/.local/share/gnome-shell/extensions` only when
+`XDG_DATA_HOME` is unset or empty. When GNOME Shell already loaded a user
+copy, setup updates the copy the Shell reports, since the Shell can run with
+another `XDG_DATA_HOME` than the app. The backend inherits the launcher's
+environment through the host bridge, including `XDG_DATA_HOME`. A bridge that
+an earlier launch started keeps that launch's environment.
+
 The direct MCP server also exposes `run_shell` only when explicitly started
 with `CODEX_COMPUTER_USE_ENABLE_SHELL=1`. The standalone
 `COMPUTER_USE_LINUX_ENABLE_SHELL=1` alias is used only when the Codex variable
@@ -372,6 +467,22 @@ the requested command. Ambient credentials and agent sockets are removed from
 the environment; additional variables must be supplied explicitly. Execution
 defaults to 30 seconds (maximum 120), and returned output is bounded. An audit
 digest is written to backend stderr without logging command text.
+
+Since the v0.7.51 sync, `codex-computer-use-linux mcp --listen ADDR:PORT`
+serves the direct MCP server over streamable HTTP at `/mcp`. The app and its
+host bridge do not use it; they start the backend over stdio. The listener
+needs a bearer token from the file named by
+`CODEX_COMPUTER_USE_MCP_TOKEN_FILE` or from `CODEX_COMPUTER_USE_MCP_TOKEN`.
+The standalone `COMPUTER_USE_LINUX_MCP_TOKEN_FILE` and
+`COMPUTER_USE_LINUX_MCP_TOKEN` names are aliases, used when the Codex name is
+unset. Set one source only. The server removes all four variables after it
+reads the token, so its children do not inherit it. It is plain HTTP: bind
+loopback or a private address, and name every hostname clients use with
+`--allowed-host NAME` for a non-loopback bind. A request with an `Origin`
+header is refused. The listener refuses to start while `run_shell` is
+enabled, since every HTTP client would get it. Over HTTP, an element call by
+`element_index` or selector, and `get_tree_page`, must pass `snapshot_id`,
+because several clients can replace the cached tree. Without `--listen` the server opens no socket.
 
 ## Enable The In-App UI
 
@@ -431,6 +542,60 @@ The v0.7.28 through v0.7.31 sync reports an unavailable window backend accuratel
 reuses desktop diagnostics for up to 30 seconds while refreshing accessibility
 on every observation, and wakes immediately when short commands exit. Failed
 actions and observations invalidate cached readiness; `doctor` always probes.
+
+The v0.7.40 sync takes standalone's versions of the input-safety and focus
+fixes this copy carried first. The uinput button release, the portal release
+guards and the KDE paste restore behave as before. Focus verification before
+targeted input gives each focused-window query up to 5 s and runs one more
+query after the 1 s transition allowance, so a slow backend such as Hyprland is
+not cut off, while queries that keep reporting another window fail after about
+1 s instead of 11 s. A failed uinput move before a scroll drops the device, so
+the next action builds a fresh one.
+
+Since the v0.7.48 sync, a coordinate scroll on Wayland sends the wheel from
+the uinput absolute pointer, the device that moved the pointer. Before, the
+wheel went through ydotool's own device 35 ms after the move, and GNOME could
+route it to a stale pointer position, so XWayland windows did not scroll. The
+route no longer needs a ydotool daemon; an untargeted scroll still sends its
+wheel through ydotool, or the portal without the daemon. `left` and `right`
+now send a negative and a positive `REL_HWHEEL`, the kernel's signs, on the
+uinput and ydotool routes; both had them swapped.
+
+Since the v0.7.41 sync, the uinput absolute pointer follows the latest
+screenshot. When a later capture reports a different desktop size, the next
+click, coordinate scroll or drag replaces the device with one sized to that
+capture; a device sized for an earlier desktop would scale every point. The
+replacement uses the cached capture size and takes no new screenshot. If it
+fails, the action is not sent and is not replayed through another backend. A
+matching device clamps an off-screen coordinate to the desktop edge, and the
+click or scroll result says where it landed. uinput clicks and scrolls carry
+that clamp note instead of the off-screen warning the portal, ydotool and X11
+xdotool routes add. A KWin element click keeps the uinput clamp note and
+appends the KWin coordinate mapping. An untargeted scroll whose portal could not start falls back to ydotool; if
+that fails too, the result reports the ydotool error followed by the portal
+error, which may be a denied consent.
+
+Since the v0.7.43 sync, a click, scroll or drag point between monitors gets a
+warning too. The server reads the monitor layout once per screenshot: from the
+portal session when one is cached, then KWin, then the compositor (the Codex
+GNOME Shell extension, Hyprland, kscreen, Sway, COSMIC, niri or wlr output
+management). It runs xrandr only on X11, since an X client could start
+Xwayland. Each new screenshot resets the layout, and the check takes no
+screenshot. Without a layout that fits the screenshot, only its outer
+rectangle is checked. The warning says what the route did with the point. The
+portal sends nothing. On X11 the X server keeps the pointer on the screen, so
+a point off the screenshot lands at an edge. On X11 and the uinput pointer, a
+point between monitors lands at a monitor edge or on no visible pixel. A
+failed X11 dispatch gets no warning. A KWin element click gets no off-screen
+or gap warning on either route, since KWin mapped its point onto an output;
+the portal route no longer adds the off-screen warning it had at v0.7.41. A
+drag gets one warning per endpoint,
+naming the start or end coordinate, and a uinput drag carries the clamp note
+for each clamped endpoint. A portal drag with an endpoint off the shared
+monitors still sends nothing, and its error names each endpoint that stopped
+it. When a stale uinput device cannot be replaced, the result says the device
+was removed and where a retry goes: a new device from a fresh screenshot,
+then the portal, ydotool, or a refusal on Wayland.
 
 On COSMIC Wayland, pointer input uses per-monitor portal streams instead of
 uinput absolute coordinates. EIS input waits for its devices to resume. Portal

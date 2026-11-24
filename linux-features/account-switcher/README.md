@@ -12,8 +12,8 @@ this preference.
 
 With the toggle **On**, **Switch account** opens upstream's native account menu.
 It encrypts remembered ChatGPT credentials using Linux Secret Service and
-`secret-tool`, restarts the local app-server connection, and reloads the
-windows without relaunching the desktop app. Accounts use the current
+`secret-tool`, restarts the local app-server connection, and lets the desktop app recreate
+its windows without relaunching. Accounts use the current
 profile's chats, settings, and plugins. Upstream checks for active tasks and
 pending requests before switching. The package includes the `libsecret-tools`
 dependency on Debian/Ubuntu. The desktop keyring must be available.

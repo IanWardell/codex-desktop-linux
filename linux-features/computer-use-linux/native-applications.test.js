@@ -105,12 +105,21 @@ test("native metadata rejects duplicate owners and partial or damaged contracts"
   const patched = patch(fixture);
   for (const changed of [
     fixture + fixture, patched + fixture, patched + patched,
-    fixture.replace("nativeApplications=(function(){", "nativeApplications=(function(){return other();"),
-    fixture.replace("nativeApplications:this.fetchHandler.nativeApplications", "nativeApplications:this.other.nativeApplications"),
+    fixture.replace("G=function(){", "G=function(){return other();"),
+    fixture.replace("nativeApplications:this.desktopServices.nativeApplications", "nativeApplications:this.other.nativeApplications"),
     fixture.replace("iconSmall:null,iconMedium:", "iconSmall:undefined,iconMedium:"),
     patched.replace("list:async(e={})", "list:async(e=changed)"),
     patched.replace('if("linux"===process.platform)return codexLinuxNativeApplications();', ""),
   ]) assert.throws(() => patch(changed), /native Applications contract drift/);
+});
+
+test("native metadata accepts a symbol-like minified published binding", () => {
+  const symbolic = fixture.replaceAll("G=function(){", "$=function(){")
+    .replace("nativeApplications:G,workspaceRoots:", "nativeApplications:$,workspaceRoots:");
+  assert.notEqual(symbolic, fixture);
+  const patched = patch(symbolic);
+  assert.notEqual(patched, symbolic);
+  assert.equal(patch(patched), patched);
 });
 
 test("chunks without the metadata owner are left unchanged with a diagnostic", (t) => {

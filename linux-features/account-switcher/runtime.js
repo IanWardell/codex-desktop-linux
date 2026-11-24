@@ -2,7 +2,7 @@
 
 // Self-contained: the patch embeds this function in the official main bundle.
 // Nothing here runs until a user opens the account switcher.
-function createAccountSwitcher({ electron, clients, home, reload, runSecretTool }) {
+function createAccountSwitcher({ electron, clients, home, runSecretTool }) {
   const fs = require("node:fs");
   const path = require("node:path");
   const crypto = require("node:crypto");
@@ -12,6 +12,8 @@ function createAccountSwitcher({ electron, clients, home, reload, runSecretTool 
   const root = path.join(home, ".community-account-switcher");
   const vaultPath = path.join(root, "accounts.json");
   const authPath = path.join(home, "auth.json");
+  const PRINCIPAL_SETTLE_ATTEMPTS = 20;
+  const PRINCIPAL_SETTLE_INTERVAL_MS = 250;
   class SwitcherError extends Error {}
   let menuOpen = false;
   let busy = false;
@@ -212,7 +214,8 @@ function createAccountSwitcher({ electron, clients, home, reload, runSecretTool 
   async function assertIdle() {
     stage = "checking backend connections";
     for (const client of clients()) {
-      if (client.getPendingRequestCount() !== 0) throw new SwitcherError("Wait for pending requests and active tasks to finish before switching accounts.");
+      if (client.hostConfig.id === "durable" && client.getConnectionState() === "disconnected") continue;
+      if (await client.getPendingRequestCount() !== 0) throw new SwitcherError("Wait for pending requests and active tasks to finish before switching accounts.");
       // Durable tasks run independently of this desktop connection. An
       // account-wide catalog includes work in other apps/profiles, which a
       // local credential change neither restarts nor cancels. Only in-flight
@@ -236,26 +239,32 @@ function createAccountSwitcher({ electron, clients, home, reload, runSecretTool 
     }
   }
 
-  async function readCurrent(client) {
+  async function readCurrent(client, attempts = 1) {
     stage = "verifying the current login";
     const text = readPrivate(authPath);
     const info = identity(text);
-    const principal = await client.getAuthenticatedPrincipal();
-    if (!info.userId || principal?.accountId !== info.accountId || principal.userId !== info.userId) {
+    if (!info.userId || !await principalMatches(client, info, attempts)) {
       throw new SwitcherError("The file login does not match the active account. Sign in again before remembering it.");
     }
     return text;
+  }
+
+  async function principalMatches(client, info, attempts) {
+    for (let attempt = 1; ; attempt++) {
+      const principal = await client.getAuthenticatedPrincipal();
+      if (principal?.accountId === info.accountId && principal.userId === info.userId) return true;
+      if (attempt >= attempts) return false;
+      await new Promise(resolve => setTimeout(resolve, PRINCIPAL_SETTLE_INTERVAL_MS));
+    }
   }
 
   async function restore(client, text) {
     stage = "reconnecting the account";
     const info = identity(text);
     writePrivate(authPath, text);
-    client.clearAuthTokenCache();
     await client.restart({ intent: "reconnect" });
     await rpc(client, "account/read", { refreshToken: false });
-    const principal = await client.getAuthenticatedPrincipal();
-    if (principal?.accountId !== info.accountId || principal.userId !== info.userId) {
+    if (!await principalMatches(client, info, PRINCIPAL_SETTLE_ATTEMPTS)) {
       throw new SwitcherError("The selected account could not be activated.");
     }
   }
@@ -271,7 +280,6 @@ function createAccountSwitcher({ electron, clients, home, reload, runSecretTool 
       catch { throw new SwitcherError("Switch failed and the previous account needs recovery. Your saved accounts are retained."); }
       throw new SwitcherError("Could not switch accounts. The previous account was restored; try signing in again.");
     }
-    reload();
   }
 
   async function add(client, accounts) {
@@ -287,7 +295,7 @@ function createAccountSwitcher({ electron, clients, home, reload, runSecretTool 
       if (message.method !== "account/login/completed") return;
       if (loginId == null) { early = message.params; return; }
       if (message.params?.loginId === loginId) resolveLogin(message.params);
-    });
+    }, { methods: ["account/login/completed"] });
     const controller = new AbortController();
     try {
       const login = await rpc(client, "account/login/start", { type: "chatgpt", appBrand: "chatgpt", useHostedLoginSuccessPage: true });
@@ -303,10 +311,8 @@ function createAccountSwitcher({ electron, clients, home, reload, runSecretTool 
         dialog.showMessageBox({ type: "info", title: "ChatGPT Community", message: "Sign in to another ChatGPT account in your browser.", detail: "Your current login is remembered. Cancel returns to it.", buttons: ["Cancel"], cancelId: 0, signal: controller.signal }).then(() => null),
       ]);
       if (!result?.success) return;
-      client.clearAuthTokenCache();
-      remember(accounts, await readCurrent(client));
+      remember(accounts, await readCurrent(client, PRINCIPAL_SETTLE_ATTEMPTS));
       completed = true;
-      reload();
     } catch (error) {
       // Preserve the failing phase before rollback performs other operations.
       if (error instanceof SwitcherError) throw error;

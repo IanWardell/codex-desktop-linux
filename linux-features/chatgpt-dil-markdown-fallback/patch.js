@@ -70,55 +70,62 @@ function replyContract(source) {
   const fallbacks = [...source.matchAll(new RegExp(
     `errorFallback:(${IDENT})\\?null:\\(0,(${IDENT})\\.jsx\\)\\((${IDENT}(?:\\.${IDENT})?),\\{([^{}]{0,200})\\}\\),diagnostics:`, "g",
   ))];
-  const owners = [...source.matchAll(new RegExp(
-    `function ${IDENT}\\(\\{assistantMessageId:${IDENT},reference:(${IDENT}),source:${IDENT},`, "g",
-  ))];
-  if (fallbacks.length !== 1 || owners.length !== 1) return null;
+  if (fallbacks.length !== 1) return null;
   const [fallback] = fallbacks;
-  const [owner] = owners;
-  const module = moduleAt(modules, owner.index);
+  const module = moduleAt(modules, fallback.index);
   const requireName = module?.params[2];
-  if (requireName == null || moduleAt(modules, fallback.index) !== module) return null;
-  // The failure branch must belong to the reply renderer itself.
-  const ownerBodyStart = source.indexOf("{", owner.index + owner[0].length);
-  const ownerEnd = findMatchingBrace(source, ownerBodyStart);
-  if (ownerEnd < 0 || fallback.index < ownerBodyStart || fallback.index > ownerEnd) return null;
-  const ownerSource = source.slice(owner.index, ownerEnd);
-  if (!RESPONSE_NEEDLES.every((needle) => ownerSource.includes(needle))) return null;
-  const [, preparing, jsx, failure, failureProps] = fallback;
-  return { module, requireName, fallback, preparing, jsx, failure, failureProps, reference: owner[1] };
-}
-
-// The current reply chunk also requires the native Markdown module from a
-// sibling renderer (`N=require("id")` … `N.ChatGptMarkdown`), which proves that
-// the module is loaded with this chunk.
-function chunkRequiresMarkdownModule(source, markdownModule) {
-  const modules = chunkModules(source) ?? [];
-  return modules.some((module) => {
-    const requireName = module.params[2];
-    if (requireName == null) return false;
-    const body = source.slice(module.start, module.end);
-    const binding = body.match(new RegExp(
-      `(?<![\\w$.])(${IDENT})=${escapeRegExp(requireName)}\\("${escapeRegExp(markdownModule)}"\\)`,
+  if (requireName == null) return null;
+  // React Compiler now receives one props object and destructures the reply
+  // contract inside the component. Select the unique enclosing function by
+  // that semantic destructure, never by its minified name.
+  const owners = [];
+  const declarations = source.slice(module.bodyStart, fallback.index).matchAll(new RegExp(
+    `function ${IDENT}\\((?<props>${IDENT})\\)\\{`, "g",
+  ));
+  for (const declaration of declarations) {
+    const start = module.bodyStart + declaration.index;
+    const bodyStart = start + declaration[0].length - 1;
+    const end = findMatchingBrace(source, bodyStart);
+    if (end < fallback.index || end >= module.end) continue;
+    const ownerSource = source.slice(start, end + 1);
+    const props = escapeRegExp(declaration.groups.props);
+    const destructure = ownerSource.match(new RegExp(
+      `\\{experiment:${IDENT},assistantMessageId:${IDENT},reference:(${IDENT}),source:${IDENT},` +
+        `onAutoSafeUrls:${IDENT},dilComponents:${IDENT},loadPublicComponents:${IDENT},surface:${IDENT}\\}=${props}`,
     ));
-    return binding != null && body.includes(`${binding[1]}.ChatGptMarkdown`);
-  });
+    if (destructure != null && RESPONSE_NEEDLES.every((needle) => ownerSource.includes(needle))) {
+      owners.push({ reference: destructure[1] });
+    }
+  }
+  if (owners.length !== 1) return null;
+  const [, preparing, jsx, failure, failureProps] = fallback;
+  return { module, requireName, fallback, preparing, jsx, failure, failureProps, reference: owners[0].reference };
 }
 
-function applyDilMarkdownFallback(source, markdownModule) {
+// The current reply chunk reaches the native Markdown factory through the
+// uniquely discovered async exporter chunk. A synchronous in-chunk require is
+// an obsolete upstream layout and must not satisfy this contract.
+function chunkLoadsMarkdownAsync(source, markdownChunk) {
+  return Number.isSafeInteger(markdownChunk) &&
+    new RegExp(`(?<![\\w$.])${IDENT}\\.e\\(${markdownChunk}\\)`).test(source);
+}
+
+function applyDilMarkdownFallback(source, markdownModule, markdownChunk) {
   if (!MODULE_ID.test(markdownModule)) throw new Error("Invalid native ChatGPT Markdown module id");
   const markerCount = source.split(MARKER).length - 1;
   if (markerCount > 0) {
     const patchedFallbacks = source.split("jsx)(codexLinuxDilMarkdownFallback,{reference:").length - 1;
-    if (markerCount === 1 && patchedFallbacks === 1 && source.includes(`("${markdownModule}").ChatGptMarkdown`)) {
+    if (markerCount === 1 && patchedFallbacks === 1 &&
+        source.includes(`("${markdownModule}").ChatGptMarkdown`) &&
+        chunkLoadsMarkdownAsync(source, markdownChunk)) {
       return source;
     }
     throw new Error("Incomplete ChatGPT DIL Markdown fallback patch");
   }
   const contract = replyContract(source);
   if (contract == null) throw new Error("ChatGPT interactive reply fallback contract changed");
-  if (!chunkRequiresMarkdownModule(source, markdownModule)) {
-    throw new Error("Native ChatGPT Markdown module is not loaded with the interactive reply chunk");
+  if (!chunkLoadsMarkdownAsync(source, markdownChunk)) {
+    throw new Error("Native ChatGPT Markdown async chunk is not loaded with the interactive reply chunk");
   }
   const { module, requireName, fallback, preparing, jsx, failure, failureProps, reference } = contract;
   const replacement = `errorFallback:${preparing}?null:(0,${jsx}.jsx)(codexLinuxDilMarkdownFallback,` +
@@ -150,6 +157,19 @@ function findMarkdownModule(extractedDir) {
   return [...ids];
 }
 
+function findMarkdownChunk(extractedDir, markdownModule) {
+  const assets = path.join(extractedDir, "webview", "assets");
+  const chunks = new Set();
+  for (const assetName of findWebviewAssetsContaining(extractedDir, [MARKDOWN_EXPORT_NEEDLE])) {
+    const source = fs.readFileSync(path.join(assets, assetName), "utf8");
+    const modules = chunkModules(source);
+    if (!modules?.some((module) => module.id === markdownModule)) continue;
+    const header = source.match(/^export const __rspack_esm_ids=\[(\d+)\];/);
+    if (header != null) chunks.add(Number(header[1]));
+  }
+  return [...chunks];
+}
+
 function patchDilMarkdownFallback(extractedDir) {
   const assets = path.join(extractedDir, "webview", "assets");
   const responses = findWebviewAssetsContaining(extractedDir, RESPONSE_NEEDLES).map((file) => ({
@@ -157,11 +177,16 @@ function patchDilMarkdownFallback(extractedDir) {
     source: fs.readFileSync(path.join(assets, file), "utf8"),
   })).filter(({ source }) => source.includes(MARKER) || replyContract(source) != null);
   const markdown = findMarkdownModule(extractedDir);
-  if (responses.length === 0 || markdown.length !== 1) {
-    throw new Error(`Expected interactive reply modules and one native Markdown module; found ${responses.length} and ${markdown.length}`);
+  const markdownChunks = markdown.length === 1 ? findMarkdownChunk(extractedDir, markdown[0]) : [];
+  if (responses.length === 0 || markdown.length !== 1 || markdownChunks.length !== 1) {
+    throw new Error(
+      `Expected interactive reply modules, one native Markdown module, and one Markdown async chunk; ` +
+      `found ${responses.length}, ${markdown.length}, and ${markdownChunks.length}`,
+    );
   }
+  const markdownChunk = markdownChunks[0];
   // Validate every copy of the reply module before writing any of them.
-  const outputs = responses.map(({ file, source }) => ({ file, source, output: applyDilMarkdownFallback(source, markdown[0]) }));
+  const outputs = responses.map(({ file, source }) => ({ file, source, output: applyDilMarkdownFallback(source, markdown[0], markdownChunk) }));
   const changed = outputs.filter(({ source, output }) => output !== source);
   for (const { file, output } of changed) fs.writeFileSync(path.join(assets, file), output, "utf8");
   return { changed: changed.length > 0 };
@@ -171,6 +196,7 @@ module.exports = {
   fallbackSource,
   applyDilMarkdownFallback,
   findMarkdownModule,
+  findMarkdownChunk,
   patchDilMarkdownFallback,
   descriptors: [{
     id: "chatgpt-dil-markdown-fallback",

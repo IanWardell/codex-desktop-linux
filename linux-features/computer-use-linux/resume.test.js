@@ -59,7 +59,8 @@ function trustedServicesConstant(chunks, exportName) {
 // external dependencies. No Electron, app-server, profile, or network is used.
 function resumeHarness(source, trustedServicesKey) {
   const builder = only(source, new RegExp(
-    `function (${IDENT})\\(\\{browserBackends:(${IDENT}),deferTools:${IDENT},surfaces:${IDENT},` +
+    `function (${IDENT})\\(\\{browserBackends:(${IDENT}),deferTools:${IDENT},` +
+    `(?:omitCuaConfirmationPolicyBySku:${IDENT},)?surfaces:${IDENT},` +
     `nodeRepl:${IDENT},accessBootstrapPath:(${IDENT})\\}`,
     "g",
   ));
@@ -68,17 +69,36 @@ function resumeHarness(source, trustedServicesKey) {
   const buildSource = owner(source, builder.index);
   const resumeSource = owner(source, call.index);
   const selection = call[4];
-  const cache = only(resumeSource, new RegExp(`=(${IDENT})\\?await (${IDENT})\\((${IDENT})\\):null,${IDENT}=\\1\\?(${IDENT})\\(\\):`, "g"));
-  const select = only(resumeSource, new RegExp(`\\?\\.selection\\?\\?await (${IDENT})\\(`, "g"));
+  const local = only(resumeSource, new RegExp(
+    `(${IDENT})="local"===(${IDENT})\\.hostConfig\\.kind`,
+    "g",
+  ));
+  const cache = only(resumeSource, new RegExp(
+    `(${IDENT})=${local[1]}\\?await (${IDENT})\\(${local[2]},\\{waitForReconcile:!1\\}\\):null`,
+    "g",
+  ));
+  const features = only(resumeSource, new RegExp(
+    `(${IDENT})=${local[1]}\\?(${IDENT})\\(\\):${IDENT}\\.desktopFeatureAvailability`,
+    "g",
+  ));
+  const posture = only(resumeSource, new RegExp(
+    `(${IDENT})=${features[1]}\\.browserUseTinysky\\?${cache[1]}:null`,
+    "g",
+  ));
+  const select = only(resumeSource, new RegExp(
+    `${posture[1]}\\?\\.selection\\?\\?await (${IDENT})\\(`,
+    "g",
+  ));
   const config = only(resumeSource, new RegExp(
-    `let ${IDENT}=await (${IDENT})\\(\\{\\.\\.\\.(${IDENT}),selection:${selection}\\}\\)`,
+    `let ${IDENT}=await (${IDENT})\\(\\{\\.\\.\\.(${IDENT}),selection:${selection},` +
+    `verifyBrowserService:${local[1]}&&null==${cache[1]}\\}\\)`,
     "g",
   ));
   const principal = only(resumeSource, new RegExp(
-    `(${IDENT})=${cache[1]}\\?await ${cache[3]}\\.getAuthenticatedPrincipal\\(\\)\\.catch\\(\\(\\)=>null\\):null`,
+    `(${IDENT})=${local[1]}\\?await ${local[2]}\\.getAuthenticatedPrincipal\\(\\)\\.catch\\(\\(\\)=>null\\):null`,
     "g",
   ));
-  const identity = only(resumeSource, new RegExp(`=${cache[1]}\\?(${IDENT})\\(${principal[1]}\\)\\?\\?(${IDENT}):null`, "g"));
+  const identity = only(resumeSource, new RegExp(`=${local[1]}\\?(${IDENT})\\(${principal[1]}\\)\\?\\?(${IDENT}):null`, "g"));
   const env = only(resumeSource, new RegExp(
     `Object\\.assign\\(${IDENT}\\.env,\\{\\[(${IDENT})\\.${IDENT}\\]:${IDENT},\\[\\1\\.${IDENT}\\]:(${IDENT})\\(\\)\\.env\\[(${IDENT})\\]\\?\\?"",`, "g"));
   const fallback = only(resumeSource, new RegExp(`:\\{\\.\\.\\.${IDENT},\\.\\.\\.(${IDENT})\\}\\}$`, "g"));
@@ -114,7 +134,7 @@ function resumeHarness(source, trustedServicesKey) {
     [fileUrls[1]]: { pathToFileURL: url.pathToFileURL },
     [platforms[1]]: { linux: "linux" },
     [cache[2]]: async () => cached,
-    [cache[4]]: () => ({ browserUseTinysky: true }),
+    [features[2]]: () => ({ browserUseTinysky: true }),
     [select[1]]: () => { throw Error("Unexpected fallback instead of cached selection"); },
     [config[1]]: async () => ({
       "mcp_servers.node_repl": {
@@ -127,6 +147,7 @@ function resumeHarness(source, trustedServicesKey) {
     [env[3]]: "browserIdentity",
     [fallback[1]]: { "mcp_servers.cua_repl": { enabled: false } },
     [cleanup[1]]: () => {},
+    r8: "NODE_REPL_ENV_DELETE",
     URL,
     require: name => {
       assert.equal(name, "node:path");
@@ -161,7 +182,10 @@ test("official per-thread CUA overrides carry the trusted root when resuming cha
   assert.notEqual(patched, source);
   assert.equal(applyUnifiedComputerUsePatch(patched), patched);
   assert.doesNotThrow(() => new vm.Script(patched));
-  const builderStart = patched.search(new RegExp(`function ${IDENT}\\(\\{browserBackends:${IDENT},deferTools:`));
+  const builderStart = patched.search(new RegExp(
+    `function ${IDENT}\\(\\{browserBackends:${IDENT},deferTools:${IDENT},` +
+    `(?:omitCuaConfirmationPolicyBySku:${IDENT},)?surfaces:`,
+  ));
   const builderServices = only(owner(patched, builderStart),
     new RegExp(`\\[${IDENT}\\.(${IDENT})\\]:JSON\\.stringify\\(${IDENT}\\)`, "g"));
   const trustedServicesKey = trustedServicesConstant(chunks, builderServices[1]);

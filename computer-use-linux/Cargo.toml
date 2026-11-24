@@ -1,7 +1,9 @@
 [package]
 name = "codex-computer-use-linux"
-version = "0.7.38"
+version = "0.7.59"
 edition = "2021"
+# File::try_lock, used by the indicator, is stable since Rust 1.89.
+rust-version = "1.89"
 
 [[bin]]
 name = "codex-computer-use-linux"
@@ -23,7 +25,7 @@ path = "src/bin/computer-use-linux-indicator/main.rs"
 mimalloc = { version = "0.1", default-features = false }
 anyhow = "1.0.102"
 # atspi without its "connection" feature: that feature pulls atspi-connection
-# with default features, which include "p2p" — and p2p peer enumeration during
+# with default features, which include "p2p", and p2p peer enumeration during
 # connect() calls GetInterfaces on every a11y-bus peer, so a single
 # AppArmor-confined peer (e.g. snap-packaged Slack) aborts the whole
 # AccessibilityConnection. We deliberately never use P2P routing (upstream
@@ -39,7 +41,10 @@ getrandom = "0.4.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
 reis = { version = "0.7.1", features = ["tokio"] }
-rmcp = { version = "3.5.1", features = ["transport-io"] }
+rmcp = { version = "3.5.1", features = ["transport-io", "transport-streamable-http-server"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+hyper = { version = "1.12", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "service"] }
 schemars = "1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -52,11 +57,12 @@ tokio = { version = "1.53.3", features = ["io-util", "macros", "net", "process",
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
 wayland-client = "0.31.11"
 wayland-protocols = { version = "0.32.9", features = ["client", "staging"] }
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 # Pure-Rust X11 client (no libxcb). Native X11 sessions only: absolute window
 # origins for the EWMH backend (wmctrl -lG counts the frame offset twice,
 # upstream #157) and the root-window screenshot route (upstream #155).
-x11rb = { version = "0.14", features = ["xkb"] }
+x11rb = { version = "0.14", features = ["xinput", "xkb", "xtest"] }
 xkeysym = "0.2.1"
 zbus = "5.14.0"
 zbus_xml = "5.1.1"

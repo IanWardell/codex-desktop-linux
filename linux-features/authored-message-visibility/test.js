@@ -12,7 +12,7 @@ const { createPatchReport, captureWarnings, enabledFeatureFailuresFromReport } =
 
 // Current signed rspack/SWC partition with the inlined classifier, anchored by
 // semantics rather than the chunk filename or minified aliases.
-const fixture = 'function xO(e,{hasFollowingFinalAnswer:t=!1,isTurnInProgress:turn=!1,keepMcpAppEntriesPersistent:s=!1,mcpServerStatuses:a,renderMcpApps:i=!1}={}){let r=[],o=[],l=[],c=[],d=null;for(let m of e){l.push(m),function({unit:e,hasFollowingFinalAnswer:t,keepMcpAppEntriesPersistent:n,mcpServerStatuses:s,renderMcpApps:a}){if("standalone"!==e.kind)return!1;let i=e.item.item;return"user-input-response"===i.type?!i.completed:!!("mcp-tool-call"===i.type&&(0,g.o)(i)||"assistant-message"===i.type&&(0,p.Yr)(i)||"dynamic-tool-call"===i.type&&(0,h.Q1)(i)||n&&a&&"mcp-tool-call"===i.type&&function({item:e,mcpServerStatuses:t}){return e.interactive}({item:i,mcpServerStatuses:s}))||"user-message"===i.type&&("pending"===i.steeringStatus||!0===i.followsInterruptedFinalAnswer||!0===i.wasInHistoryPreview||"not-sent"===i.deliveryStatus||!0===i.hookFeedback||!t)}({unit:m,hasFollowingFinalAnswer:t,keepMcpAppEntriesPersistent:s,mcpServerStatuses:a,renderMcpApps:i})?r.push(m):o.push(m)}return{collapsibleUnits:o,expandedUnits:l,persistentUnits:r,preToggleUnits:c,workedForItem:d}}';
+const fixture = 'function xO(e,{hasFollowingFinalAnswer:t=!1,isTurnInProgress:turn=!1,keepMcpAppEntriesPersistent:s=!1,mcpServerStatuses:a,renderMcpApps:render=!0}={}){let r=[],o=[],l=[],c=[],d=null;for(let m of e){l.push(m),function({unit:e,hasFollowingFinalAnswer:t,keepMcpAppEntriesPersistent:n,mcpServerStatuses:s,renderMcpApps:r}){if("standalone"!==e.kind)return!1;let i=e.item.item;return"user-input-response"===i.type?!i.completed:!!("mcp-tool-call"===i.type&&(0,g.o)(i))||("assistant-message"===i.type?(0,p.Yr)(i):!!("dynamic-tool-call"===i.type&&(0,h.Q1)(i)||n&&r&&"mcp-tool-call"===i.type&&function({item:e,mcpServerStatuses:t}){return e.interactive}({item:i,mcpServerStatuses:s}))||"user-message"===i.type&&("pending"===i.steeringStatus||!0===i.followsInterruptedFinalAnswer||"accepted"===i.steeringStatus&&null==i.questionReplies&&null==i.codexDelegation&&!i.isToolOutput&&!i.isHistoricalSteering||!0===i.wasInHistoryPreview||"not-sent"===i.deliveryStatus||!0===i.hookFeedback||!t))}({unit:m,hasFollowingFinalAnswer:t,keepMcpAppEntriesPersistent:s,mcpServerStatuses:a,renderMcpApps:render})?r.push(m):o.push(m)}return{collapsibleUnits:o,expandedUnits:l,persistentUnits:r,preToggleUnits:c,workedForItem:d}}';
 function partition(source, units, options) {
   return vm.runInNewContext(source + ";xO", { g: { o: item => item.persist }, p: { Yr: item => item.final }, h: { Q1: item => item.interactive } })(units, options);
 }
@@ -21,7 +21,7 @@ const ids = units => Array.from(units, unit => unit.item.item.id);
 
 test("commentary stays visible in order while tools collapse; expansion contains each item once", () => {
   const units = [unit("assistant-message","c1"),unit("exec","tool"),unit("user-message","steering",{steeringStatus:"accepted"}),unit("assistant-message","c2"),unit("user-message","ordinary"),unit("user-message","interrupted",{followsInterruptedFinalAnswer:true}),unit("user-message","hook",{hookFeedback:true})];
-  assert.deepEqual(ids(partition(fixture,units,{hasFollowingFinalAnswer:true}).persistentUnits), ["interrupted","hook"]);
+  assert.deepEqual(ids(partition(fixture,units,{hasFollowingFinalAnswer:true}).persistentUnits), ["steering","interrupted","hook"]);
   const patched = apply(fixture);
   assert.notEqual(patched, fixture);
   for (let toggle = 0; toggle < 3; toggle++) {
@@ -35,7 +35,7 @@ test("commentary stays visible in order while tools collapse; expansion contains
 
 test("tool exceptions, grouped activity and worked-for handling remain upstream-owned", () => {
   const tools = [unit("exec","exec"),unit("dynamic-tool-call","dynamic",{interactive:true}),unit("mcp-tool-call","mcp",{interactive:true}),unit("worked-for","duration")];
-  const options = {hasFollowingFinalAnswer:true,keepMcpAppEntriesPersistent:true,renderMcpApps:true};
+  const options = {hasFollowingFinalAnswer:true,keepMcpAppEntriesPersistent:true};
   assert.equal(JSON.stringify(partition(apply(fixture),tools,options)),JSON.stringify(partition(fixture,tools,options)));
   const group = {kind:"group",items:[]};
   assert.equal(partition(apply(fixture),[group]).collapsibleUnits[0],group);

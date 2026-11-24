@@ -164,7 +164,7 @@ function codexLinuxModelPickerDefaultPresets(catalog, configured) {
 
 function functionSections(source) {
   const sections = [];
-  const pattern = /function [A-Za-z_$][\w$]*\([^)]*\)\{/g;
+  const pattern = /function(?: [A-Za-z_$][\w$]*)?\([^)]*\)\{/g;
   for (const match of source.matchAll(pattern)) {
     const open = match.index + match[0].length - 1;
     const close = findMatchingBrace(source, open);
@@ -186,7 +186,7 @@ function enclosingModuleFactory(source, index) {
   const registry = "__webpack_modules__={";
   const registryStart = source.indexOf(registry);
   if (registryStart < 0 || source.indexOf(registry, registryStart + 1) >= 0) return null;
-  const entry = /(?:"[^"\\]*"|[\w$]+)\([^()]*\)\{/y;
+  const entry = /(?:"[^"\\]*"|[\w$]+)(?:(?:\([^()]*\))|(?::(\()?function\([^()]*\)))\{/y;
   let cursor = registryStart + registry.length;
   while (cursor < source.length && source[cursor] !== "}") {
     entry.lastIndex = cursor;
@@ -196,9 +196,15 @@ function enclosingModuleFactory(source, index) {
     const close = findMatchingBrace(source, open);
     if (close < 0) return null;
     if (index > open && index < close) {
-      return { end: close + 1, source: source.slice(cursor, close + 1), start: cursor };
+      return {
+        bodyStart: open + 1,
+        end: close + 1,
+        source: source.slice(cursor, close + 1),
+        start: cursor,
+      };
     }
     cursor = close + 1;
+    if (match[1] != null && source[cursor] === ")") cursor += 1;
     if (source[cursor] === ",") cursor += 1;
   }
   return null;
@@ -355,8 +361,12 @@ function catalogPatchContract(source) {
   const resolver = found != null && normalizer != null && sectionsOverlap(normalizer, found)
     ? null
     : found;
+  const modernNormalizer = normalizer != null &&
+    normalizer.source.includes("serviceTiersByModelSlug") &&
+    normalizer.source.includes("modelConfigBySlug");
   if (markerCount === 0 && presetOptionsCount === 0) {
-    return normalizer == null || resolver == null ? "drifted" : "current";
+    if (normalizer == null) return "drifted";
+    return resolver != null ? "current" : modernNormalizer ? "current-modern" : "drifted";
   }
   if (
     markerCount === 2 &&
@@ -367,6 +377,15 @@ function catalogPatchContract(source) {
     resolver.source.includes(`?.${CATALOG_PRESET_OPTIONS_KEY}??[]`)
   ) {
     return "applied";
+  }
+  if (
+    markerCount === 2 &&
+    presetOptionsCount === 1 &&
+    modernNormalizer &&
+    resolver == null &&
+    normalizer.source.includes(`${CATALOG_PATCH_MARKER}({`)
+  ) {
+    return "applied-modern";
   }
   return "mixed";
 }
@@ -383,10 +402,10 @@ function applyCatalogPatch(source, context = {}) {
   }
 
   const contract = catalogPatchContract(source);
-  if (contract === "applied") {
+  if (contract === "applied" || contract === "applied-modern") {
     return source;
   }
-  if (contract !== "current") {
+  if (contract !== "current" && contract !== "current-modern") {
     warn(
       "Could not find one coherent ChatGPT model catalog normalizer contract",
       "model picker Default catalog patch",
@@ -406,16 +425,13 @@ function applyCatalogPatch(source, context = {}) {
     return source;
   }
 
-  const resolverSignature = /^function [A-Za-z_$][\w$]*\(([A-Za-z_$][\w$]*)[,)]/u.exec(
-    resolver.source,
-  );
-  const resolverOptionsStart = resolverSignature == null
-    ? -1
-    : catalogOptionArrayStart(resolver.source, resolverSignature[1]);
-  const resolverOptionsEnd = resolverOptionsStart < 0
-    ? -1
-    : matchingSquareBracket(resolver.source, resolverOptionsStart);
-  if (resolverOptionsStart < 0 || resolverOptionsEnd < 0) {
+  const resolverSignature = resolver == null ? null :
+    /^function(?: [A-Za-z_$][\w$]*)?\(([A-Za-z_$][\w$]*)[,)]/u.exec(resolver.source);
+  const resolverOptionsStart = resolverSignature == null ? -1 :
+    catalogOptionArrayStart(resolver.source, resolverSignature[1]);
+  const resolverOptionsEnd = resolverOptionsStart < 0 ? -1 :
+    matchingSquareBracket(resolver.source, resolverOptionsStart);
+  if (contract === "current" && (resolverOptionsStart < 0 || resolverOptionsEnd < 0)) {
     warn(
       "Could not locate the ChatGPT model selection option array",
       "model picker Default catalog patch",
@@ -429,14 +445,14 @@ function applyCatalogPatch(source, context = {}) {
     normalizer.source.slice(returnIndex, closingIndex) +
     ",codexLinuxDefaultPresetsConfigured)" +
     normalizer.source.slice(closingIndex);
-  const catalogParameter = resolverSignature[1];
-  const patchedResolver =
+  const catalogParameter = resolverSignature?.[1];
+  const patchedResolver = resolver == null ? null :
     resolver.source.slice(0, resolverOptionsEnd) +
     `,...${catalogParameter}?.${CATALOG_PRESET_OPTIONS_KEY}??[]` +
     resolver.source.slice(resolverOptionsEnd);
   if (
     !keepsSectionParseable(normalizer.source, patchedNormalizer) ||
-    !keepsSectionParseable(resolver.source, patchedResolver)
+    (resolver != null && !keepsSectionParseable(resolver.source, patchedResolver))
   ) {
     warn(
       "Patched ChatGPT model catalog section no longer parses",
@@ -447,7 +463,7 @@ function applyCatalogPatch(source, context = {}) {
 
   const replacements = [
     { ...normalizer, source: patchedNormalizer },
-    { ...resolver, source: patchedResolver },
+    ...(resolver == null ? [] : [{ ...resolver, source: patchedResolver }]),
   ].sort((left, right) => right.start - left.start);
   let patchedSource = source;
   for (const replacement of replacements) {
@@ -456,13 +472,23 @@ function applyCatalogPatch(source, context = {}) {
       replacement.source +
       patchedSource.slice(replacement.end);
   }
-  const helperIndex = Math.min(normalizer.start, resolver.start);
+  const normalizerFactory = resolver == null ? enclosingModuleFactory(source, normalizer.start) : null;
+  if (resolver == null && normalizerFactory == null) {
+    warn(
+      "Could not resolve the ChatGPT model catalog rspack module",
+      "model picker Default catalog patch",
+    );
+    return source;
+  }
+  const helperIndex = resolver == null
+    ? normalizerFactory.bodyStart
+    : Math.min(normalizer.start, resolver.start);
   patchedSource =
     patchedSource.slice(0, helperIndex) +
     catalogRuntimeHelper(presets) +
     patchedSource.slice(helperIndex);
   // Re-read the result so a mis-scanned section cannot ship a mixed bundle.
-  if (catalogPatchContract(patchedSource) !== "applied") {
+  if (!["applied", "applied-modern"].includes(catalogPatchContract(patchedSource))) {
     warn(
       "Patched ChatGPT model catalog contract is incomplete",
       "model picker Default catalog patch",
@@ -496,7 +522,7 @@ function defaultOptionBuilderSection(source) {
 
 function upstreamDefaultSelectionContract(source) {
   const section = defaultOptionBuilderSection(source);
-  const catalogParameter = new RegExp(`^function ${IDENT}\\((${IDENT}),\\{`, "u")
+  const catalogParameter = new RegExp(`^function(?: ${IDENT})?\\((${IDENT}),\\{`, "u")
     .exec(section?.source ?? "")?.[1];
   if (catalogParameter == null) return "drifted";
   const catalog = escapeRegExp(catalogParameter);
@@ -816,18 +842,7 @@ function localComposerSection(source) {
     "setDefaultModelAndReasoningEffort:",
     "composer.mode.local.model.custom",
   ]);
-  if (prefix == null) return null;
-  const terminalMarker = source.indexOf("onSelectDefault:", prefix.start);
-  if (terminalMarker < 0) return null;
-  const nextFunction = /function [A-Za-z_$][\w$]*\(/g;
-  nextFunction.lastIndex = terminalMarker;
-  const next = nextFunction.exec(source);
-  if (next == null) return null;
-  return {
-    end: next.index,
-    source: source.slice(prefix.start, next.index),
-    start: prefix.start,
-  };
+  return prefix != null && prefix.source.includes("onSelectDefault:") ? prefix : null;
 }
 
 function localComposerResolverContract(source) {
@@ -934,16 +949,28 @@ function localComposerRuntime(config) {
 
 const LOCAL_COMPOSER_FALLBACK_PATTERN =
   /([A-Za-z_$][\w$]*)=(\(0,[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*\))\(([A-Za-z_$][\w$]*),null==([A-Za-z_$][\w$]*)\?void 0:`\$\{\4\.model\}:\$\{\4\.defaultReasoningEffort\}`\)/gu;
+const LOCAL_COMPOSER_RETURN_FALLBACK_PATTERN =
+  /return(\(0,[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*\))\(([A-Za-z_$][\w$]*),null==([A-Za-z_$][\w$]*)\?void 0:`\$\{\3\.model\}:\$\{\3\.defaultReasoningEffort\}`\)/gu;
+function localComposerFallbackCount(source) {
+  return (source.match(LOCAL_COMPOSER_FALLBACK_PATTERN) ?? []).length +
+    (source.match(LOCAL_COMPOSER_RETURN_FALLBACK_PATTERN) ?? []).length;
+}
 // The composer picks the slider config from one of two ChatGPT-gated sources.
 const LOCAL_COMPOSER_CONFIG_PATTERN =
   /sliderModelsConfig:([A-Za-z_$][\w$]*\?[A-Za-z_$][\w$]*:[A-Za-z_$][\w$]*)(?=[,}])/gu;
 const LOCAL_COMPOSER_SELECTION_PATTERN = new RegExp(
-  `async function (?<handler>[A-Za-z_$][\\w$]*)\\((?<model>[A-Za-z_$][\\w$]*),(?<effort>[A-Za-z_$][\\w$]*)\\)\\{` +
-    `let (?<normalized>[A-Za-z_$][\\w$]*)=(?<normalizer>[A-Za-z_$][\\w$]*)\\(\\k<model>\\);` +
+  `async function(?: (?<handler>[A-Za-z_$][\\w$]*))?\\((?<model>[A-Za-z_$][\\w$]*),(?<effort>[A-Za-z_$][\\w$]*)\\)\\{` +
+    `[\\s\\S]{0,240}?let (?<normalized>[A-Za-z_$][\\w$]*)=(?<normalizer>[A-Za-z_$][\\w$]*)\\(\\k<model>\\);` +
     `await ?\\(null==(?<delegate>[A-Za-z_$][\\w$]*)\\?(?<base>[A-Za-z_$][\\w$]*)\\(\\k<normalized>,\\k<effort>\\):` +
     `\\k<delegate>\\.setModelAndReasoningEffort\\(\\k<normalized>,\\k<effort>\\)\\)\\}`,
   "gu",
 );
+
+function localComposerSelectionCount(source) {
+  const handlers = source.match(LOCAL_COMPOSER_SELECTION_PATTERN) ?? [];
+  if (handlers.length > 0) return handlers.length;
+  return (source.match(/onSelectDefault:[A-Za-z_$][\w$]*/gu) ?? []).length;
+}
 
 function localComposerResetContext(section) {
   const matches = [
@@ -962,11 +989,11 @@ function localComposerConfigContract(source) {
   if (markerCount === 0) {
     if (section == null) return "drifted";
     const configMatches = section.source.match(LOCAL_COMPOSER_CONFIG_PATTERN) ?? [];
-    const fallbackMatches = section.source.match(LOCAL_COMPOSER_FALLBACK_PATTERN) ?? [];
-    const selectionMatches = section.source.match(LOCAL_COMPOSER_SELECTION_PATTERN) ?? [];
+    const fallbackMatches = localComposerFallbackCount(section.source);
+    const selectionMatches = localComposerSelectionCount(section.source);
     return configMatches.length === 1 &&
-      fallbackMatches.length === 2 &&
-      selectionMatches.length === 1 &&
+      fallbackMatches === 2 &&
+      selectionMatches === 1 &&
       localComposerResetContext(section) != null
       ? "current"
       : "drifted";
@@ -974,10 +1001,11 @@ function localComposerConfigContract(source) {
   if (
     markerCount === 1 &&
     section != null &&
+    section.source.includes(`/*${LOCAL_COMPOSER_CONFIG_MARKER}*/`) &&
     section.source.includes(":codexLinuxLocalDefaultPresetConfig") &&
-    (section.source.match(/codexLinuxLocalDefaultPresetFallback\(/g) ?? []).length === 2 &&
-    (section.source.match(/codexLinuxLocalDefaultPresetSelection\(/g) ?? []).length === 0 &&
-    (section.source.match(LOCAL_COMPOSER_SELECTION_PATTERN) ?? []).length === 1
+    (section.source.match(/codexLinuxLocalDefaultPresetFallback\(/g) ?? []).length >= 2 &&
+    (section.source.match(/codexLinuxLocalDefaultPresetSelection\(/g) ?? []).length >= 1 &&
+    localComposerSelectionCount(section.source) === 1
   ) {
     return "applied";
   }
@@ -1071,7 +1099,7 @@ function applyExistingChatOptimisticPatch(source, context = {}) {
   }
 
   const { groups } = optimisticTarget;
-  const patchedModelState = modelState.source.replace(
+  let patchedModelState = modelState.source.replace(
     optimisticTarget[0],
     optimisticTarget[0]
       .replace(
@@ -1083,9 +1111,9 @@ function applyExistingChatOptimisticPatch(source, context = {}) {
         `${groups.selection}.codexLinuxKeepOptimisticSelection!==!0&&${groups.cleanup}/*${EXISTING_CHAT_OPTIMISTIC_MARKER}*/`,
       ),
   );
+  patchedModelState = patchedModelState.replace("{", `{${existingChatPresetRuntime(presets)}`);
   const patchedSource =
     source.slice(0, modelState.start) +
-    existingChatPresetRuntime(presets) +
     patchedModelState +
     source.slice(modelState.end);
   if (existingChatOptimisticContract(patchedSource) !== "applied") {
@@ -1113,13 +1141,13 @@ function applyLocalComposerConfigPatch(source, context = {}) {
   const section = localComposerSection(source);
   const configMatches = [...section.source.matchAll(LOCAL_COMPOSER_CONFIG_PATTERN)];
   const configMatch = configMatches.length === 1 ? configMatches[0] : null;
-  const fallbackMatches = [...section.source.matchAll(LOCAL_COMPOSER_FALLBACK_PATTERN)];
-  const selectionMatches = [...section.source.matchAll(LOCAL_COMPOSER_SELECTION_PATTERN)];
+  const fallbackMatches = localComposerFallbackCount(section.source);
+  const selectionMatches = localComposerSelectionCount(section.source);
   const resetContext = localComposerResetContext(section);
   if (
     configMatch == null ||
-    fallbackMatches.length !== 2 ||
-    selectionMatches.length !== 1 ||
+    fallbackMatches !== 2 ||
+    selectionMatches !== 1 ||
     resetContext == null
   ) {
     return source;
@@ -1137,9 +1165,19 @@ function applyLocalComposerConfigPatch(source, context = {}) {
       `${configExpression}!=null,${selections},null==${upstreamDefault}?void 0:` +
       `\`\${${upstreamDefault}.model}:\${${upstreamDefault}.defaultReasoningEffort}\`))`,
   );
+  patchedSection = patchedSection.replace(
+    LOCAL_COMPOSER_RETURN_FALLBACK_PATTERN,
+    (_match, resolver, selections, upstreamDefault) =>
+      `return${resolver}(${selections},codexLinuxLocalDefaultPresetFallback(` +
+      `${configExpression}!=null,${selections},null==${upstreamDefault}?void 0:` +
+      `\`\${${upstreamDefault}.model}:\${${upstreamDefault}.defaultReasoningEffort}\`))`,
+  );
+  patchedSection = patchedSection.replace(
+    "{",
+    `{${localComposerRuntime(localComposerConfig(presets))}`,
+  );
   const patchedSource =
     source.slice(0, section.start) +
-    localComposerRuntime(localComposerConfig(presets)) +
     patchedSection +
     source.slice(section.end);
   if (localComposerConfigContract(patchedSource) !== "applied") {

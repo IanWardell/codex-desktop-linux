@@ -23,8 +23,66 @@ function requireUsages(source, name, expected) {
   // Include bare references as well as calls so an added alias/export fails
   // closed. Property accesses such as constants.Aa and private class members
   // such as #Aa are different bindings.
-  const uses = [...source.matchAll(new RegExp(`(?<![\\w$.#])${escapeRegExp(name)}(?![\\w$])`, "g"))];
-  if (uses.length !== expected) throw drift(`unexpected ${name} consumers`);
+  // Current rspack modules also embed large serialized tables. Scan JavaScript
+  // tokens so identifier-shaped data in strings, comments, and regexes does
+  // not look like a consumer of a short minified binding.
+  let uses = 0;
+  let previousToken = null;
+  for (let index = 0; index < source.length;) {
+    const char = source[index];
+    if (/\s/u.test(char)) { index += 1; continue; }
+    if (char === "/" && source[index + 1] === "/") {
+      index = source.indexOf("\n", index + 2);
+      if (index < 0) break;
+      continue;
+    }
+    if (char === "/" && source[index + 1] === "*") {
+      index = source.indexOf("*/", index + 2);
+      if (index < 0) break;
+      index += 2;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") {
+      const quote = char;
+      index += 1;
+      while (index < source.length) {
+        if (source[index] === "\\") index += 2;
+        else if (source[index++] === quote) break;
+      }
+      previousToken = "literal";
+      continue;
+    }
+    const regexPrefix = previousToken == null || /^(?:return|throw|case|delete|void|typeof|instanceof|in)$/u.test(previousToken) ||
+      /^[([{,:;=!?&|+*%^~<>-]$/u.test(previousToken);
+    if (char === "/" && regexPrefix) {
+      let inClass = false;
+      index += 1;
+      while (index < source.length) {
+        if (source[index] === "\\") index += 2;
+        else if (source[index] === "[") { inClass = true; index += 1; }
+        else if (source[index] === "]") { inClass = false; index += 1; }
+        else if (source[index] === "/" && !inClass) { index += 1; break; }
+        else index += 1;
+      }
+      while (/[a-z]/iu.test(source[index] ?? "")) index += 1;
+      previousToken = "literal";
+      continue;
+    }
+    if (/[A-Za-z_$]/u.test(char)) {
+      const start = index++;
+      while (/[\w$]/u.test(source[index] ?? "")) index += 1;
+      const token = source.slice(start, index);
+      let next = index;
+      while (/\s/u.test(source[next] ?? "")) next += 1;
+      const property = source[start - 1] === "." || source[start - 1] === "#" || source[next] === ":";
+      if (token === name && !property) uses += 1;
+      previousToken = token;
+      continue;
+    }
+    previousToken = char;
+    index += 1;
+  }
+  if (uses !== expected) throw drift(`unexpected ${name} consumers`);
 }
 
 // Minified names are module scoped. Restrict every relationship check to the
@@ -65,7 +123,33 @@ function lifecycleContract(source, builder, syncSource) {
   const owner = uniqueMatch(syncSource, new RegExp(`^(?:async )?function (?<name>${ID})\\((?<argument>${ID})\\)\\{`, "g"),
     "expected one plugin synchronization owner");
   requireUsages(source, builder, 3); // declaration, plugin synchronization, thread configuration
-  requireUsages(source, owner.groups.name, 2); // declaration and cached selection initialization
+  const reloads = [...source.matchAll(new RegExp(
+    `(?<![\\w$.#])${escapeRegExp(owner.groups.name)}\\(\\{\\.\\.\\.this\\.options,reloadUserConfig:!1\\}\\)`, "g",
+  ))];
+  if (reloads.length > 1) throw drift("unexpected plugin resynchronization consumers");
+  requireUsages(source, owner.groups.name, 2 + reloads.length);
+  const inlineSelection = [...syncSource.matchAll(new RegExp(
+    `,\\{selection:(?<selection>${ID}),cuaReplEnabled:${ID}\\}\\}\\)\\(${ID}\\)\\)`, "g",
+  ))];
+  if (inlineSelection.length === 1) {
+    const syncCall = uniqueMatch(syncSource, new RegExp(
+      `Object\\.assign\\(${ID},${escapeRegExp(builder)}\\(\\{\\.\\.\\.(?<argument>${ID}),accessBootstrapPath:${ID}\\}(?:,${ID})?\\)\\)`, "g",
+    ), "expected one inline plugin synchronization builder call");
+    const resume = uniqueMatch(source, new RegExp(
+      `(?<![\\w$.#])${escapeRegExp(builder)}\\(\\{browserBackends:(?<selection>${ID})\\.browserBackends,` +
+      `deferTools:\\k<selection>\\.desktopFeatureAvailability\\.deferCuaTools,` +
+      `(?:omitCuaConfirmationPolicyBySku:\\k<selection>\\.desktopFeatureAvailability\\.omitCuaConfirmationPolicyBySku,)?` +
+      `surfaces:\\k<selection>\\.cuaReplSurfaces,` +
+      `nodeRepl:${ID}\\}(?<root>,\\k<selection>\\.${ROOT_KEY})?\\)`, "g"),
+    "expected one thread configuration builder call");
+    return {
+      version: 2,
+      argument: syncCall.groups.argument,
+      selection: inlineSelection[0].groups.selection,
+      sync: { groups: { context: null } },
+      resume,
+    };
+  }
   const sync = uniqueMatch(source, new RegExp(
     `(?<enabled>${ID})=await ${escapeRegExp(owner.groups.name)}\\(\\{browserBackends:${ID},deferTools:${ID}\\.deferCuaTools,` +
     `surfaces:${ID},codexHome:${ID},marketplaceName:${ID},marketplaces:${ID},nodeRepl:${ID}\\?void 0:${ID}` +
@@ -80,7 +164,9 @@ function lifecycleContract(source, builder, syncSource) {
     "expected cached selection to belong to plugin initialization");
   const resume = uniqueMatch(source, new RegExp(
     `(?<![\\w$.#])${escapeRegExp(builder)}\\(\\{browserBackends:(?<selection>${ID})\\.browserBackends,` +
-    `deferTools:\\k<selection>\\.desktopFeatureAvailability\\.deferCuaTools,surfaces:\\k<selection>\\.cuaReplSurfaces,` +
+    `deferTools:\\k<selection>\\.desktopFeatureAvailability\\.deferCuaTools,` +
+    `(?:omitCuaConfirmationPolicyBySku:\\k<selection>\\.desktopFeatureAvailability\\.omitCuaConfirmationPolicyBySku,)?` +
+    `surfaces:\\k<selection>\\.cuaReplSurfaces,` +
     `nodeRepl:${ID}\\}(?<root>,\\k<selection>\\.${ROOT_KEY})?\\)`, "g"),
   "expected one thread configuration builder call");
   const resumeOwner = enclosingFunction(source, resume.index);
@@ -102,7 +188,7 @@ function lifecycleContract(source, builder, syncSource) {
   if (sync.groups.context != null && sync.groups.selection !== cached.groups.selection) {
     throw drift("plugin root receiver is not the cached selection");
   }
-  return { argument: owner.groups.argument, sync, resume, selection: cached.groups.selection };
+  return { version: 1, argument: owner.groups.argument, sync, resume, selection: cached.groups.selection };
 }
 
 function enclosingFunction(source, targetIndex) {
@@ -157,6 +243,7 @@ function applyUnifiedComputerUseModulePatch(source) {
   // its cached selection, then pass that context through both builder calls.
   const builder = uniqueMatch(source, new RegExp(
     `function (?<builder>[\\w$]+)\\(\\{browserBackends:(?<backends>[\\w$]+),deferTools:(?<defer>[\\w$]+),` +
+      `(?:omitCuaConfirmationPolicyBySku:(?<omitPolicy>[\\w$]+),)?` +
       `surfaces:(?<surfaces>[\\w$]+),nodeRepl:(?<nodeRepl>[\\w$]+),` +
       `accessBootstrapPath:(?<accessBootstrapPath>[\\w$]+)\\}(?<rootParam>,(?<pluginRoot>[\\w$]+))?\\)\\{`,
     "g",
@@ -175,7 +262,9 @@ function applyUnifiedComputerUseModulePatch(source) {
     `(?<audio>\\.\\.\\.${nodeRepl}\\?\\.env\\.SKY_[A-Z_]+==="1"\\?\\{` +
     `SKY_ENABLE_AUDIO:${surfaces}\\.includes\\("computer"\\)\\?"1":"0",` +
     `[^{}]*\\}:\\{\\},)`;
-  const environmentPrefix = `\\{\\.\\.\\.${nodeRepl}\\?\\.env,CUA_REPL_ENABLED_SURFACES:${surfaces}\\.join\\(","\\),`;
+  const environmentPrefix =
+    `\\{(?<prefix>\\.\\.\\.${nodeRepl}\\?\\.env,(?:[^{}]|\\{[^{}]*\\}){0,500}?)` +
+    `CUA_REPL_ENABLED_SURFACES:${surfaces}\\.join\\(","\\),`;
   const servicesEnvironment = `\\[(?<constants>[\\w$]+)\\.(?<constant>[\\w$]+)\\]:JSON\\.stringify\\((?<services>[\\w$]+)\\)`;
   const currentBanners = [...builderSource.matchAll(new RegExp(
     environmentPrefix + audioEnvironmentPattern + servicesEnvironment, "g"))];
@@ -215,10 +304,10 @@ function applyUnifiedComputerUseModulePatch(source) {
   const bannerPatched = currentBanners.length === 0 && patchedBanners.length === 1;
   const current = !linux && builder.groups.rootParam == null && calls.length === 1 &&
     calls[0].groups.rootArg == null && serviceCurrent && bannerCurrent &&
-    lifecycle.sync.groups.context == null && lifecycle.resume.groups.root == null;
+    (lifecycle.version === 2 || lifecycle.sync.groups.context == null) && lifecycle.resume.groups.root == null;
   const patched = Boolean(linux) && builder.groups.rootParam != null && calls.length === 1 &&
     calls[0].groups.rootArg != null && servicePatched && bannerPatched &&
-    lifecycle.sync.groups.context != null && lifecycle.resume.groups.root != null;
+    (lifecycle.version === 2 || lifecycle.sync.groups.context != null) && lifecycle.resume.groups.root != null;
   if (!current && !patched) throw drift("expected one native trusted service selector");
   const service = current ? currentServices[0] : patchedServices[0];
   if (pluginRoots.length !== 1) throw drift("changed plugin cache relationship");
@@ -228,7 +317,9 @@ function applyUnifiedComputerUseModulePatch(source) {
     `${escapeRegExp(root.groups.pluginRoot)}=\\(0,${ID}\\.${ID}\\)\\(\\{codexHome:${escapeRegExp(argument)}\\.codexHome,` +
     `localVersion:(?<plugin>${ID})\\.plugin\\.localVersion,marketplaceName:\\k<plugin>\\.marketplace\\.name,pluginName:\\k<plugin>\\.plugin\\.name\\}\\)`, "g"),
   "expected plugin root derived from verified installed plugin metadata");
-  const publishRoot = `${argument}.${CONTEXT_KEY}.${ROOT_KEY}=${root.groups.pluginRoot};`;
+  const publishRoot = lifecycle.version === 2
+    ? `${lifecycle.selection}.${ROOT_KEY}=${root.groups.pluginRoot};`
+    : `${argument}.${CONTEXT_KEY}.${ROOT_KEY}=${root.groups.pluginRoot};`;
   const banner = current ? currentBanners[0] : patchedBanners[0];
   if (banner.groups.services !== service.groups.services) throw drift("changed native banner relationship");
   if (patched && (service.groups.pluginRoot !== builder.groups.pluginRoot ||
@@ -266,7 +357,7 @@ function applyUnifiedComputerUseModulePatch(source) {
       index: builderOwner.start + banner.index,
       length: banner[0].length,
       replacement:
-        `{...${nodeRepl}?.env,CUA_REPL_ENABLED_SURFACES:${surfaces}.join(","),` +
+        `{${banner.groups.prefix}CUA_REPL_ENABLED_SURFACES:${surfaces}.join(","),` +
         "CODEX_LINUX_CUA_HOST_SOCKET:process.env.CODEX_LINUX_CUA_HOST_SOCKET," +
         `NODE_REPL_JS_BANNER:${bannerExpression(builderRoot)},` +
         banner.groups.audio +
@@ -287,11 +378,11 @@ function applyUnifiedComputerUseModulePatch(source) {
       length: calls[0][0].length,
       replacement: publishRoot + calls[0][0].slice(0, -2) + `,${pluginRoot}` + calls[0][0].slice(-2),
     },
-    {
+    ...(lifecycle.version === 1 ? [{
       index: lifecycle.sync.index,
       length: lifecycle.sync[0].length,
       replacement: lifecycle.sync[0].slice(0, -2) + `,${CONTEXT_KEY}:${lifecycle.selection}})`,
-    },
+    }] : []),
     {
       index: lifecycle.resume.index,
       length: lifecycle.resume[0].length,

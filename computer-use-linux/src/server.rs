@@ -1,9 +1,10 @@
 use crate::atspi_tree::{
     accessibility_chrome_context, focused_element_summary_in_app, list_accessible_apps,
-    object_ref_owner_pid, perform_action as invoke_accessibility_action, perform_named_action,
-    probe_focused_element, set_element_value, snapshot_accessibility_tree, AccessibilityAction,
-    AccessibilityNode, AccessibleAppSummary, Bounds, EditableTextSetOutcome, FocusProbe,
-    FocusedElementSummary, ValueSetInvocation,
+    object_ref_application_pid, object_ref_owner_pid,
+    perform_action as invoke_accessibility_action, perform_named_action, probe_focused_element,
+    set_element_value, snapshot_accessibility_tree, AccessibilityAction, AccessibilityNode,
+    AccessibleAppSummary, Bounds, EditableTextSetOutcome, FocusProbe, FocusedElementSummary,
+    FocusedTextInsert, ValueSetInvocation,
 };
 use crate::diagnostics::{
     doctor_report, setup_accessibility_report, DoctorReport, ReadinessReport, SetupReport,
@@ -51,7 +52,7 @@ use std::{
     future::Future,
     os::unix::{
         ffi::OsStrExt,
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt},
     },
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -99,6 +100,9 @@ const UNMATCHABLE_ACCESSIBILITY_APP_FILTER: &str = "\0";
 /// the same snapshot.
 #[derive(Default)]
 struct CachedAccessibilitySnapshot {
+    /// The snapshot_id results return for this tree; empty before the first
+    /// store. Every store gets a new one.
+    id: String,
     nodes: Vec<AccessibilityNode>,
     pid: Option<u32>,
     window_id: Option<u64>,
@@ -154,6 +158,52 @@ struct CachedTreeWindow {
     window: Option<(u64, String)>,
 }
 
+/// The cached pid and window scope a post-action tree may reuse, taken
+/// under the action's input lock so a later snapshot cannot change it.
+#[derive(Debug, Clone, Default)]
+struct PostActionScope {
+    pid: Option<u32>,
+    tree: Option<CachedTreeWindow>,
+    /// Bound to a dispatched element's owner before the action. The tree
+    /// keeps this scope on stdio too, and the owner may match zero or
+    /// several compositor windows without the desktop having changed.
+    bound: bool,
+}
+
+impl PostActionScope {
+    /// The scope of an element's verified owner: its window range only,
+    /// never the latest caller's snapshot.
+    fn bound_to(target: &ElementObservationTarget) -> Self {
+        Self {
+            pid: target.owner.pid,
+            tree: target.tree_window.clone(),
+            bound: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ElementObservationTarget {
+    owner: WindowTarget,
+    // The observed tree's range, not the popup or dialog's own window identity.
+    tree_window: Option<CachedTreeWindow>,
+}
+
+impl ElementObservationTarget {
+    fn inherit_tree_window(&mut self, previous: &Self) {
+        // Recovery clears the snapshot before retrying the same application.
+        if self.tree_window.is_none()
+            && self.owner.pid.is_some()
+            && self.owner.pid == previous.owner.pid
+        {
+            self.tree_window = previous
+                .tree_window
+                .clone()
+                .filter(|window| window.pid == self.owner.pid);
+        }
+    }
+}
+
 /// How a cached tree was returned: its node encoding, which get_tree_page
 /// pages in, and the AT-SPI window it was narrowed to.
 #[derive(Debug, Clone, Default)]
@@ -171,6 +221,66 @@ enum TargetRaised {
     No,
 }
 
+/// Snapshot ids: a random prefix per server and a serial. The prefix keeps an
+/// id from an earlier server process from naming a snapshot of this one.
+struct SnapshotIds {
+    prefix: String,
+    serial: std::sync::atomic::AtomicU64,
+}
+
+impl Default for SnapshotIds {
+    fn default() -> Self {
+        Self {
+            prefix: format!(
+                "{:08x}",
+                getrandom::u32().unwrap_or_else(|_| std::process::id())
+            ),
+            serial: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl SnapshotIds {
+    fn next(&self) -> String {
+        let serial = self
+            .serial
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        format!("{}-{serial}", self.prefix)
+    }
+}
+
+/// Refuse a `snapshot_id` that does not name the cached snapshot `current`.
+/// Indices and selectors resolve only against the cached tree, so once a later
+/// get_app_state, include_tree or perform_action recovery replaced the named
+/// one, its indices may name other elements. `prefix` is this server's id
+/// prefix. An empty or blank id counts as absent, as other optional strings do.
+fn check_snapshot_id(
+    requested: Option<&str>,
+    current: &str,
+    prefix: &str,
+) -> std::result::Result<(), String> {
+    let Some(requested) = trimmed_nonempty(requested) else {
+        return Ok(());
+    };
+    if requested == current {
+        return Ok(());
+    }
+    let reason = if requested
+        .split_once('-')
+        .is_none_or(|(requested_prefix, _)| requested_prefix != prefix)
+    {
+        "this server did not issue it; it may come from a server process that has since exited"
+    } else if current.is_empty() {
+        "no tree is cached now, since the last tree read failed or perform_action recovery cleared it"
+    } else {
+        "a later get_app_state, include_tree or perform_action recovery replaced it"
+    };
+    Err(format!(
+        "snapshot_id {requested:?} is not the cached snapshot: {reason}, and its element indices could name other elements now. Call get_app_state and use the element_index values and snapshot_id it returns."
+    ))
+}
+
 #[derive(Clone)]
 struct AccessibilityRecoveryScope {
     params: GetAppStateParams,
@@ -186,16 +296,23 @@ struct RefreshedAccessibilitySnapshot {
 #[derive(Clone, Default)]
 pub struct ComputerUseLinux {
     last_snapshot: Arc<Mutex<CachedAccessibilitySnapshot>>,
+    snapshot_ids: Arc<SnapshotIds>,
     portal_pointer_session: Arc<Mutex<Option<PortalPointerSession>>>,
     portal_keyboard_session: Arc<Mutex<Option<PortalKeyboardSession>>>,
     /// Lazily-created uinput absolute pointer (preferred coordinate backend).
     abs_pointer: Arc<Mutex<Option<crate::abs_pointer::AbsPointer>>>,
     portal_session_init_lock: Arc<tokio::sync::Mutex<()>>,
     input_operation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Set once this server has told a caller that background delivery has
+    /// no route here; later such calls use focused input without asking.
+    background_notice_shown: Arc<std::sync::atomic::AtomicBool>,
     kde_clipboard_lock: Arc<tokio::sync::Mutex<()>>,
     /// Cached physical desktop size from the most recent full-frame capture;
     /// used for off-screen warnings and portal logical-coordinate mapping.
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
+    /// Monitor layout for that capture, read once per capture for the
+    /// off-screen note. Every new capture resets it.
+    capture_layout: Arc<Mutex<CaptureLayout>>,
     /// On-screen activity overlay (opt-out via `COMPUTER_USE_LINUX_INDICATOR=0`).
     indicator: Arc<crate::indicator::Indicator>,
     /// Private files for trees too large to return inline; removed on exit.
@@ -205,6 +322,47 @@ pub struct ComputerUseLinux {
     /// it.
     diagnostics: Arc<DiagnosticsCache<DoctorReport>>,
     accessibility_check: AccessibilityCheck,
+    /// Set for HTTP: clients share the cached tree, so element calls must name it.
+    require_snapshot_ids: bool,
+    /// Set for HTTP: a remote client gets no file writes on the host, so
+    /// screenshot_file_path is refused.
+    http_transport: bool,
+}
+
+/// The monitor layout of the cached capture. `generation` counts captures,
+/// so a layout read during a newer capture is not stored for it.
+#[derive(Debug, Default)]
+struct CaptureLayout {
+    generation: u64,
+    monitors: CaptureMonitors,
+}
+
+/// Monitor rectangles (x, y, width, height), tagged with their space.
+#[derive(Debug, Clone, Default, PartialEq)]
+enum CaptureMonitors {
+    #[default]
+    Unread,
+    Unknown,
+    /// Wayland logical pixels. The capture spans their bounding box.
+    Logical(Vec<(i32, i32, i32, i32)>),
+    /// X11 root-window pixels, the space of an X11 capture, which also
+    /// holds framebuffer area no monitor shows.
+    Root(Vec<(i32, i32, i32, i32)>),
+}
+
+/// The route a coordinate click, scroll or drag took, for the off-screen note.
+/// Each one treats a point on no monitor differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerRoute {
+    /// xdotool, or ydotool on X11. The X server keeps the pointer on the
+    /// screen, then moves it to the monitor it came from or lets it sit in
+    /// the dead space.
+    X11,
+    /// The uinput absolute pointer. The device clamps to the capture and the
+    /// clamp note says so; the compositor places a point in a monitor gap.
+    Uinput,
+    /// The remote desktop portal refuses a point on no shared monitor.
+    Portal,
 }
 
 /// The live check get_app_state compares a cached report's
@@ -298,6 +456,7 @@ impl ComputerUseLinux {
         }
         Json(send_completion_notification(Path::new("notify-send"), Duration::from_secs(2)).await)
     }
+
     #[tool(
         name = "doctor",
         description = "Report Linux Computer Use desktop integration readiness.",
@@ -318,7 +477,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "setup_accessibility",
-        description = "Enable GNOME accessibility through gsettings so Linux Computer Use can read AT-SPI trees.",
+        description = "Enable GNOME accessibility so Linux Computer Use can read AT-SPI trees: sets and reads back the toolkit-accessibility gsettings key when it is not already true, and requests runtime org.a11y.Status IsEnabled when the tree cannot be built or the key does not read back.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -336,7 +495,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "setup_window_targeting",
-        description = "Install and enable the optional GNOME Shell extension used for exact window list/focus targeting when GNOME blocks native introspection.",
+        description = "Install and enable the bundled Codex GNOME Shell extension. GNOME Wayland needs it for exact window focus, move_window and resize_window, since Introspect cannot focus, move or resize windows (and recent GNOME blocks its window list too); every GNOME session needs it for the on-screen indicator, and its screenshot route is tried when the GNOME Shell screenshot call fails. Ask the user to log out and back in when the result says a shell reload is required.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -379,7 +538,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_tree_page",
-        description = "Return a page of the accessibility tree from the latest get_app_state or include_tree snapshot, starting at node offset (default 0). Use it when a tree was too large to return inline (accessibility_tree_spill is set) and the host cannot read the spill file; page with next_offset until it is null. Element indices match the snapshot, so element_index actions work on these nodes. It does not read the desktop again.",
+        description = "Return a page of the accessibility tree from the latest get_app_state or include_tree snapshot, starting at node offset (default 0). Use it when a tree was too large to return inline (accessibility_tree_spill is set) and the host cannot read the spill file; page with next_offset until it is null. Element indices match the snapshot, so element_index actions work on these nodes. Pass the snapshot's snapshot_id to refuse a page from a tree a later snapshot replaced. It does not read the desktop again.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -391,12 +550,34 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<GetTreePageParams>,
     ) -> Json<GetTreePageOutput> {
-        let (nodes, detail) = self
+        let (id, nodes, detail) = self
             .last_snapshot
             .lock()
-            .map(|snapshot| (snapshot.nodes.clone(), snapshot.detail))
+            .map(|snapshot| (snapshot.id.clone(), snapshot.nodes.clone(), snapshot.detail))
             .unwrap_or_default();
-        Json(tree_page(&nodes, detail, params.offset.unwrap_or(0)))
+        let offset = params.offset.unwrap_or(0);
+        let checked = self
+            .require_snapshot_id("get_tree_page", params.snapshot_id.as_deref())
+            .and_then(|()| {
+                check_snapshot_id(
+                    params.snapshot_id.as_deref(),
+                    &id,
+                    &self.snapshot_ids.prefix,
+                )
+            });
+        if let Err(message) = checked {
+            return Json(GetTreePageOutput {
+                snapshot_id: None,
+                nodes: TreeNodes::new(Vec::new(), detail),
+                offset,
+                next_offset: None,
+                node_count: 0,
+                message,
+            });
+        }
+        let mut page = tree_page(&nodes, detail, offset);
+        page.snapshot_id = (!id.is_empty()).then_some(id);
+        Json(page)
     }
 
     #[tool(
@@ -514,7 +695,7 @@ impl ComputerUseLinux {
     #[tool(
         name = "get_app_state",
         output_schema = rmcp::handler::server::tool::schema_for_output::<GetAppStateOutput>(),
-        description = "Start an app use session if needed, then get a size-bounded screenshot and accessibility state for a Linux app. Scope the accessibility tree with app_name_or_bundle_identifier or a window_id/pid/app_id/wm_class/title target; omitting a target returns the whole desktop tree and can flood context. Nodes are compact (empty fields left out, actions by name; verbose=true returns every field). Pass interactive_only=true for only actionable nodes, headings and status regions, with the same element_index values. A title or window_id target narrows an app with several windows under one AT-SPI root (Chromium) to that window, keeping the app's popups and dialogs. A tree too large to return inline is written whole to the private file in accessibility_tree_spill. Screenshot results include coordinate_width, coordinate_height, scale, format, and quality when the returned image is downscaled or compressed; callers can request jpeg/quality for compression before resizing.",
+        description = "Get a size-bounded screenshot and accessibility state for a Linux app. Scope the accessibility tree with app_name_or_bundle_identifier or a window_id/pid/app_id/wm_class/title target; omitting a target returns the whole desktop tree and can flood context. Nodes are compact (empty fields left out, actions by name; verbose=true returns every field). Pass interactive_only=true for only actionable nodes, headings and status regions, with the same element_index values. A title or window_id target narrows an app with several windows under one AT-SPI root (Chromium) to that window, keeping the app's popups and dialogs. A window-targeted screenshot needs that window visible and already focused (outside Hyprland background mode); otherwise screenshot_error is set and the tree still returns, so use the screenshot tool to raise and capture it. A tree too large to return inline is written whole to the private file in accessibility_tree_spill. The result's snapshot_id names the tree: element_index and selector actions that pass it are refused once a later tree replaced it. Screenshot results always include coordinate_width, coordinate_height, scale, and format, plus quality for jpeg; callers can request jpeg/quality for compression before resizing. Pass screenshot_file_path (an absolute path to a new file, stdio only; an existing path is refused) to save the screenshot there instead of returning image content; screenshot.file_path then names it.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -575,7 +756,21 @@ impl ComputerUseLinux {
             .await;
         let mut screenshot_captured = None;
         let mut capture_note = None;
-        let (screenshot, screenshot_error) = if include_screenshot {
+        // A path that cannot be written is reported without a capture.
+        let file_refusal = params
+            .screenshot_file_path
+            .as_deref()
+            .filter(|_| include_screenshot)
+            .and_then(|path| {
+                crate::screenshot_file::validate_screenshot_file_path(
+                    path,
+                    params.format.unwrap_or(ScreenshotOutputFormat::Png),
+                    self.http_transport,
+                )
+                .err()
+            })
+            .map(|error| format!("{error:#}"));
+        let (screenshot, screenshot_error) = if include_screenshot && file_refusal.is_none() {
             let result: Result<ScreenshotCapture> = async {
                 let _pipeline = crate::screenshot::screenshot_pipeline_permit().await?;
                 if let Some(window) = window_context.as_ref() {
@@ -623,10 +818,28 @@ impl ComputerUseLinux {
         } else {
             (None, None)
         };
+        // A failed file write is reported like a failed capture, but it says
+        // nothing about the desktop's screenshot readiness.
+        let screenshot_capture_failed = screenshot_error.is_some();
+        let mut screenshot_file = None;
+        let (screenshot, screenshot_error) =
+            match (screenshot, params.screenshot_file_path.as_deref()) {
+                (Some(capture), Some(path)) => {
+                    match self.save_screenshot_file(&capture, path).await {
+                        Ok(saved) => {
+                            screenshot_file = Some(saved);
+                            (Some(capture), None)
+                        }
+                        Err(error) => (None, Some(format!("{error:#}"))),
+                    }
+                }
+                (screenshot, _) => (screenshot, screenshot_error.or(file_refusal)),
+            };
         let mut tree_scoped = false;
         let mut tree_root_pid = None;
         let mut accessibility_tree_truncated = false;
         let mut shell_only_note = None;
+        let mut unmatched_pid_note = None;
         let mut window_scope = None;
         let mut interactive_note = None;
         let detail = NodeDetail::from_verbose(verbose);
@@ -634,19 +847,35 @@ impl ComputerUseLinux {
             if diagnostics.readiness.can_build_accessibility_tree {
                 let target_pid = accessibility_snapshot_target_pid(
                     app_filter.as_deref(),
-                    window_context.as_ref().and_then(|window| window.pid),
+                    window_context
+                        .as_ref()
+                        .and_then(|window| window.pid)
+                        .or(params.pid.filter(|_| params.window_id.is_none())),
                 );
                 let window_title = accessibility_window_title(&params, window_context.as_ref());
+                // A listed window is alive even when its pid owns no AT-SPI
+                // root (a Flatpak app behind xdg-dbus-proxy); its title finds it.
+                let window_pid = window_context.as_ref().and_then(|window| window.pid);
+                let pid_fallback_name = accessibility_filter_candidates(window_context.as_ref())
+                    .into_iter()
+                    .next()
+                    .filter(|_| window_pid.is_some() && window_pid == target_pid);
                 match snapshot_accessibility_tree(
                     app_filter.as_deref(),
                     target_pid,
                     window_title.as_deref(),
+                    pid_fallback_name.as_deref(),
                     max_nodes,
                     max_depth,
                 )
                 .await
                 {
                     Ok(snapshot) => {
+                        unmatched_pid_note = unmatched_accessibility_pid_note(
+                            target_pid,
+                            snapshot.root_pid,
+                            snapshot.app_filter_matched,
+                        );
                         tree_scoped = snapshot.scoped;
                         tree_root_pid = snapshot.root_pid;
                         accessibility_tree_truncated = snapshot.truncated;
@@ -690,7 +919,7 @@ impl ComputerUseLinux {
                 )
             };
         let observed = AppStateObservation {
-            screenshot_failed: screenshot_error.is_some(),
+            screenshot_failed: screenshot_capture_failed,
             window: match (&window_context, &window_error) {
                 (_, Some(_)) => WindowLookup::Failed,
                 (Some(_), None) => WindowLookup::Resolved,
@@ -716,30 +945,42 @@ impl ComputerUseLinux {
         if let Some(captured) = screenshot_captured {
             diagnostics.readiness.record_screenshot_result(captured);
         }
-        if accessibility_error.is_none() {
-            // Record a pid only when the tree's roots were matched by it. A pid
-            // with no AT-SPI root falls back to every app, or to an app-name
-            // match that can be another app entirely; recording the pid then
-            // would let that app's index pass the target check instead of
-            // taking the per-node owner lookup.
-            self.commit_app_state_snapshot(
-                &accessibility_tree,
-                tree_root_pid,
-                window_context.as_ref(),
-                &params,
-                tree_scoped,
-                TreeShape {
-                    detail,
-                    window_scope: window_scope.clone(),
-                },
-            )
-            .await;
+        let snapshot_id = if accessibility_error.is_none() {
+            // Record a pid only when the tree's roots were matched by it. An
+            // explicit app-name filter can match another process when this pid
+            // has no AT-SPI root; recording the requested pid then would let
+            // that app's index pass the target check instead of taking the
+            // per-node owner lookup.
+            let id = self
+                .commit_app_state_snapshot(
+                    &accessibility_tree,
+                    tree_root_pid,
+                    window_context.as_ref(),
+                    &params,
+                    tree_scoped,
+                    TreeShape {
+                        detail,
+                        window_scope: window_scope.clone(),
+                    },
+                )
+                .await;
+            Some(id)
         } else {
-            self.commit_snapshot(&[], None).await;
-        }
+            self.commit_cleared_snapshot().await;
+            None
+        };
         let compacted_count = accessibility_tree.len();
         let mut message = if let Some(error) = &accessibility_error {
             format!("MCP registration is working, but AT-SPI tree extraction failed: {error}")
+        } else if let Some(note) = &unmatched_pid_note {
+            let screenshot_status = if let Some(capture) = &screenshot {
+                format!("Captured a screenshot through {}.", capture.source)
+            } else if let Some(error) = &screenshot_error {
+                format!("Screenshot capture failed: {error}")
+            } else {
+                "Screenshot capture was not requested.".to_string()
+            };
+            format!("MCP registration is working. {note} {screenshot_status}")
         } else if let Some(capture) = &screenshot {
             format!(
                 "MCP registration, screenshot capture, and AT-SPI tree extraction are working. Captured {} accessibility nodes (compacted from {}) and a screenshot through {}.",
@@ -771,6 +1012,9 @@ impl ComputerUseLinux {
         if let Some(note) = capture_note {
             message.push(' ');
             message.push_str(&note);
+        }
+        if let Some(path) = &screenshot_file {
+            message.push_str(&format!(" The screenshot was saved to {path}."));
         }
         if let Some(warning) = unscoped_accessibility_tree_warning(
             tree_scoped,
@@ -816,8 +1060,12 @@ impl ComputerUseLinux {
             window_error,
             window_permissions_hint,
             backend: "linux-atspi".to_string(),
-            screenshot: screenshot.as_ref().map(ScreenshotSummary::from),
+            screenshot: screenshot.as_ref().map(|capture| ScreenshotSummary {
+                file_path: screenshot_file.clone(),
+                ..ScreenshotSummary::from(capture)
+            }),
             screenshot_error,
+            snapshot_id,
             accessibility_tree: TreeNodes::new(Vec::new(), detail),
             accessibility_tree_raw_count,
             accessibility_tree_spill: None,
@@ -842,12 +1090,13 @@ impl ComputerUseLinux {
             output.message.push(' ');
             output.message.push_str(&note);
         }
-        app_state_result(output, screenshot)
+        // A saved image is not returned inline.
+        app_state_result(output, screenshot.filter(|_| screenshot_file.is_none()))
     }
 
     #[tool(
         name = "screenshot",
-        description = "Capture the screen and return it as a viewable, size-bounded image. Optionally target a window (window_id/pid/wm_class/title/app_id): the window is raised to the front and the image is cropped before any resize. Returns the image plus a short caption with returned dimensions, coordinate dimensions, scale, format, quality, source, and crop bounds; callers can request jpeg/quality for compression before resizing.",
+        description = "Capture the screen and return it as a viewable, size-bounded image. Optionally target a window (window_id/pid/wm_class/title/app_id): the window is raised to the front and the image is cropped before any resize; outside Hyprland background mode, a target without known bounds is refused, so pass full_screen=true there. Pass monitor (a 0-based index in reading order: rows of monitors top to bottom, each row left to right) instead to capture one monitor at its own resolution, so a wide multi-monitor span is not shrunk to fit max_width; the caption then adds monitor, monitor_count, monitor_x and monitor_y, the monitor's origin in full-desktop click coordinates. Returns the image plus a JSON caption with returned and coordinate dimensions, scale, format, quality, source, cropped_to_window, and window_title. The crop origin is not reported; use relative=true on click or scroll for window-relative input. Callers can request jpeg/quality for compression before resizing. Pass screenshot_file_path (an absolute path to a new file, stdio only; an existing path is refused) to save the image there instead: the result is then only the caption, with file_path.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -912,15 +1161,49 @@ impl ComputerUseLinux {
         if let Some(note) = note {
             caption["hidden_workspace_note"] = serde_json::json!(note);
         }
-        Some(Ok(CallToolResult::success(vec![
+        Some(
+            self.screenshot_tool_result(capture, caption, params.screenshot_file_path.as_deref())
+                .await,
+        )
+    }
+
+    /// The screenshot tool's result: the image and its JSON caption, or with
+    /// screenshot_file_path only the caption, naming the saved file.
+    async fn screenshot_tool_result(
+        &self,
+        capture: ScreenshotCapture,
+        mut caption: serde_json::Value,
+        file_path: Option<&str>,
+    ) -> Result<CallToolResult> {
+        if let Some(path) = file_path {
+            caption["file_path"] =
+                serde_json::json!(self.save_screenshot_file(&capture, path).await?);
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                caption.to_string(),
+            )]));
+        }
+        Ok(CallToolResult::success(vec![
             ContentBlock::image(data_url_payload(&capture.data_url), capture.mime_type),
             ContentBlock::text(caption.to_string()),
-        ])))
+        ]))
     }
 
     async fn capture_screenshot(&self, params: ScreenshotParams) -> Result<CallToolResult> {
-        let _pipeline = crate::screenshot::screenshot_pipeline_permit().await?;
+        // Refuse a bad path before anything is raised or captured.
+        if let Some(path) = params.screenshot_file_path.as_deref() {
+            crate::screenshot_file::validate_screenshot_file_path(
+                path,
+                params.format.unwrap_or(ScreenshotOutputFormat::Png),
+                self.http_transport,
+            )?;
+        }
         let target = params.window_target();
+        if params.monitor.is_some() && target.is_some() {
+            anyhow::bail!(
+                "screenshot takes a monitor or a window target, not both; pass monitor alone to capture one monitor"
+            );
+        }
+        let _pipeline = crate::screenshot::screenshot_pipeline_permit().await?;
         if let (Some(target), false) = (target.as_ref(), params.full_screen.unwrap_or(false)) {
             if let Some(result) = self.hyprland_background_screenshot(target, &params).await {
                 return result;
@@ -957,17 +1240,57 @@ impl ComputerUseLinux {
             None => None,
         };
 
-        let (capture, cropped) = match crop_window {
-            Some(window) => {
-                let (x, y, width, height) = self
-                    .window_crop_rect_for_capture(window, &raw_capture)
+        let monitor_crop = match params.monitor {
+            Some(index) => {
+                // Umbriel's portal fallback captures one output of several.
+                // Monitor rectangles scaled from the whole layout would crop
+                // an unrelated region of it, even where the two sizes happen
+                // to be in proportion.
+                if crate::windowing::backends::umbriel::is_umbriel_session() {
+                    let (width, height) = (raw_capture.width as i32, raw_capture.height as i32);
+                    let fit = tokio::task::spawn_blocking(move || {
+                        crate::abs_pointer::detect_placement(width, height)
+                    })
                     .await
-                    .context("targeted screenshot crop failed")?;
+                    .ok()
+                    .and_then(Result::ok);
+                    if let Some(reason) = fit.as_ref().and_then(partial_capture_monitor_refusal) {
+                        anyhow::bail!("monitor screenshot failed: {reason}");
+                    }
+                }
+                let rects = self
+                    .capture_monitor_rects((raw_capture.width, raw_capture.height))
+                    .await
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "monitor screenshot failed: the monitor layout of this capture is unknown; capture the full desktop instead"
+                        )
+                    })?;
+                let count = rects.len();
+                let rect =
+                    monitor_crop_rect(&rects, index, (raw_capture.width, raw_capture.height))
+                        .map_err(|error| anyhow::anyhow!("monitor screenshot failed: {error}"))?;
+                Some((index, count, rect))
+            }
+            None => None,
+        };
+
+        let crop_rect = match (crop_window, monitor_crop) {
+            (Some(window), _) => Some(
+                self.window_crop_rect_for_capture(window, &raw_capture)
+                    .await
+                    .context("targeted screenshot crop failed")?,
+            ),
+            (None, Some((_, _, rect))) => Some(rect),
+            (None, None) => None,
+        };
+        let (capture, cropped) = match crop_rect {
+            Some((x, y, width, height)) => {
                 let (raw_capture, bytes, width, height) =
                     crate::screenshot::run_image_task(move || {
                         let (bytes, width, height) =
                             crop_png(&raw_capture.bytes, x, y, width, height).map_err(|error| {
-                                anyhow::anyhow!("targeted screenshot crop failed: {error}")
+                                anyhow::anyhow!("screenshot crop failed: {error}")
                             })?;
                         Ok((raw_capture, bytes, width, height))
                     })
@@ -980,7 +1303,7 @@ impl ComputerUseLinux {
                         width,
                         height,
                     },
-                    true,
+                    crop_window.is_some(),
                 )
             }
             None => (raw_capture, false),
@@ -1007,21 +1330,30 @@ impl ComputerUseLinux {
             "cropped_to_window": cropped,
             "window_title": window_label,
         });
+        if let Some((index, count, (x, y, _, _))) = monitor_crop {
+            caption["monitor"] = serde_json::json!(index);
+            caption["monitor_count"] = serde_json::json!(count);
+            caption["monitor_x"] = serde_json::json!(x);
+            caption["monitor_y"] = serde_json::json!(y);
+        }
         if let Some(note) = off_screen_note {
             caption["window_off_screen"] = serde_json::json!(true);
             caption["off_screen_note"] = serde_json::json!(note);
         }
-        Ok(CallToolResult::success(vec![
-            ContentBlock::image(data_url_payload(&capture.data_url), capture.mime_type),
-            ContentBlock::text(caption.to_string()),
-        ]))
+        self.screenshot_tool_result(capture, caption, params.screenshot_file_path.as_deref())
+            .await
     }
 
     /// Lazily create the uinput absolute pointer, sizing its ABS range to the
     /// full capture's pixel dimensions. This preserves the coordinate space
     /// used by click/scroll/drag, independently of logical monitor scaling.
     /// Explicit backend overrides skip this device, including a cached one.
-    async fn ensure_abs_pointer(&self) -> bool {
+    /// A device sized for another capture is replaced: the compositor spreads
+    /// its range across the current layout, so it would scale every point.
+    /// With the device matching the capture, an off-capture point is clamped
+    /// and the clamp note reports where it landed. A failed replacement is an
+    /// error, as on the KWin path: the caller reports it and sends nothing.
+    async fn ensure_abs_pointer(&self) -> std::result::Result<bool, AbsPointerFailure> {
         if self.is_cosmic_wayland_session()
             || (native_x11_xdotool_pointer_session(
                 env::var("XDG_SESSION_TYPE").ok().as_deref(),
@@ -1040,41 +1372,102 @@ impl ComputerUseLinux {
                 "CODEX_COMPUTER_USE_FORCE_PORTAL_POINTER",
             ]) && self.is_wayland_session())
         {
-            return false;
+            return Ok(false);
         }
-        if self
-            .abs_pointer
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        let Ok(cap) = capture_screenshot_raw().await else {
-            return false;
-        };
-        self.cache_desktop_size(cap.width, cap.height);
-        match tokio::task::spawn_blocking(move || {
-            crate::abs_pointer::AbsPointer::create(cap.width as i32, cap.height as i32)
-        })
+        self.ensure_abs_pointer_with(
+            crate::windowing::backends::umbriel::is_umbriel_session(),
+            raw_capture_size,
+            crate::abs_pointer::AbsPointer::create,
+        )
         .await
-        {
-            Ok(Ok(pointer)) => {
-                if let Ok(mut guard) = self.abs_pointer.lock() {
-                    *guard = Some(pointer);
-                    return true;
-                }
-                false
+    }
+
+    /// `ensure_abs_pointer` past its route checks, with the capture and the
+    /// device creation passed in. `umbriel` is whether this is an Umbriel
+    /// session, where captures can come from routes that cover different
+    /// parts of the layout.
+    async fn ensure_abs_pointer_with<C, CFut, F>(
+        &self,
+        umbriel: bool,
+        capture: C,
+        create: F,
+    ) -> std::result::Result<bool, AbsPointerFailure>
+    where
+        C: FnOnce() -> CFut,
+        CFut: Future<Output = Option<(u32, u32)>>,
+        F: FnOnce(i32, i32) -> Result<crate::abs_pointer::AbsPointer> + Send + 'static,
+    {
+        let desktop_size = self.desktop_size.lock().ok().and_then(|guard| *guard);
+        // A capture of one output of several keeps its size when another
+        // output turns on or off, so the cached device is also checked
+        // against where the capture now sits in the layout. This reads the
+        // layout from the compositor, so it runs before the lock is taken;
+        // a failed read keeps the device. A capture that can no longer be
+        // placed drops the device, and the other pointer routes are tried.
+        let has_pointer = self.abs_pointer.lock().is_ok_and(|guard| guard.is_some());
+        let current_fit = match desktop_size {
+            Some((width, height)) if has_pointer && umbriel => {
+                tokio::task::spawn_blocking(move || {
+                    crate::abs_pointer::detect_placement(width as i32, height as i32)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
             }
-            _ => false,
-        }
+            _ => None,
+        };
+        let current_placement = match current_fit {
+            Some(crate::abs_pointer::CaptureFit::Unsupported(_)) => {
+                if let Ok(mut guard) = self.abs_pointer.lock() {
+                    *guard = None;
+                }
+                return Ok(false);
+            }
+            Some(crate::abs_pointer::CaptureFit::Placed(placement)) => Some(Some(placement)),
+            Some(crate::abs_pointer::CaptureFit::WholeLayout) => Some(None),
+            None => None,
+        };
+        let stale_size = match self.abs_pointer.lock() {
+            Ok(mut guard) => match (guard.as_ref(), desktop_size) {
+                (Some(pointer), Some((width, height)))
+                    if !pointer.matches_dimensions(width as i32, height as i32)
+                        || current_placement
+                            .is_some_and(|placement| placement != pointer.placement()) =>
+                {
+                    *guard = None;
+                    Some((width, height))
+                }
+                (Some(_), _) => return Ok(true),
+                (None, _) => None,
+            },
+            Err(_) => return Ok(false),
+        };
+        // The cached size is the latest raw capture, the space the caller's
+        // coordinates come from, so a replacement needs no new capture. On
+        // Umbriel a first device needs none either: a new capture could come
+        // from the other route and cover a different part of the layout than
+        // the one the point was mapped in. Creation checks where a capture
+        // of that size sits in the layout.
+        let ((width, height), stale) = match (stale_size, desktop_size) {
+            (Some(size), _) => (size, true),
+            (None, Some(size)) if umbriel => (size, false),
+            (None, _) => {
+                let Some((width, height)) = capture().await else {
+                    return Ok(false);
+                };
+                self.cache_desktop_size(width, height);
+                ((width, height), false)
+            }
+        };
+        self.create_abs_pointer_with(width, height, stale, create)
+            .await
     }
 
     async fn ensure_abs_pointer_for_kwin_capture(
         &self,
         width: u32,
         height: u32,
-    ) -> std::result::Result<bool, String> {
+    ) -> std::result::Result<bool, AbsPointerFailure> {
         if self.is_cosmic_wayland_session()
             || (native_x11_xdotool_pointer_session(
                 env::var("XDG_SESSION_TYPE").ok().as_deref(),
@@ -1099,7 +1492,7 @@ impl ComputerUseLinux {
             let mut guard = self
                 .abs_pointer
                 .lock()
-                .map_err(|_| "absolute pointer lock was poisoned".to_string())?;
+                .map_err(|_| AbsPointerFailure::lock_poisoned())?;
             match guard.as_ref() {
                 Some(pointer) if pointer.matches_dimensions(width as i32, height as i32) => {
                     return Ok(true)
@@ -1111,50 +1504,86 @@ impl ComputerUseLinux {
                 None => false,
             }
         };
-        self.create_abs_pointer_for_kwin_capture_with(
-            width,
-            height,
-            stale,
-            crate::abs_pointer::AbsPointer::create,
-        )
-        .await
+        self.create_abs_pointer_with(width, height, stale, crate::abs_pointer::AbsPointer::create)
+            .await
     }
 
-    async fn create_abs_pointer_for_kwin_capture_with<F>(
+    /// The uinput pointer for a KWin element click, sized to the capture
+    /// KWin mapped the element onto. A device that cannot be replaced fails
+    /// the click with a device message, not a mapping failure.
+    async fn kwin_abs_pointer_ready(
+        &self,
+        kwin_click: PreparedKwinElementClick,
+        received: &Option<serde_json::Value>,
+    ) -> std::result::Result<bool, ActionOutput> {
+        let (width, height) = kwin_click.capture_size;
+        match self
+            .ensure_abs_pointer_for_kwin_capture(width, height)
+            .await
+        {
+            Ok(ready) => Ok(ready),
+            Err(failure) => Err(kwin_abs_pointer_not_sent(
+                kwin_click.element_index,
+                &failure,
+                self.pointer_retry_route().await,
+                received.clone(),
+            )),
+        }
+    }
+
+    async fn create_abs_pointer_with<F>(
         &self,
         width: u32,
         height: u32,
         stale: bool,
         create: F,
-    ) -> std::result::Result<bool, String>
+    ) -> std::result::Result<bool, AbsPointerFailure>
     where
         F: FnOnce(i32, i32) -> Result<crate::abs_pointer::AbsPointer> + Send + 'static,
     {
         let created =
             tokio::task::spawn_blocking(move || create(width as i32, height as i32)).await;
-        match created {
+        let detail = match created {
             Ok(Ok(pointer)) => {
                 let mut guard = self
                     .abs_pointer
                     .lock()
-                    .map_err(|_| "absolute pointer lock was poisoned".to_string())?;
+                    .map_err(|_| AbsPointerFailure::lock_poisoned())?;
                 *guard = Some(pointer);
-                Ok(true)
+                return Ok(true);
             }
-            Ok(Err(error)) if stale => Err(format!(
-                "cached absolute-pointer geometry was stale for the current raw capture and the device could not be recreated: {error:#}"
-            )),
-            Err(error) if stale => Err(format!(
-                "cached absolute-pointer geometry was stale for the current raw capture and the device recreation task failed: {error}"
-            )),
-            _ => Ok(false),
+            Ok(Err(error)) if stale => format!(
+                "cached absolute-pointer geometry was stale for the {width}x{height} raw capture and the device could not be recreated: {error:#}"
+            ),
+            Err(error) if stale => format!(
+                "cached absolute-pointer geometry was stale for the {width}x{height} raw capture and the device recreation task failed: {error}"
+            ),
+            _ => return Ok(false),
+        };
+        Err(AbsPointerFailure {
+            detail,
+            device_dropped: true,
+        })
+    }
+
+    /// Where a coordinate action goes once no uinput pointer can be made:
+    /// the routes click, scroll and drag try after the uinput block.
+    async fn pointer_retry_route(&self) -> &'static str {
+        if self.cached_portal_pointer_session().is_some()
+            || self.should_prefer_portal_pointer_backend().await
+        {
+            "it goes through the remote desktop portal"
+        } else if self.is_wayland_session() {
+            "it is not sent, since ydotool cannot position the pointer accurately on Wayland"
+        } else {
+            "it goes through ydotool"
         }
     }
 
     #[tool(
         name = "click",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ActionToolOutput>(),
-        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata. Plain left activation prefers a native AT-SPI click/press/toggle action, avoiding toolkit coordinate scaling. Entry activate and slider jump actions are not substituted for pointer clicks. Explicit coordinates, right clicks, and multi-clicks retain pointer semantics. Explicit x/y default to raw screenshot capture pixels; coordinate_space=\"atspi\" with element_index or a semantic selector maps a global AT-SPI screen point through the element's KWin window and output geometry on KDE Wayland. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata. A plain left click on an element whose first AT-SPI action is click, press, or toggle invokes that action, avoiding toolkit coordinate scaling. Entry activate and slider jump actions are not substituted for pointer clicks. Explicit coordinates, right clicks, and multi-clicks retain pointer semantics. Explicit x/y default to raw screenshot capture pixels; coordinate_space=\"atspi\" with element_index or a semantic selector maps a global AT-SPI screen point through the element's KWin window and output geometry on KDE Wayland. A window target is raised and focused first (on GNOME Wayland, raising needs the Shell extension); nothing is sent when focus cannot be verified. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1168,14 +1597,127 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.window_target();
-        let Json(output) = self.dispatch_click(params).await;
-        self.finish_action_output(output, &capture, target.as_ref(), TargetRaised::Yes)
+        let background = params.delivery == Some(KeyboardDelivery::Background);
+        let (Json(output), scope, report) = self.dispatch_click(params).await;
+        let raised = background_target_raised(background, report.as_ref());
+        self.finish_background_output(output, &capture, target.as_ref(), raised, scope, report)
             .await
     }
 
-    async fn dispatch_click(&self, mut params: ClickParams) -> Json<ActionOutput> {
+    async fn dispatch_click(
+        &self,
+        mut params: ClickParams,
+    ) -> (
+        Json<ActionOutput>,
+        PostActionScope,
+        Option<BackgroundReport>,
+    ) {
         let received = Some(serde_json::json!(params.clone()));
+        let mut report = None;
+        if params.delivery == Some(KeyboardDelivery::Background) {
+            let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+            let button = match params
+                .button
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                None | Some("left") => Some(crate::agent_seat::PointerButton::Left),
+                Some("right") => Some(crate::agent_seat::PointerButton::Right),
+                Some("middle") => Some(crate::agent_seat::PointerButton::Middle),
+                Some(_) => None,
+            };
+            let count = params.click_count.unwrap_or(1).clamp(1, 10);
+            let outcome = match button {
+                Some(button) => {
+                    self.background_pointer(
+                        "click",
+                        (params.x, params.y),
+                        params.window_target(),
+                        params.relative == Some(true)
+                            || params.coordinate_space != ClickCoordinateSpace::default()
+                            || click_resolves_cached_element(&params),
+                        move |x, y| crate::agent_seat::PointerInput::Click {
+                            x,
+                            y,
+                            button,
+                            count,
+                        },
+                        received.clone(),
+                        input_guard,
+                    )
+                    .await
+                }
+                None => BackgroundOutcome::Unavailable {
+                    reason: "a background click uses the left, right or middle button".to_string(),
+                    fallback: FocusFallback::default(),
+                },
+            };
+            match outcome {
+                BackgroundOutcome::Done(output, route) => {
+                    return (
+                        Json(output),
+                        PostActionScope::default(),
+                        route.map(BackgroundReport::routed),
+                    )
+                }
+                BackgroundOutcome::Unavailable { reason, .. } => {
+                    // A stale snapshot is an error, not a missing route.
+                    if let Err(message) = self.check_element_snapshot(
+                        "click",
+                        params.snapshot_id.as_deref(),
+                        click_resolves_cached_element(&params),
+                    ) {
+                        return (
+                            Json(action_result("click", Err(message), received)),
+                            PostActionScope::default(),
+                            None,
+                        );
+                    }
+                    if let Some((output, notice)) =
+                        self.background_notice("click", &reason, received.clone())
+                    {
+                        return (Json(output), PostActionScope::default(), Some(notice));
+                    }
+                    params.delivery = None;
+                    report = Some(BackgroundReport::focused());
+                }
+            }
+        }
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        // Before the window is raised: a refused call changes nothing.
+        match self.check_element_snapshot(
+            "click",
+            params.snapshot_id.as_deref(),
+            click_resolves_cached_element(&params),
+        ) {
+            Ok(scope) => (
+                self.dispatch_checked_click(params, received, input_guard)
+                    .await,
+                scope,
+                report,
+            ),
+            Err(message) => (
+                Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message,
+                    received,
+                }),
+                PostActionScope::default(),
+                None,
+            ),
+        }
+    }
+
+    /// The rest of click, under the input lock the caller took.
+    async fn dispatch_checked_click(
+        &self,
+        mut params: ClickParams,
+        received: Option<serde_json::Value>,
+        input_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Json<ActionOutput> {
         let mut portal_target_point = None;
         let mut input_focus = None;
         let mut owner_target = ElementOwnerTarget::pid(params.pid);
@@ -1422,12 +1964,11 @@ impl ComputerUseLinux {
             )
             .await
         {
-            return Json(output);
+            return Json(pointer_action_result(output));
         }
-        let mut input_guard = Arc::try_unwrap(input_guard)
-            .unwrap_or_else(|_| panic!("pixelflux fallback must not retain dispatched input"));
+        let input_guard = Arc::try_unwrap(input_guard)
+            .expect("pixelflux fallback must not retain dispatched input");
         if self.should_prefer_xdotool_pointer() {
-            let off_screen_note = self.off_screen_note_for_point(x, y).await;
             if let Some(xdotool_args) = xdotool_pointer_click_args(
                 x,
                 y,
@@ -1453,6 +1994,13 @@ impl ComputerUseLinux {
                 if output.ok && used_xdotool {
                     output.message = "Action sent through xdotool (X11 XTEST).".to_string();
                 }
+                // Nothing was sent when the dispatch failed.
+                let off_screen_note = if output.ok {
+                    self.off_screen_note_for_point(x, y, PointerRoute::X11)
+                        .await
+                } else {
+                    None
+                };
                 return Json(with_notes(output, off_screen_note));
             }
             return Json(ActionOutput {
@@ -1468,104 +2016,69 @@ impl ComputerUseLinux {
         // move, which acceleration + fractional scaling distort) and unlike the
         // portal (per-monitor coordinate scaling + an approval dialog), the
         // absolute pointer uses screenshot-pixel coordinates directly and
-        // reports the point it emitted after desktop-edge clamping. Keep the
-        // operation guard through cancellation so a partial click is never
-        // replayed through a fallback backend.
-        let off_screen_note = self.off_screen_note_for_point(x, y).await;
-        let abs_pointer_ready = if let Some(kwin_click) = kwin_click {
-            match self
-                .ensure_abs_pointer_for_kwin_capture(
-                    kwin_click.capture_size.0,
-                    kwin_click.capture_size.1,
-                )
-                .await
-            {
-                Ok(ready) => ready,
-                Err(message) => {
-                    return self.kwin_element_click_failure(
-                        kwin_click.element_index,
-                        &message,
-                        received,
-                    );
+        // reports the point it emitted after desktop-edge clamping.
+        if let Some(abs_button) =
+            crate::abs_pointer::PointerButton::from_name(params.button.as_deref())
+        {
+            let abs_pointer_ready = if let Some(kwin_click) = kwin_click {
+                match self.kwin_abs_pointer_ready(kwin_click, &received).await {
+                    Ok(ready) => ready,
+                    Err(output) => return Json(output),
                 }
-            }
-        } else {
-            self.ensure_abs_pointer().await
-        };
-        if let (true, Some(btn)) = (
-            abs_pointer_ready,
-            crate::abs_pointer::PointerButton::from_name(params.button.as_deref()),
-        ) {
-            let count = params.click_count.unwrap_or(1).clamp(1, 10);
-            let abs_pointer = Arc::clone(&self.abs_pointer);
-            let (returned_guard, clicked) =
-                run_cancellation_safe_guarded(input_guard, async move {
-                    tokio::task::spawn_blocking(move || {
-                        let mut guard = abs_pointer.lock().ok()?;
-                        let result = guard
-                            .as_mut()?
-                            .click(x, y, btn, count)
-                            .map_err(|error| format!("{error:#}"));
-                        if result.is_err() {
-                            guard.take();
-                        }
-                        Some(result)
+            } else {
+                match self.ensure_abs_pointer().await {
+                    Ok(ready) => ready,
+                    Err(failure) => {
+                        return Json(abs_pointer_not_sent(
+                            "click",
+                            &failure,
+                            self.pointer_retry_route().await,
+                            received,
+                        ))
+                    }
+                }
+            };
+            if abs_pointer_ready {
+                let pointer = Arc::clone(&self.abs_pointer);
+                let count = params.click_count.unwrap_or(1).clamp(1, 10);
+                let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
+                    run_abs_pointer(pointer, move |pointer| {
+                        pointer.click(x, y, abs_button, count)
                     })
                     .await
-                    .ok()
-                    .flatten()
                 })
                 .await;
-            let Some(returned_guard) = returned_guard else {
-                return Json(with_notes(
-                    action_result("click", Err(clicked.unwrap_err()), received),
-                    off_screen_note,
-                ));
-            };
-            input_guard = returned_guard;
-            match clicked {
-                Ok(Some(Ok(landing))) => {
-                    return Json(kwin_element_click_dispatch_output(
-                        with_notes(
-                            pointer_action_result(ActionOutput {
-                                ok: true,
-                                implemented: true,
-                                action: "click".to_string(),
-                                message: "Action sent through the uinput absolute pointer."
-                                    .to_string(),
-                                received,
-                            }),
-                            abs_pointer_clamp_note(landing).or(off_screen_note.clone()),
-                        ),
-                        kwin_click,
-                        "the uinput absolute pointer",
-                    ));
-                }
-                Ok(Some(Err(error))) => {
-                    return Json(with_notes(
-                        action_result(
-                            "click",
-                            Err(format!(
-                                "uinput click may have started before it failed; the device was invalidated and input was not replayed through another backend: {error}"
-                            )),
-                            received,
-                        ),
+                let _input_guard = input_guard;
+                // KWin mapped an element point onto one of its outputs.
+                let off_screen_note = match kwin_click {
+                    Some(_) => None,
+                    None => self.uinput_off_screen_note(&result).await,
+                };
+                return Json(kwin_element_click_dispatch_output(
+                    with_notes(
+                        pointer_action_result(abs_pointer_result("click", result, received)),
                         off_screen_note,
-                    ));
-                }
-                Ok(None) => {}
-                Err(_) => unreachable!("missing guard already handled the guarded task failure"),
+                    ),
+                    kwin_click,
+                ));
             }
         }
-        let off_screen_note = self.off_screen_note_for_point(x, y).await;
+        // A portal release guard holds a clone, so a cancelled action keeps
+        // the lock until its button is up; this one keeps it until a failed
+        // session is cleared.
+        let input_guard = InputOperationGuard::new(input_guard);
         if let Some(session) = self.cached_portal_pointer_session() {
+            // KWin mapped an element point onto one of its outputs.
+            let portal_off_screen_note = self
+                .portal_off_screen_note(kwin_click.is_none().then_some((x, y)))
+                .await;
             let Some((portal_x, portal_y)) =
                 portal_target_point.or_else(|| self.logical_portal_point(&session, x, y))
             else {
                 self.clear_portal_pointer_session(&session);
                 return Json(with_notes(
                     pointer_action_result(portal_coordinate_error("click", received)),
-                    off_screen_note.clone(),
+                    portal_off_screen_note.clone(),
                 ));
             };
             match portal_click(
@@ -1574,7 +2087,7 @@ impl ComputerUseLinux {
                 portal_y,
                 PointerButton::from_name(params.button.as_deref()),
                 params.click_count.unwrap_or(1).clamp(1, 10),
-                InputOperationGuard::new(input_guard),
+                input_guard.clone(),
             )
             .await
             {
@@ -1589,17 +2102,16 @@ impl ComputerUseLinux {
                                     .to_string(),
                                 received,
                             }),
-                            off_screen_note.clone(),
+                            portal_off_screen_note.clone(),
                         ),
                         kwin_click,
-                        "the remote desktop portal",
                     ));
                 }
                 Err(error) => {
                     self.clear_portal_pointer_session(&session);
                     return Json(with_notes(
                         pointer_action_result(portal_action_error("click", error, received)),
-                        off_screen_note.clone(),
+                        portal_off_screen_note.clone(),
                     ));
                 }
             }
@@ -1611,13 +2123,16 @@ impl ComputerUseLinux {
                             return Json(action_result("click", Err(message), received));
                         }
                     }
+                    let portal_off_screen_note = self
+                        .portal_off_screen_note(kwin_click.is_none().then_some((x, y)))
+                        .await;
                     let Some((portal_x, portal_y)) =
                         portal_target_point.or_else(|| self.logical_portal_point(&session, x, y))
                     else {
                         self.clear_portal_pointer_session(&session);
                         return Json(with_notes(
                             pointer_action_result(portal_coordinate_error("click", received)),
-                            off_screen_note.clone(),
+                            portal_off_screen_note.clone(),
                         ));
                     };
                     match portal_click(
@@ -1626,7 +2141,7 @@ impl ComputerUseLinux {
                         portal_y,
                         PointerButton::from_name(params.button.as_deref()),
                         params.click_count.unwrap_or(1).clamp(1, 10),
-                        InputOperationGuard::new(input_guard),
+                        input_guard.clone(),
                     )
                     .await
                     {
@@ -1641,10 +2156,9 @@ impl ComputerUseLinux {
                                             .to_string(),
                                         received,
                                     }),
-                                    off_screen_note.clone(),
+                                    portal_off_screen_note.clone(),
                                 ),
                                 kwin_click,
-                                "the remote desktop portal",
                             ));
                         }
                         Err(error) => {
@@ -1653,27 +2167,13 @@ impl ComputerUseLinux {
                                 pointer_action_result(portal_action_error(
                                     "click", error, received,
                                 )),
-                                off_screen_note.clone(),
+                                portal_off_screen_note.clone(),
                             ));
                         }
                     }
                 }
-                Ok(None) => {
-                    return Json(with_notes(
-                        pointer_action_result(portal_action_error(
-                            "click",
-                            anyhow::anyhow!("the selected portal pointer backend was unavailable"),
-                            received,
-                        )),
-                        off_screen_note,
-                    ));
-                }
-                Err(error) => {
-                    return Json(with_notes(
-                        pointer_action_result(portal_start_error("click", error, received)),
-                        off_screen_note,
-                    ));
-                }
+                Ok(None) => {}
+                Err(error) => return Json(portal_start_error("click", error, received)),
             }
         }
         if self.is_wayland_session() {
@@ -1693,10 +2193,14 @@ impl ComputerUseLinux {
         })
         .await;
         let _input_guard = input_guard;
-        Json(with_notes(
-            pointer_action_result(action_result("click", result, received)),
-            off_screen_note,
-        ))
+        let output = pointer_action_result(action_result("click", result, received));
+        let off_screen_note = if output.ok {
+            self.off_screen_note_for_point(x, y, PointerRoute::X11)
+                .await
+        } else {
+            None
+        };
+        Json(with_notes(output, off_screen_note))
     }
 
     #[tool(
@@ -1716,12 +2220,24 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let requested_action = requested_or_primary_action(params.action.as_deref());
-        let target = params.target.window_target();
-        let Json(output) = self
+        let screenshot_target = params.target.window_target();
+        let (Json(output), target) = self
             .perform_element_action(&params, Some(requested_action))
             .await;
-        self.finish_action_output(output, &capture, target.as_ref(), TargetRaised::No)
-            .await
+        let (observation, screenshot, notes) = if output.ok {
+            self.capture_element_observation(&capture, screenshot_target.as_ref(), target.as_ref())
+                .await
+        } else {
+            (PostActionObservation::default(), None, Vec::new())
+        };
+        self.action_tool_result(
+            ActionToolOutput {
+                action: with_notes(output, notes),
+                background: None,
+                observation,
+            },
+            screenshot,
+        )
     }
 
     #[tool(
@@ -1740,15 +2256,61 @@ impl ComputerUseLinux {
         Parameters(params): Parameters<SetValueParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
-        let target = params.target.window_target();
-        let (output, verified) = self.dispatch_set_value(params).await;
-        self.finish_set_value_output(output, verified, &capture, target.as_ref())
-            .await
+        let screenshot_target = params.target.window_target();
+        let (output, verified, target) = self.dispatch_set_value(params).await;
+        self.finish_set_value_output(
+            output,
+            verified,
+            &capture,
+            screenshot_target.as_ref(),
+            target.as_ref(),
+        )
+        .await
     }
 
-    async fn dispatch_set_value(&self, params: SetValueParams) -> (ActionOutput, Option<bool>) {
+    async fn dispatch_set_value(
+        &self,
+        params: SetValueParams,
+    ) -> (
+        ActionOutput,
+        Option<bool>,
+        std::result::Result<ElementObservationTarget, String>,
+    ) {
         let _input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         let received = Some(serde_json::json!(params.clone()));
+        // An element_identifier names the object itself, not a snapshot node.
+        match self.check_element_snapshot(
+            "set_value",
+            params.snapshot_id.as_deref(),
+            trimmed_nonempty(params.element_identifier.as_deref()).is_none()
+                && (params.element_index.is_some() || !params.selector().is_empty()),
+        ) {
+            // The post-action tree follows the element's bound owner instead.
+            Ok(_) => self.dispatch_checked_set_value(params, received).await,
+            Err(message) => (
+                ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "set_value".to_string(),
+                    message,
+                    received,
+                },
+                None,
+                Ok(ElementObservationTarget::default()),
+            ),
+        }
+    }
+
+    /// The rest of set_value; the caller holds the input lock.
+    async fn dispatch_checked_set_value(
+        &self,
+        params: SetValueParams,
+        received: Option<serde_json::Value>,
+    ) -> (
+        ActionOutput,
+        Option<bool>,
+        std::result::Result<ElementObservationTarget, String>,
+    ) {
         if let Err(message) = self
             .check_element_action_target(
                 &params.target,
@@ -1768,6 +2330,7 @@ impl ComputerUseLinux {
                     received,
                 },
                 None,
+                Ok(ElementObservationTarget::default()),
             );
         }
         let object_ref = match self.resolve_object_ref(
@@ -1787,12 +2350,23 @@ impl ComputerUseLinux {
                         received,
                     },
                     None,
+                    Ok(ElementObservationTarget::default()),
                 );
             }
         };
 
+        let target = if params.capture.include_tree.unwrap_or(false) {
+            self.element_observation_target(
+                &params.target,
+                &object_ref,
+                params.snapshot_id.as_deref(),
+            )
+            .await
+        } else {
+            Ok(ElementObservationTarget::default())
+        };
         self.indicator.text("set_value", &params.value, false).await;
-        match set_element_value(&object_ref, &params.value).await {
+        let (output, verified) = match set_element_value(&object_ref, &params.value).await {
             Ok(ValueSetInvocation::Numeric { value }) => (
                 ActionOutput {
                     ok: true,
@@ -1816,13 +2390,14 @@ impl ComputerUseLinux {
                 },
                 None,
             ),
-        }
+        };
+        (output, verified, target)
     }
 
     #[tool(
         name = "scroll",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ActionToolOutput>(),
-        description = "Scroll an element in a direction by a number of pages. With a window target and no x/y/element_index, scrolls at the centre of the targeted window. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+        description = "Scroll an element, window, or point in a direction by a number of pages (5 wheel notches per page). With a window target and no x/y/element_index, scrolls at the centre of the targeted window; with no point or target, at the current pointer. A window target is raised and focused first; nothing is sent when focus cannot be verified. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1836,26 +2411,111 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.window_target();
-        let Json(output) = self.dispatch_scroll(params).await;
-        self.finish_action_output(output, &capture, target.as_ref(), TargetRaised::Yes)
+        let background = params.delivery == Some(KeyboardDelivery::Background);
+        let (Json(output), scope, report) = self.dispatch_scroll(params).await;
+        let raised = background_target_raised(background, report.as_ref());
+        self.finish_background_output(output, &capture, target.as_ref(), raised, scope, report)
             .await
     }
 
-    async fn dispatch_scroll(&self, mut params: ScrollParams) -> Json<ActionOutput> {
+    async fn dispatch_scroll(
+        &self,
+        mut params: ScrollParams,
+    ) -> (
+        Json<ActionOutput>,
+        PostActionScope,
+        Option<BackgroundReport>,
+    ) {
         let received = Some(serde_json::json!(params.clone()));
-        let units = match scroll_units(params.pages) {
-            Ok(units) => units,
-            Err(message) => {
-                return Json(ActionOutput {
+        let refused = |message| {
+            (
+                Json(ActionOutput {
                     ok: false,
                     implemented: true,
                     action: "scroll".to_string(),
                     message,
-                    received,
-                });
-            }
+                    received: received.clone(),
+                }),
+                PostActionScope::default(),
+                None,
+            )
         };
+        let units = match scroll_units(params.pages) {
+            Ok(units) => units,
+            Err(message) => return refused(message),
+        };
+        let mut report = None;
+        if params.delivery == Some(KeyboardDelivery::Background) {
+            let (dx, dy) = match params.direction.to_ascii_lowercase().as_str() {
+                "up" => (0, -units),
+                "down" => (0, units),
+                "left" => (-units, 0),
+                "right" => (units, 0),
+                _ => return refused("direction must be up, down, left or right".to_string()),
+            };
+            let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+            let outcome = self
+                .background_pointer(
+                    "scroll",
+                    (params.x, params.y),
+                    params.window_target(),
+                    params.relative == Some(true) || params.element_index.is_some(),
+                    move |x, y| crate::agent_seat::PointerInput::Scroll { x, y, dx, dy },
+                    received.clone(),
+                    input_guard,
+                )
+                .await;
+            match outcome {
+                BackgroundOutcome::Done(output, route) => {
+                    return (
+                        Json(output),
+                        PostActionScope::default(),
+                        route.map(BackgroundReport::routed),
+                    )
+                }
+                BackgroundOutcome::Unavailable { reason, .. } => {
+                    // A stale snapshot is an error, not a missing route.
+                    if let Err(message) = self.check_element_snapshot(
+                        "scroll",
+                        params.snapshot_id.as_deref(),
+                        scroll_resolves_cached_element(&params),
+                    ) {
+                        return refused(message);
+                    }
+                    if let Some((output, notice)) =
+                        self.background_notice("scroll", &reason, received.clone())
+                    {
+                        return (Json(output), PostActionScope::default(), Some(notice));
+                    }
+                    params.delivery = None;
+                    report = Some(BackgroundReport::focused());
+                }
+            }
+        }
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        match self.check_element_snapshot(
+            "scroll",
+            params.snapshot_id.as_deref(),
+            scroll_resolves_cached_element(&params),
+        ) {
+            Ok(scope) => (
+                self.dispatch_checked_scroll(params, units, received.clone(), input_guard)
+                    .await,
+                scope,
+                report,
+            ),
+            Err(message) => refused(message),
+        }
+    }
+
+    /// The rest of scroll, under the input lock the caller took.
+    async fn dispatch_checked_scroll(
+        &self,
+        mut params: ScrollParams,
+        units: i32,
+        received: Option<serde_json::Value>,
+        input_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Json<ActionOutput> {
         let mut portal_target_point = None;
         let mut owner_target = ElementOwnerTarget::pid(params.pid);
         // Raise/focus the target window first (parity with click) so wheel
@@ -1972,7 +2632,7 @@ impl ComputerUseLinux {
                 window_target = Some(portal_focus_target(target, &focus.requested_window));
             }
         }
-        if params.x.is_none() && params.y.is_none() {
+        if scroll_resolves_cached_element(&params) {
             if let Err(message) = self
                 .check_cached_element_target(
                     params.element_index,
@@ -2028,12 +2688,7 @@ impl ComputerUseLinux {
             }
             None => self.indicator.action("scroll").await,
         }
-        let (dx, dy) = match direction {
-            ScrollDirection::Up => (0, units),
-            ScrollDirection::Down => (0, -units),
-            ScrollDirection::Left => (units, 0),
-            ScrollDirection::Right => (-units, 0),
-        };
+        let (dx, dy) = wheel_deltas(direction, units);
         // Element centres are AT-SPI logical points; pixelflux wants capture pixels.
         let pixelflux_point = match (params.x.zip(params.y), params.element_index) {
             (None, Some(index)) if crate::pixelflux::PixelfluxConfig::from_env().is_some() => {
@@ -2066,15 +2721,11 @@ impl ComputerUseLinux {
             )
             .await
         {
-            return Json(output);
+            return Json(pointer_action_result(output));
         }
         let input_guard = Arc::try_unwrap(input_guard)
-            .unwrap_or_else(|_| panic!("pixelflux fallback must not retain dispatched input"));
+            .expect("pixelflux fallback must not retain dispatched input");
 
-        let off_screen_note = match target_point {
-            Some((x, y)) => self.off_screen_note_for_point(x, y).await,
-            None => None,
-        };
         if self.should_prefer_xdotool_pointer() {
             let repeat = u32::try_from(units.max(1)).unwrap_or(1);
             let xdotool_args = xdotool_pointer_scroll_args(target_point, repeat, direction);
@@ -2101,29 +2752,64 @@ impl ComputerUseLinux {
             if output.ok && used_xdotool {
                 output.message = "Action sent through xdotool (X11 XTEST).".to_string();
             }
+            let off_screen_note = match target_point {
+                Some((x, y)) if output.ok => {
+                    self.off_screen_note_for_point(x, y, PointerRoute::X11)
+                        .await
+                }
+                _ => None,
+            };
             return Json(with_notes(output, off_screen_note));
         }
         // Coordinate scroll needs the same accurate positioning as click. Keep
         // the move and wheel event under one cancellation-safe input guard.
+        // The device sends both, so this route needs no ydotool daemon.
         if let Some((x, y)) = target_point {
-            if self.is_wayland_session()
-                && ydotool_backend_available().await
-                && self.ensure_abs_pointer().await
-            {
+            let abs_pointer_ready = if self.is_wayland_session() {
+                match self.ensure_abs_pointer().await {
+                    Ok(ready) => ready,
+                    Err(failure) => {
+                        return Json(abs_pointer_not_sent(
+                            "scroll",
+                            &failure,
+                            self.pointer_retry_route().await,
+                            received,
+                        ))
+                    }
+                }
+            } else {
+                false
+            };
+            if abs_pointer_ready {
                 let pointer = Arc::clone(&self.abs_pointer);
                 let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
-                    let landing =
-                        run_abs_pointer(pointer, move |pointer| pointer.move_to(x, y)).await?;
-                    sleep(Duration::from_millis(35)).await;
-                    run_ydotool(&wheel_mousemove_args(dx, dy)).await?;
-                    Ok(landing)
+                    // Move and wheel must come from the same device: a wheel
+                    // event sent through ydotool right after this device jumps
+                    // the cursor can be routed with a stale pointer position
+                    // and dropped, so the window never scrolls.
+                    run_abs_pointer(pointer, move |pointer| {
+                        let landing = pointer.move_to(x, y)?;
+                        // spawn_blocking context: a blocking sleep is fine, and
+                        // it keeps the settle delay that the old ydotool path
+                        // had between motion and wheel.
+                        std::thread::sleep(Duration::from_millis(35));
+                        pointer.wheel(dx, dy)?;
+                        Ok(landing)
+                    })
+                    .await
                 })
                 .await;
                 let _input_guard = input_guard;
-                return Json(abs_pointer_result("scroll", result, received));
+                let off_screen_note = self.uinput_off_screen_note(&result).await;
+                return Json(with_notes(
+                    pointer_action_result(abs_pointer_result("scroll", result, received)),
+                    off_screen_note,
+                ));
             }
         }
+        let mut portal_start_failure = None;
         if let Some(session) = self.cached_portal_pointer_session() {
+            let portal_off_screen_note = self.portal_off_screen_note(target_point).await;
             let mapped_target = match (portal_target_point, target_point) {
                 (Some(point), _) => Some(Some(point)),
                 (None, Some((x, y))) => self.logical_portal_point(&session, x, y).map(Some),
@@ -2133,7 +2819,7 @@ impl ComputerUseLinux {
                 self.clear_portal_pointer_session(&session);
                 return Json(with_notes(
                     pointer_action_result(portal_coordinate_error("scroll", received)),
-                    off_screen_note.clone(),
+                    portal_off_screen_note.clone(),
                 ));
             };
             let session_for_input = session.clone();
@@ -2154,7 +2840,7 @@ impl ComputerUseLinux {
                             message: "Action sent through the remote desktop portal.".to_string(),
                             received,
                         }),
-                        off_screen_note.clone(),
+                        portal_off_screen_note.clone(),
                     ));
                 }
                 Err(error) => {
@@ -2165,7 +2851,7 @@ impl ComputerUseLinux {
                             anyhow::anyhow!(error),
                             received,
                         )),
-                        off_screen_note.clone(),
+                        portal_off_screen_note.clone(),
                     ));
                 }
             }
@@ -2177,6 +2863,7 @@ impl ComputerUseLinux {
                             return Json(action_result("scroll", Err(message), received));
                         }
                     }
+                    let portal_off_screen_note = self.portal_off_screen_note(target_point).await;
                     let mapped_target = match (portal_target_point, target_point) {
                         (Some(point), _) => Some(Some(point)),
                         (None, Some((x, y))) => self.logical_portal_point(&session, x, y).map(Some),
@@ -2186,7 +2873,7 @@ impl ComputerUseLinux {
                         self.clear_portal_pointer_session(&session);
                         return Json(with_notes(
                             pointer_action_result(portal_coordinate_error("scroll", received)),
-                            off_screen_note.clone(),
+                            portal_off_screen_note.clone(),
                         ));
                     };
                     let session_for_input = session.clone();
@@ -2209,7 +2896,7 @@ impl ComputerUseLinux {
                                         .to_string(),
                                     received,
                                 }),
-                                off_screen_note.clone(),
+                                portal_off_screen_note.clone(),
                             ));
                         }
                         Err(error) => {
@@ -2220,27 +2907,22 @@ impl ComputerUseLinux {
                                     anyhow::anyhow!(error),
                                     received,
                                 )),
-                                off_screen_note.clone(),
+                                portal_off_screen_note.clone(),
                             ));
                         }
                     }
                 }
-                Ok(None) => {
-                    return Json(with_notes(
-                        pointer_action_result(portal_action_error(
-                            "scroll",
-                            anyhow::anyhow!("the selected portal pointer backend was unavailable"),
-                            received,
-                        )),
-                        off_screen_note,
-                    ));
+                Ok(None) => {}
+                Err(error)
+                    if target_point.is_some()
+                        || env_flag_enabled_any(&[
+                            "COMPUTER_USE_LINUX_FORCE_PORTAL_POINTER",
+                            "CODEX_COMPUTER_USE_FORCE_PORTAL_POINTER",
+                        ]) =>
+                {
+                    return Json(portal_start_error("scroll", error, received));
                 }
-                Err(error) => {
-                    return Json(with_notes(
-                        pointer_action_result(portal_start_error("scroll", error, received)),
-                        off_screen_note,
-                    ));
-                }
+                Err(error) => portal_start_failure = Some(error),
             }
         }
         if target_point.is_some() && self.is_wayland_session() {
@@ -2261,16 +2943,29 @@ impl ComputerUseLinux {
         })
         .await;
         let _input_guard = input_guard;
+        // Outside COSMIC the portal is preferred only when ydotool looked
+        // unavailable, so this fallback usually fails too. Keep the portal
+        // error then: it may be a denied consent.
+        let off_screen_note = match target_point {
+            Some((x, y)) if result.is_ok() => {
+                self.off_screen_note_for_point(x, y, PointerRoute::X11)
+                    .await
+            }
+            _ => None,
+        };
+        let portal_note = portal_start_failure
+            .filter(|_| result.is_err())
+            .map(|error| format!("The scroll fell back to ydotool because the remote desktop portal could not start: {error:#}"));
         Json(with_notes(
             pointer_action_result(action_result("scroll", result, received)),
-            off_screen_note,
+            portal_note.into_iter().chain(off_screen_note),
         ))
     }
 
     #[tool(
         name = "drag",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ActionToolOutput>(),
-        description = "Drag from one point to another using pixel coordinates. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+        description = "Drag with the left button from one point to another in screenshot capture pixels. Takes no relative coordinates; a window target matters only with delivery=\"background\", which on GNOME and KDE Plasma Wayland drags with a virtual pen inside that window and leaves the user's pointer where it is (elsewhere the first such call returns a one-time notice, then later calls drag through the user's pointer). Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2283,9 +2978,67 @@ impl ComputerUseLinux {
         Parameters(params): Parameters<DragParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
-        let Json(output) = self.dispatch_drag(params).await;
-        self.finish_action_output(output, &capture, None, TargetRaised::Yes)
-            .await
+        let target = params.window_target();
+        let background = params.delivery == Some(KeyboardDelivery::Background);
+        if !background {
+            let Json(output) = self.dispatch_drag(params).await;
+            return self
+                .finish_action_output(
+                    output,
+                    &capture,
+                    None,
+                    TargetRaised::Yes,
+                    PostActionScope::default(),
+                )
+                .await;
+        }
+        let received = Some(serde_json::json!(params.clone()));
+        let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        let outcome = match crate::virtual_pen::availability() {
+            Ok(desktop) => {
+                self.background_pen(
+                    desktop,
+                    "drag",
+                    PenRequest::Drag {
+                        start: (params.start_x, params.start_y),
+                        end: (params.end_x, params.end_y),
+                    },
+                    target.clone(),
+                    received.clone(),
+                    input_guard,
+                )
+                .await
+            }
+            Err(reason) => {
+                drop(input_guard);
+                BackgroundOutcome::Unavailable {
+                    reason: format!("a background drag goes through the virtual pen, and {reason}"),
+                    fallback: FocusFallback::default(),
+                }
+            }
+        };
+        let (output, report) = match outcome {
+            BackgroundOutcome::Done(output, route) => (output, route.map(BackgroundReport::routed)),
+            BackgroundOutcome::Unavailable { reason, .. } => {
+                match self.background_notice("drag", &reason, received) {
+                    Some((output, notice)) => (output, Some(notice)),
+                    None => {
+                        let Json(output) = self.dispatch_drag(params).await;
+                        (output, Some(BackgroundReport::focused()))
+                    }
+                }
+            }
+        };
+        // Neither the pen nor a focused drag raises the target.
+        self.finish_background_output(
+            output,
+            &capture,
+            target.as_ref(),
+            TargetRaised::No,
+            PostActionScope::default(),
+            report,
+        )
+        .await
     }
 
     async fn dispatch_drag(&self, params: DragParams) -> Json<ActionOutput> {
@@ -2312,101 +3065,93 @@ impl ComputerUseLinux {
             )
             .await
         {
-            return Json(output);
+            return Json(pointer_action_result(output));
         }
-        let mut input_guard = Arc::try_unwrap(input_guard)
-            .unwrap_or_else(|_| panic!("pixelflux fallback must not retain dispatched input"));
+        let input_guard = Arc::try_unwrap(input_guard)
+            .expect("pixelflux fallback must not retain dispatched input");
+        let start = (params.start_x, params.start_y);
+        let end = (params.end_x, params.end_y);
 
         if self.should_prefer_xdotool_pointer() {
             let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
-                run_xdotool_drag(
-                    Path::new("xdotool"),
-                    (params.start_x, params.start_y),
-                    (params.end_x, params.end_y),
-                )
-                .await
+                run_xdotool_drag(Path::new("xdotool"), start, end).await
             })
             .await;
             let _input_guard = input_guard;
             let mut output = pointer_action_result(action_result("drag", result, received));
-            if output.ok {
-                output.message =
-                    "Drag dispatched through xdotool (X11 XTEST); verify the drop target."
-                        .to_string();
+            // A failed drag gets no note, as a failed click does.
+            if !output.ok {
+                return Json(output);
             }
-            return Json(output);
+            output.message =
+                "Drag dispatched through xdotool (X11 XTEST); verify the drop target.".to_string();
+            let notes = self
+                .drag_off_screen_notes(start, end, PointerRoute::X11)
+                .await;
+            return Json(with_notes(output, notes));
         }
         // Preferred backend: the uinput absolute pointer (accurate landing).
-        if self.ensure_abs_pointer().await {
-            let abs_pointer = Arc::clone(&self.abs_pointer);
-            let start = (params.start_x, params.start_y);
-            let end = (params.end_x, params.end_y);
-            let (returned_guard, dragged) =
-                run_cancellation_safe_guarded(input_guard, async move {
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(mut guard) = abs_pointer.lock() {
-                            let result = guard.as_mut().map(|pointer| {
-                                pointer
-                                    .drag(start, end, crate::abs_pointer::PointerButton::Left)
-                                    .map_err(|error| format!("{error:#}"))
-                            });
-                            if result.as_ref().is_some_and(Result::is_err) {
-                                guard.take();
-                            }
-                            result
-                        } else {
-                            None
-                        }
-                    })
-                    .await
-                    .ok()
-                    .flatten()
+        let abs_pointer_ready = match self.ensure_abs_pointer().await {
+            Ok(ready) => ready,
+            Err(failure) => {
+                return Json(abs_pointer_not_sent(
+                    "drag",
+                    &failure,
+                    self.pointer_retry_route().await,
+                    received,
+                ))
+            }
+        };
+        if abs_pointer_ready {
+            let pointer = Arc::clone(&self.abs_pointer);
+            let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
+                run_abs_pointer(pointer, move |pointer| {
+                    pointer.drag(start, end, crate::abs_pointer::PointerButton::Left)
                 })
-                .await;
-            let Some(returned_guard) = returned_guard else {
-                return Json(action_result("drag", Err(dragged.unwrap_err()), received));
-            };
-            input_guard = returned_guard;
-            match dragged {
-                Ok(Some(Ok(()))) => {
-                    return Json(pointer_action_result(ActionOutput {
+                .await
+            })
+            .await;
+            let _input_guard = input_guard;
+            let notes = self.uinput_drag_notes(&result).await;
+            return Json(match result {
+                Ok(_) => with_notes(
+                    pointer_action_result(ActionOutput {
                         ok: true,
                         implemented: true,
                         action: "drag".to_string(),
                         message: "Action sent through the uinput absolute pointer.".to_string(),
                         received,
-                    }));
-                }
-                Ok(Some(Err(error))) => {
-                    return Json(action_result(
-                        "drag",
-                        Err(format!(
-                            "uinput drag may have started before it failed; the device was invalidated and input was not replayed through another backend: {error}"
-                        )),
-                        received,
-                    ));
-                }
-                Ok(None) => {}
-                Err(_) => unreachable!("missing guard already handled the guarded task failure"),
-            }
+                    }),
+                    notes,
+                ),
+                Err(error) => abs_pointer_error("drag", error, received),
+            });
         }
+        // A portal release guard holds a clone, so a cancelled action keeps
+        // the lock until its button is up; this one keeps it until a failed
+        // session is cleared.
+        let input_guard = InputOperationGuard::new(input_guard);
         if let Some(session) = self.cached_portal_pointer_session() {
             let _ = self.capture_space_rect().await;
-            let Some((start_x, start_y)) =
-                self.logical_portal_point(&session, params.start_x, params.start_y)
+            // The portal sends nothing unless both endpoints are on a shared
+            // monitor, so the notes say which endpoint stopped it.
+            let portal_notes = self
+                .drag_off_screen_notes(start, end, PointerRoute::Portal)
+                .await;
+            let Some((start_x, start_y)) = self.logical_portal_point(&session, start.0, start.1)
             else {
                 self.clear_portal_pointer_session(&session);
-                return Json(pointer_action_result(portal_coordinate_error(
-                    "drag", received,
-                )));
+                return Json(with_notes(
+                    pointer_action_result(portal_coordinate_error("drag", received)),
+                    portal_notes,
+                ));
             };
-            let Some((end_x, end_y)) =
-                self.logical_portal_point(&session, params.end_x, params.end_y)
-            else {
+            let Some((end_x, end_y)) = self.logical_portal_point(&session, end.0, end.1) else {
                 self.clear_portal_pointer_session(&session);
-                return Json(pointer_action_result(portal_coordinate_error(
-                    "drag", received,
-                )));
+                return Json(with_notes(
+                    pointer_action_result(portal_coordinate_error("drag", received)),
+                    portal_notes,
+                ));
             };
             match portal_drag(
                 &session,
@@ -2414,45 +3159,53 @@ impl ComputerUseLinux {
                 start_y,
                 end_x,
                 end_y,
-                InputOperationGuard::new(input_guard),
+                input_guard.clone(),
             )
             .await
             {
                 Ok(()) => {
-                    return Json(pointer_action_result(ActionOutput {
-                        ok: true,
-                        implemented: true,
-                        action: "drag".to_string(),
-                        message: "Action sent through the remote desktop portal.".to_string(),
-                        received,
-                    }));
+                    return Json(with_notes(
+                        pointer_action_result(ActionOutput {
+                            ok: true,
+                            implemented: true,
+                            action: "drag".to_string(),
+                            message: "Action sent through the remote desktop portal.".to_string(),
+                            received,
+                        }),
+                        portal_notes,
+                    ));
                 }
                 Err(error) => {
                     self.clear_portal_pointer_session(&session);
-                    return Json(pointer_action_result(portal_action_error(
-                        "drag", error, received,
-                    )));
+                    return Json(with_notes(
+                        pointer_action_result(portal_action_error("drag", error, received)),
+                        portal_notes,
+                    ));
                 }
             }
         } else if self.should_prefer_portal_pointer_backend().await {
             let _ = self.capture_space_rect().await;
             match self.ensure_portal_pointer_session().await {
                 Ok(Some(session)) => {
+                    let portal_notes = self
+                        .drag_off_screen_notes(start, end, PointerRoute::Portal)
+                        .await;
                     let Some((start_x, start_y)) =
-                        self.logical_portal_point(&session, params.start_x, params.start_y)
+                        self.logical_portal_point(&session, start.0, start.1)
                     else {
                         self.clear_portal_pointer_session(&session);
-                        return Json(pointer_action_result(portal_coordinate_error(
-                            "drag", received,
-                        )));
+                        return Json(with_notes(
+                            pointer_action_result(portal_coordinate_error("drag", received)),
+                            portal_notes,
+                        ));
                     };
-                    let Some((end_x, end_y)) =
-                        self.logical_portal_point(&session, params.end_x, params.end_y)
+                    let Some((end_x, end_y)) = self.logical_portal_point(&session, end.0, end.1)
                     else {
                         self.clear_portal_pointer_session(&session);
-                        return Json(pointer_action_result(portal_coordinate_error(
-                            "drag", received,
-                        )));
+                        return Json(with_notes(
+                            pointer_action_result(portal_coordinate_error("drag", received)),
+                            portal_notes,
+                        ));
                     };
                     match portal_drag(
                         &session,
@@ -2460,59 +3213,59 @@ impl ComputerUseLinux {
                         start_y,
                         end_x,
                         end_y,
-                        InputOperationGuard::new(input_guard),
+                        input_guard.clone(),
                     )
                     .await
                     {
                         Ok(()) => {
-                            return Json(pointer_action_result(ActionOutput {
-                                ok: true,
-                                implemented: true,
-                                action: "drag".to_string(),
-                                message: "Action sent through the remote desktop portal."
-                                    .to_string(),
-                                received,
-                            }));
+                            return Json(with_notes(
+                                pointer_action_result(ActionOutput {
+                                    ok: true,
+                                    implemented: true,
+                                    action: "drag".to_string(),
+                                    message: "Action sent through the remote desktop portal."
+                                        .to_string(),
+                                    received,
+                                }),
+                                portal_notes,
+                            ));
                         }
                         Err(error) => {
                             self.clear_portal_pointer_session(&session);
-                            return Json(pointer_action_result(portal_action_error(
-                                "drag", error, received,
-                            )));
+                            return Json(with_notes(
+                                pointer_action_result(portal_action_error("drag", error, received)),
+                                portal_notes,
+                            ));
                         }
                     }
                 }
-                Ok(None) => {
-                    return Json(pointer_action_result(portal_action_error(
-                        "drag",
-                        anyhow::anyhow!("the selected portal pointer backend was unavailable"),
-                        received,
-                    )));
-                }
-                Err(error) => {
-                    return Json(pointer_action_result(portal_start_error(
-                        "drag", error, received,
-                    )));
-                }
+                Ok(None) => {}
+                Err(error) => return Json(portal_start_error("drag", error, received)),
             }
         }
         if self.is_wayland_session() {
             return Json(unsafe_pointer_fallback("drag", received));
         }
         let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
-            run_ydotool_drag(params.start_x, params.start_y, params.end_x, params.end_y).await
+            run_ydotool_drag(start.0, start.1, end.0, end.1).await
         })
         .await;
         let _input_guard = input_guard;
-        Json(pointer_action_result(action_result(
-            "drag", result, received,
-        )))
+        let output = pointer_action_result(action_result("drag", result, received));
+        // Not Wayland, so this is the X11 route, as for click.
+        let notes = if output.ok {
+            self.drag_off_screen_notes(start, end, PointerRoute::X11)
+                .await
+        } else {
+            Vec::new()
+        };
+        Json(with_notes(output, notes))
     }
 
     #[tool(
         name = "press_key",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ActionToolOutput>(),
-        description = "Press a key or key-combination on the keyboard, optionally after focusing a target window or terminal selector. Key grammar (case-insensitive; hyphens/spaces ignored): combos join with '+', e.g. Ctrl+L or Ctrl+Shift+T. Modifiers: ctrl/control, alt/option, shift, meta/super/cmd/command. Named keys: enter/return, escape/esc, tab, backspace, delete/del, space, home, end, pageup, pagedown, arrowleft/left, arrowright/right, arrowup/up, arrowdown/down, f1-f12. Plus single US letters a-z and digits 0-9. Anything else returns an error (never silently dropped). On Wayland, chords are sent through an active remote desktop portal keyboard session when one is available (or when ydotool is absent), falling back to ydotool otherwise. When ydotool is absent and the session has no RemoteDesktop portal (for example wlroots compositors), chords go through wtype instead. Portal chords send modifiers and named keys as keysyms so remapped keys (e.g. Caps Lock swapped with Control) follow the active keymap; letters and digits are physical US positions. Note: compositor-level shortcuts (e.g. Super+Up) may be consumed by GNOME before reaching the app. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+        description = "Press a key or key-combination on the keyboard, optionally after focusing a target window or terminal selector. Key grammar (case-insensitive; hyphens/spaces ignored): combos join with '+', e.g. Ctrl+L or Ctrl+Shift+T. Modifiers: ctrl/control, alt/option, shift, meta/super/cmd/command. Named keys: enter/return, kp_enter (keypad Enter), escape/esc, tab, backspace, delete/del, space, home, end, pageup, pagedown, arrowleft/left, arrowright/right, arrowup/up, arrowdown/down, f1-f12. Plus single US letters a-z and digits 0-9. Anything else returns an error (never silently dropped). With PIXELFLUX_CU and PIXELFLUX_CU_TOKEN set, chords go to pixelflux. An unreachable pixelflux falls through to the routes below; a pixelflux error does not. On X11, chords go through xdotool (XTEST), or ydotool when xdotool is missing or cannot start. On Wayland, chords are sent through an active remote desktop portal keyboard session when one is available (or when ydotool is absent), falling back to ydotool otherwise. When ydotool is absent and the session has no RemoteDesktop portal (for example wlroots compositors), chords go through wtype instead. Portal chords send modifiers and named keys as keysyms so remapped keys (e.g. Caps Lock swapped with Control) follow the active keymap; letters and digits are physical US positions. On KDE Plasma every key in a portal chord is a physical keycode. Note: compositor-level shortcuts (e.g. Super+Up) may be consumed by GNOME before reaching the app. Pass delivery=\"background\" (the default when an element or browser_tab is named) to leave the user's keyboard focus alone: input goes to a named element through AT-SPI, to a browser tab over a DevTools port the user opened (CODEX_COMPUTER_USE_DEVTOOLS), or to a terminal's program through tmux; when no route serves the target (the reason says which setting or desktop would open one), the first such call in a server session sends nothing and returns a notice (background.retry_to_continue=true); repeating it, and every later such call, goes through normal focused input and reports background.used=false. The result's background field names the route used. On an element, only keys that mean an action map (Enter or space on a button or menu item, space on a check box, radio button or toggle, Enter on a link or a single-line field with an activate action); others have no route there. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2526,17 +3279,89 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.window_target();
-        let Json(output) = self.dispatch_press_key(params).await;
-        let raised = keyboard_target_raised(&target);
-        self.finish_action_output(output, &capture, Some(&target), raised)
-            .await
+        let (output, raised, report, shown) = match params.background.background() {
+            Ok(false) => {
+                let raised = keyboard_target_raised(&target);
+                (
+                    self.dispatch_press_key(params).await.0,
+                    raised,
+                    None,
+                    target,
+                )
+            }
+            Err(message) => {
+                let received = Some(serde_json::json!(params.clone()));
+                (
+                    action_result("press_key", Err(message), received),
+                    TargetRaised::No,
+                    None,
+                    target,
+                )
+            }
+            Ok(true) => {
+                let received = Some(serde_json::json!(params.clone()));
+                match self
+                    .dispatch_background_keyboard(
+                        BackgroundInput::Key(&params.key),
+                        &target,
+                        &params.background,
+                        received.clone(),
+                    )
+                    .await
+                {
+                    BackgroundOutcome::Done(output, route) => (
+                        output,
+                        TargetRaised::No,
+                        route.map(BackgroundReport::routed),
+                        target,
+                    ),
+                    BackgroundOutcome::Unavailable { reason, fallback } => {
+                        if let Some((output, notice)) =
+                            self.background_notice("press_key", &reason, received.clone())
+                        {
+                            (output, TargetRaised::No, Some(notice), target)
+                        } else if let Err(message) = self.focus_fallback_element(&fallback).await {
+                            (
+                                action_result("press_key", Err(message), received),
+                                TargetRaised::No,
+                                Some(BackgroundReport::focused()),
+                                target,
+                            )
+                        } else {
+                            let mut focused = PressKeyParams {
+                                background: BackgroundKeyboardParams::default(),
+                                ..params.clone()
+                            };
+                            focused.set_window_target(&fallback.target);
+                            let raised = keyboard_target_raised(&fallback.target);
+                            let Json(mut output) = self.dispatch_press_key(focused).await;
+                            output.received = received;
+                            (
+                                output,
+                                raised,
+                                Some(BackgroundReport::focused()),
+                                fallback.target,
+                            )
+                        }
+                    }
+                }
+            }
+        };
+        self.finish_background_output(
+            output,
+            &capture,
+            Some(&shown),
+            raised,
+            PostActionScope::default(),
+            report,
+        )
+        .await
     }
 
     async fn dispatch_press_key(&self, params: PressKeyParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let input_guard =
             InputOperationGuard::new(Arc::clone(&self.input_operation_lock).lock_owned().await);
-        let window_target = params.window_target();
         if let Some(output) = self
             .hyprland_background_input(
                 "press_key",
@@ -2556,7 +3381,7 @@ impl ComputerUseLinux {
         {
             return Json(output);
         }
-        let focus = match self.focus_target_for_input(&window_target).await {
+        let focus = match self.focus_target_for_input(&params.window_target()).await {
             Ok(focus) => focus,
             Err(message) => {
                 return Json(ActionOutput {
@@ -2594,7 +3419,7 @@ impl ComputerUseLinux {
             }
         }
         let input_guard = Arc::try_unwrap(input_guard)
-            .unwrap_or_else(|_| panic!("pixelflux fallback must not retain dispatched input"));
+            .expect("pixelflux fallback must not retain dispatched input");
 
         let route = self.chord_route().await;
         if route == ChordRoute::Wtype {
@@ -2662,7 +3487,10 @@ impl ComputerUseLinux {
                                 .collect();
                             (modifiers, PortalKey::Keycode(i32::from(chord_key)))
                         });
-                    match press_key_chord(&session, &modifiers, key, Some(input_guard)).await {
+                    // The release cleanup holds a clone, so a cancelled chord
+                    // keeps the lock until its keys are up; this one keeps it
+                    // through the landing notes.
+                    match press_key_chord(&session, &modifiers, key, input_guard.clone()).await {
                         Ok(()) => {
                             let notes = self.input_landing_notes(focus.as_ref(), false).await;
                             return Json(with_notes(
@@ -2686,22 +3514,8 @@ impl ComputerUseLinux {
                         }
                     }
                 }
-                Ok(None) => {
-                    return Json(action_result_with_focus(
-                        "press_key",
-                        Err("the selected portal keyboard backend was unavailable; input was not replayed through another backend".to_string()),
-                        received,
-                        focus,
-                    ));
-                }
-                Err(error) => {
-                    return Json(action_result_with_focus(
-                        "press_key",
-                        Err(format!("remote desktop portal keyboard initialization failed; input was not replayed through another backend: {error:#}")),
-                        received,
-                        focus,
-                    ));
-                }
+                Ok(None) => {}
+                Err(error) => return Json(portal_start_error("press_key", error, received)),
             }
         }
         let Some(key_events) = key_sequence(&params.key) else {
@@ -2713,6 +3527,9 @@ impl ComputerUseLinux {
                 received,
             });
         };
+        // X11: prefer xdotool/XTEST. ydotool's raw evdev scancodes get
+        // re-mapped by the active XKB layout on X11, so named keys and chords
+        // arrive as stray glyphs instead of real key events (issue #58).
         if self.should_prefer_xdotool_keyboard() {
             if let Some(spec) = xdotool_key_spec(&params.key) {
                 let xdotool_args = vec!["key".to_string(), "--clearmodifiers".to_string(), spec];
@@ -2779,7 +3596,7 @@ impl ComputerUseLinux {
     #[tool(
         name = "type_text",
         output_schema = rmcp::handler::server::tool::schema_for_output::<ActionToolOutput>(),
-        description = "Type literal text using keyboard input, optionally after focusing a target window or terminal selector. Success confirms dispatch, not field-content verification; re-observe the target before retrying. X11 xdotool can silently substitute symbols under non-US or changing XKB layouts; inspect the text before pressing Enter or submitting it. The wtype backend rejects NUL and text over 131071 UTF-8 bytes before focus or indicators; Hyprland rejects confirmed password fields; ambiguous fields and terminals use private stdin for at most 100 Unicode characters per call. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+        description = "Type literal text using keyboard input, optionally after focusing a target window or terminal selector. Keyboard success confirms dispatch, not field-content verification; re-observe the target before retrying. On GNOME, when a configured keyboard layout group cannot type a character of the text, the text goes into the focused editable field of the verified target window through AT-SPI EditableText instead: inserted at the caret, replacing a selection, and reported as ok only when the field reads it back with the rest unchanged. Password fields, text with a newline, tab or other control character, and focus outside an editable field of that active window keep the refusal. Pass delivery=\"background\" (the default when an element or browser_tab is named) to leave the user's keyboard focus alone: input goes to a named element through AT-SPI, to a browser tab over a DevTools port the user opened (CODEX_COMPUTER_USE_DEVTOOLS), or to a terminal's program through tmux; when no route serves the target (the reason says which setting or desktop would open one), the first such call in a server session sends nothing and returns a notice (background.retry_to_continue=true); repeating it, and every later such call, goes through normal focused input and reports background.used=false. The result's background field names the route used. Into a named element the text goes in at its caret (or end) and must read back; a password field is filled unverified. X11 xdotool can silently substitute symbols under non-US or changing XKB layouts; inspect the text before pressing Enter or submitting it. The wtype backend rejects NUL and text over 131071 UTF-8 bytes before focus or indicators. On Hyprland, confirmed password fields are rejected, and ambiguous fields and terminals use private stdin for at most 100 Unicode characters per call. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2793,15 +3610,156 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let capture = params.capture.clone();
         let target = params.window_target();
+        let (output, raised, report, shown) = match params.background.background() {
+            Ok(false) => {
+                let raised = keyboard_target_raised(&target);
+                (self.focused_type_text(params).await, raised, None, target)
+            }
+            Err(message) => {
+                let received = Some(serde_json::json!(params.clone()));
+                (
+                    action_result("type_text", Err(message), received),
+                    TargetRaised::No,
+                    None,
+                    target,
+                )
+            }
+            Ok(true) => {
+                let received = Some(serde_json::json!(params.clone()));
+                match self
+                    .dispatch_background_keyboard(
+                        BackgroundInput::Text(&params.text),
+                        &target,
+                        &params.background,
+                        received.clone(),
+                    )
+                    .await
+                {
+                    BackgroundOutcome::Done(output, route) => (
+                        output,
+                        TargetRaised::No,
+                        route.map(BackgroundReport::routed),
+                        target,
+                    ),
+                    BackgroundOutcome::Unavailable { reason, fallback } => {
+                        if let Some((output, notice)) =
+                            self.background_notice("type_text", &reason, received.clone())
+                        {
+                            (output, TargetRaised::No, Some(notice), target)
+                        } else if let Err(message) = self.focus_fallback_element(&fallback).await {
+                            (
+                                action_result("type_text", Err(message), received),
+                                TargetRaised::No,
+                                Some(BackgroundReport::focused()),
+                                target,
+                            )
+                        } else {
+                            let mut focused = TypeTextParams {
+                                background: BackgroundKeyboardParams::default(),
+                                ..params.clone()
+                            };
+                            focused.set_window_target(&fallback.target);
+                            let raised = keyboard_target_raised(&fallback.target);
+                            let mut output = self.focused_type_text(focused).await;
+                            output.received = received;
+                            (
+                                output,
+                                raised,
+                                Some(BackgroundReport::focused()),
+                                fallback.target,
+                            )
+                        }
+                    }
+                }
+            }
+        };
+        self.finish_background_output(
+            output,
+            &capture,
+            Some(&shown),
+            raised,
+            PostActionScope::default(),
+            report,
+        )
+        .await
+    }
+
+    /// type_text through the user's keyboard focus.
+    async fn focused_type_text(&self, params: TypeTextParams) -> ActionOutput {
         let Json(mut output) = self.dispatch_type_text(params).await;
-        if output.ok {
+        if output.ok && !output.message.starts_with(TYPE_TEXT_ATSPI_ROUTE) {
             output.message.push_str(
                 " Field contents were not verified; re-observe the target before retrying.",
             );
         }
-        let raised = keyboard_target_raised(&target);
-        self.finish_action_output(output, &capture, Some(&target), raised)
-            .await
+        output
+    }
+
+    /// GNOME's portal route refused the text because a layout group lacks a
+    /// character. Insert it into the target's focused field through AT-SPI
+    /// EditableText instead, and succeed only when the field reads it back.
+    /// Every other case keeps the portal refusal.
+    async fn type_text_through_atspi(
+        &self,
+        text: &str,
+        portal_target: &WindowTarget,
+        missing: crate::keyboard_keymap::MissingLayoutKeysym,
+        refusal: String,
+        received: Option<serde_json::Value>,
+        input_guard: InputOperationGuard,
+    ) -> ActionOutput {
+        if let Some(key) = key_press_character(text) {
+            return action_result(
+                "type_text",
+                Err(type_text_control_character_refusal(&refusal, key)),
+                received,
+            );
+        }
+        let focus = match self.focus_target_for_input(portal_target).await {
+            Ok(focus) => focus,
+            Err(message) => {
+                return action_result(
+                    "type_text",
+                    Err(format!("{refusal} No AT-SPI text fallback: {message}")),
+                    received,
+                )
+            }
+        };
+        // The window the compositor verified as focused: the field must be in it.
+        let window = focus.as_ref().map(|focus| {
+            focus
+                .focused_window
+                .as_ref()
+                .unwrap_or(&focus.requested_window)
+        });
+        let title = window.and_then(|window| window.title.clone());
+        let Some(pid) = window.and_then(|window| window.pid) else {
+            return action_result_with_focus(
+                "type_text",
+                Err(format!(
+                    "{refusal} No AT-SPI text fallback: the target window has no process id to find its focused field."
+                )),
+                received,
+                focus,
+            );
+        };
+        // A selection replace is DeleteText then InsertText. Finish both even
+        // if this call is cancelled, and hold the input lock until they end.
+        let owned_text = text.to_string();
+        let (_guard, insert) = run_cancellation_safe_guarded(input_guard, async move {
+            crate::atspi_tree::insert_text_at_focus(pid, title.as_deref(), &owned_text).await
+        })
+        .await;
+        let insert = insert.unwrap_or_else(|error| {
+            Ok(FocusedTextInsert::EditFailed {
+                reason: error,
+                may_have_changed: true,
+            })
+        });
+        match type_text_atspi_result(&refusal, missing, text, insert) {
+            Ok(message) => successful_action_with_focus("type_text", &message, received, focus),
+            Err(message) => action_result_with_focus("type_text", Err(message), received, focus),
+        }
     }
 
     async fn dispatch_type_text(&self, params: TypeTextParams) -> Json<ActionOutput> {
@@ -2882,7 +3840,7 @@ impl ComputerUseLinux {
             return Json(output);
         }
         let mut input_guard = Arc::try_unwrap(input_guard)
-            .unwrap_or_else(|_| panic!("pixelflux fallback must not retain dispatched input"));
+            .expect("pixelflux fallback must not retain dispatched input");
 
         if self.should_prefer_kde_clipboard_text_backend() {
             let portal_target = match self
@@ -2913,6 +3871,9 @@ impl ComputerUseLinux {
                     let session_for_input = session.clone();
                     let text = params.text.clone();
                     let portal_operation_guard = input_guard.clone();
+                    // The paste puts the user's clipboard back after the
+                    // shortcut. Run it to the end even if this call is
+                    // cancelled, and hold both locks until it has.
                     let (guards, guarded_result) =
                         run_cancellation_safe_guarded((input_guard, clipboard_guard), async move {
                             run_kde_clipboard_paste_text(
@@ -2966,26 +3927,13 @@ impl ComputerUseLinux {
                         }
                     }
                 }
-                Ok(None) => {
-                    return Json(action_result_with_focus(
-                        "type_text",
-                        Err("the selected KDE portal keyboard backend was unavailable; input was not replayed through another backend".to_string()),
-                        received,
-                        focus,
-                    ));
-                }
-                Err(error) => {
-                    return Json(action_result_with_focus(
-                        "type_text",
-                        Err(format!("KDE portal keyboard initialization failed; input was not replayed through another backend: {error:#}")),
-                        received,
-                        focus,
-                    ));
-                }
+                Ok(None) => {}
+                Err(error) => return Json(portal_start_error("type_text", error, received)),
             }
         }
         if self.should_prefer_portal_text_backend() {
             let mut focus = focus;
+            let mut layout_refusal = None;
             let result = async {
                 let portal_target = self
                     .portal_keyboard_target(&window_target, focus.as_ref())
@@ -2994,9 +3942,15 @@ impl ComputerUseLinux {
                 let keysyms = keysyms_for_text(&params.text)
                     .map_err(|error| format!("Literal text was not sent: {error:#}"))?;
                 if self.is_gnome_wayland_session() {
-                    crate::keyboard_keymap::validate_gnome_text(&params.text, &keysyms)
-                        .await
-                        .map_err(|error| format!("Literal text was not sent: {error:#}"))?;
+                    if let Err(error) =
+                        crate::keyboard_keymap::validate_gnome_text(&params.text, &keysyms).await
+                    {
+                        let message = format!("Literal text was not sent: {error:#}");
+                        if let Some(missing) = atspi_fallback_trigger(&error) {
+                            layout_refusal = Some((portal_target, missing, message.clone()));
+                        }
+                        return Err(message);
+                    }
                 }
                 let session = self
                     .ensure_portal_keyboard_session()
@@ -3006,7 +3960,7 @@ impl ComputerUseLinux {
                         "Portal keyboard input is unavailable; no text was sent.".to_string()
                     })?;
                 focus = self.focus_target_for_input(&portal_target).await?;
-                type_text_with_keysyms(&session, &keysyms, Some(input_guard))
+                type_text_with_keysyms(&session, &keysyms, input_guard.clone())
                     .await
                     .map_err(|error| {
                         self.clear_portal_keyboard_session(&session);
@@ -3014,6 +3968,19 @@ impl ComputerUseLinux {
                     })
             }
             .await;
+            if let Some((portal_target, missing, refusal)) = layout_refusal {
+                return Json(
+                    self.type_text_through_atspi(
+                        &params.text,
+                        &portal_target,
+                        missing,
+                        refusal,
+                        received,
+                        input_guard,
+                    )
+                    .await,
+                );
+            }
             return Json(match result {
                 Ok(()) => {
                     let notes = self.input_landing_notes(focus.as_ref(), true).await;
@@ -3030,6 +3997,9 @@ impl ComputerUseLinux {
                 Err(error) => action_result_with_focus("type_text", Err(error), received, focus),
             });
         }
+        // X11: xdotool type resolves keysyms against the live XKB layout.
+        // ydotool's raw scancodes get re-mapped by X11 and mangle symbols and
+        // digits (`_` → `%`, `1` → `+`) even on a plain US layout (issue #58).
         if self.should_prefer_xdotool_keyboard() {
             let delay_ms = xdotool_type_delay_ms();
             let args = xdotool_type_args_with_delay(&params.text, delay_ms);
@@ -3122,7 +4092,7 @@ impl ComputerUseLinux {
     #[tool(
         name = "move_window",
         output_schema = rmcp::handler::server::tool::schema_for_output::<WindowGeometryToolOutput>(),
-        description = "Move a window to a new desktop position (frame top-left in desktop coordinates). Useful to recover windows that are partially off-screen. Works through the Codex GNOME Shell extension or a generic X11/EWMH window manager (wmctrl). Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+        description = "Move a window to a new desktop position (frame top-left in desktop coordinates). Useful to recover windows that are partially off-screen. Works only through the Codex GNOME Shell extension or a generic X11/EWMH window manager (wmctrl); other window backends refuse it. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3150,7 +4120,7 @@ impl ComputerUseLinux {
     #[tool(
         name = "resize_window",
         output_schema = rmcp::handler::server::tool::schema_for_output::<WindowGeometryToolOutput>(),
-        description = "Resize a window to a new frame width/height in desktop pixels, unmaximizing it first if needed. Useful to fit a window fully on-screen. Works through the Codex GNOME Shell extension or a generic X11/EWMH window manager (wmctrl). Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
+        description = "Resize a window in desktop pixels, unmaximizing it first if needed. Useful to fit a window fully on-screen. Through the Codex GNOME Shell extension, width and height set the frame; through a generic X11/EWMH window manager (wmctrl), they set the client area, and decorations add to it. Other window backends refuse it. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to return post-action observation in the same result.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3183,12 +4153,40 @@ impl ComputerUseLinux {
     // The rmcp tool_handler macro only accepts a string literal here, so this
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
-    version = "0.7.38",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send literal type_text through KDE clipboard integration on Plasma Wayland, wtype on compatible Wayland compositors, or portal keysyms on other Wayland sessions. Portal text startup or conversion failures return an error without replaying through ydotool. GNOME preflights the complete text against every configured keyboard layout group because the background reader cannot establish the active group; rejected text can use set_value on an editable field. Raw ydotool text is limited to printable ASCII, tab and newline, uses US physical key positions, and requires checking the resulting field contents under the active layout. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Mutating tools (click, type_text, press_key, scroll, drag, perform_action, set_value, activate_window, move_window, resize_window) accept optional screenshot_after (true, \"screen\", or \"window\") with format/quality/scale/max_width/max_height/max_bytes and optional include_tree=true to return post-action observation in the same tool call. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when a concrete non-terminal focus is not editable. Exact window focus alone does not suppress a missing-focus warning; only a complete scoped tree containing window/menu chrome without content makes it informational. Terminals accept keyboard input without an EditableText interface. On Hyprland, wtype uses a single literal argument after -- to avoid stdin keymap-refresh corruption; text is visible in process arguments, so confirmed password fields are rejected (use set_value). Terminals and ambiguous fields, with or without AT-SPI, use private stdin for at most 100 Unicode characters per call; split larger input into smaller calls or expose accessibility. Input classification has its own 1500 ms budget, independent of the 250 ms cosmetic indicator timeout. Other compatible compositors retain stdin. The wtype path rejects NUL and more than 131071 UTF-8 bytes before focus or indicators. X11 xdotool can silently substitute symbols under non-US XKB layouts (reported with br/ABNT2) or changing keymap state; inspect the text before pressing Enter or submitting it. A successful type_text result confirms dispatch only; every text backend leaves field contents unverified. Re-observe the target before retrying. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block and compact tree nodes (null, empty and default fields left out, actions listed by name) by default; pass verbose=true for the full diagnostics dump and full nodes. Pass interactive_only=true to get only nodes with an action, editable text or a value, plus headings, status/live regions, windows and dialogs; containers are collapsed and element_index values match the full tree. A title or window_id target narrows an app that exposes several windows under one AT-SPI application root (Chromium) to that window's subtree, keeping the app's popups and dialogs. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, read, or time budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 10000 and 64), not by lowering max_nodes. A compacted tree too large to return inline comes back as its leading nodes plus accessibility_tree_spill.path, a private JSON file with the whole tree and the same element_index values; search that file instead of requesting the tree again, or page through it with get_tree_page when files are not readable. Electron apps with only window/menu chrome may need --force-renderer-accessibility to expose renderer content. run_shell is absent unless CODEX_COMPUTER_USE_ENABLE_SHELL=1 or the standalone COMPUTER_USE_LINUX_ENABLE_SHELL=1 compatibility alias; when enabled it is same-user arbitrary host execution, not a sandbox, and hosts should require explicit approval."
+    version = "0.7.59",
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If readiness reports can_query_windows or can_focus_windows false on GNOME, call setup_window_targeting to install the GNOME Shell extension, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend captures size-bounded screenshots (pixelflux when configured, GNOME Shell, the Codex GNOME Shell extension, the XDG portal, native X11, gnome-screenshot; grim in Hyprland background mode), reads AT-SPI trees with action/value metadata, invokes native AT-SPI actions, sets AT-SPI values or editable text, lists and focuses compositor windows through registered Linux window backends when the session permits it, and attaches best-effort terminal tty/process metadata to terminal windows. Click, scroll and drag try pixelflux when configured, xdotool on native X11, the uinput pointer, the RemoteDesktop portal (an open portal session, or when ydotool is absent, on COSMIC, or when forced), then ydotool outside Wayland. On Wayland a point never goes through ydotool: without uinput or the portal a coordinate action is refused; a coordinate scroll sends the move and the wheel through the uinput pointer, and an untargeted scroll sends the wheel through ydotool, or the portal without its daemon. The uinput pointer is sized to the latest full screenshot; take a new one after the desktop size changes. type_text sends literal text through pixelflux when configured (an unreachable pixelflux falls through), KDE clipboard paste on Plasma Wayland (raw ydotool when Klipper cannot be read), wtype on compatible Wayland compositors, portal keysyms on other Wayland sessions, or xdotool on X11. Portal text startup or conversion failures return an error without replaying through ydotool. GNOME preflights the complete text against every configured keyboard layout group because the background reader cannot establish the active group; rejected text goes into the target's focused editable field through AT-SPI EditableText and must read back, and otherwise can use set_value on an editable field. Raw ydotool text is limited to printable ASCII, tab and newline, uses US physical key positions, and requires checking the resulting field contents under the active layout. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Mutating tools (click, type_text, press_key, scroll, drag, perform_action, set_value, activate_window, move_window, resize_window) accept optional screenshot_after (true, \"screen\", or \"window\") with format/quality/scale/max_width/max_height/max_bytes, optional screenshot_file_path (an absolute path to a new file, stdio only, refused over HTTP) to save the screenshot there instead of returning image content, and optional include_tree=true to return post-action observation in the same tool call. A failed action returns no observation, except set_value with verified=false. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. Pass that result's snapshot_id with the index or selector: each get_app_state or include_tree tree replaces the cached one, and a call naming a replaced snapshot is refused before any input. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable); type_text also warns when a concrete non-terminal focus is not editable. Exact window focus alone does not suppress a missing-focus warning; only a complete scoped tree containing window/menu chrome without content makes it informational. Terminals accept keyboard input without an EditableText interface. On Hyprland, wtype passes classified nonsecret text as one literal argument after -- to avoid stdin keymap-refresh corruption; that text is visible in process arguments, so confirmed password fields are rejected (use set_value), and terminals and ambiguous fields, with or without AT-SPI, use private stdin for at most 100 Unicode characters per call (split larger input or expose accessibility). Input classification has its own 1500 ms budget, independent of the 250 ms cosmetic indicator timeout. Other compatible compositors retain stdin. The wtype path rejects NUL and more than 131071 UTF-8 bytes before focus or indicators. X11 xdotool can silently substitute symbols under non-US XKB layouts (reported with br/ABNT2) or changing keymap state; inspect the text before pressing Enter or submitting it. A successful type_text result through a keyboard backend confirms dispatch only and leaves field contents unverified; only the GNOME AT-SPI fallback reads the field back. Re-observe the target before retrying. Screenshot, keyboard and move/resize results warn when the target window is partly or fully off-screen; click, scroll and drag results warn when a coordinate is off the screenshot or between monitors (not through pixelflux, and not for KWin element clicks, which KWin maps onto an output). move_window and resize_window, which bring a window back on-screen, work only through the GNOME Shell extension or X11/EWMH (wmctrl). scroll accepts the same window targeting and relative coordinates as click; on both, a window target is raised and focused first, and nothing is sent when focus cannot be verified. get_app_state returns a compact readiness block and compact tree nodes (null, empty and default fields left out, actions listed by name) by default; pass verbose=true for the full diagnostics dump and full nodes. Pass interactive_only=true to get only nodes with an action, editable text or a value, plus headings, status/live regions, windows and dialogs; containers are collapsed and element_index values match the full tree. A title or window_id target narrows an app that exposes several windows under one AT-SPI application root (Chromium) to that window's subtree, keeping the app's popups and dialogs. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, read, or time budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 10000 and 64), not by lowering max_nodes. A compacted tree too large to return inline comes back as its leading nodes plus accessibility_tree_spill.path, a private JSON file with the whole tree and the same element_index values; search that file instead of requesting the tree again, or page through it with get_tree_page when files are not readable. Electron apps with only window/menu chrome may need --force-renderer-accessibility to expose renderer content. run_shell is absent unless CODEX_COMPUTER_USE_ENABLE_SHELL=1 or the standalone COMPUTER_USE_LINUX_ENABLE_SHELL=1 compatibility alias; when enabled it is same-user arbitrary host execution, not a sandbox, and hosts should require explicit approval."
 )]
-impl ServerHandler for ComputerUseLinux {}
+impl ServerHandler for ComputerUseLinux {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        // Each HTTP client names itself per request; a shared field would show the last to initialize.
+        let agent = crate::indicator::request_agent_name(&context.meta, context.client_info());
+        let router = self.mcp_tool_router();
+        // A bad screenshot_file_path is refused before any capture or input,
+        // so a mutating tool never acts and then drops its observation.
+        let accepts_file = router.get(&request.name).is_some_and(|tool| {
+            tool.input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|properties| properties.contains_key("screenshot_file_path"))
+        });
+        if let Some(refusal) = screenshot_file_refusal(
+            &request.name,
+            request.arguments.as_ref(),
+            accepts_file,
+            self.http_transport,
+        ) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(refusal)]).into());
+        }
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        crate::indicator::with_request_agent(agent, router.call(call)).await
+    }
+}
 
-fn shell_execution_enabled() -> bool {
+pub(crate) fn shell_execution_enabled() -> bool {
     let value = env::var(SHELL_ENABLE_ENV)
         .ok()
         .or_else(|| env::var(SHELL_ENABLE_ENV_STANDALONE).ok());
@@ -3215,6 +4213,48 @@ struct CompletionOutput {
     ok: bool,
     cue: String,
     note: String,
+}
+
+/// Why a `monitor` index cannot be cropped from a capture with this fit, or
+/// None when the capture covers the whole layout.
+fn partial_capture_monitor_refusal(fit: &crate::abs_pointer::CaptureFit) -> Option<String> {
+    match fit {
+        crate::abs_pointer::CaptureFit::WholeLayout => None,
+        crate::abs_pointer::CaptureFit::Placed(_) => Some(
+            "this capture covers one output of several, so a monitor index cannot be cropped from it; capture the full desktop instead"
+                .to_string(),
+        ),
+        crate::abs_pointer::CaptureFit::Unsupported(reason) => Some(format!(
+            "this capture cannot be placed in the output layout ({reason}); capture the full desktop instead"
+        )),
+    }
+}
+
+/// The size of a new full capture, for the paths that only need to know
+/// what the capture covers.
+async fn raw_capture_size() -> Option<(u32, u32)> {
+    let capture = capture_screenshot_raw().await.ok()?;
+    Some((capture.width, capture.height))
+}
+
+/// An Umbriel window as listed for the capture a window-relative point is
+/// mapped in. `capture_rect` is that capture, taken first when the session
+/// has none yet; without one the action is refused, since bounds listed for
+/// a capture that was only assumed can be in another space.
+async fn window_for_primed_capture<L, LFut>(
+    capture_rect: impl Future<Output = Option<(i32, i32, i32, i32)>>,
+    relist: L,
+) -> std::result::Result<crate::windowing::WindowInfo, String>
+where
+    L: FnOnce(u32, u32) -> LFut,
+    LFut: Future<Output = Result<crate::windowing::WindowInfo>>,
+{
+    let (_, _, width, height) = capture_rect.await.ok_or_else(|| {
+        "Could not determine screenshot dimensions for window-relative coordinates.".to_string()
+    })?;
+    relist(width as u32, height as u32)
+        .await
+        .map_err(|error| format!("Could not read target-window bounds for this capture: {error:#}"))
 }
 
 async fn send_completion_notification(program: &Path, limit: Duration) -> CompletionOutput {
@@ -3397,7 +4437,7 @@ async fn execute_shell(params: RunShellParams) -> RunShellOutput {
         );
     }
 
-    let cwd = match fs::canonicalize(&requested_cwd) {
+    let cwd = match std::fs::canonicalize(&requested_cwd) {
         Ok(path) if path.is_dir() => path,
         Ok(_) => {
             return shell_error_output(
@@ -3476,11 +4516,21 @@ async fn execute_shell(params: RunShellParams) -> RunShellOutput {
     }
 }
 
-pub async fn serve_mcp() -> Result<()> {
-    let server = ComputerUseLinux::default();
-    let indicator = Arc::clone(&server.indicator);
+pub(crate) async fn serve_mcp(listen: Option<crate::http_listen::ListenConfig>) -> Result<()> {
+    let mut server = ComputerUseLinux::default();
     let tree_spiller = Arc::clone(&server.tree_spiller);
     tree_spiller.sweep();
+    if let Some(config) = listen {
+        server.require_snapshot_ids = true;
+        server.http_transport = true;
+        let served = crate::http_listen::serve_http(server, config).await;
+        crate::agent_seat::shutdown();
+        crate::virtual_pen::shutdown();
+        let signal = served?;
+        tree_spiller.remove_current();
+        std::process::exit(128 + signal);
+    }
+    let indicator = Arc::clone(&server.indicator);
     let running = server.serve(rmcp::transport::stdio()).await?;
     // Legacy initialization supplies the client name through the peer.
     // Discovery-only hosts use the indicator's configured name or Agent fallback.
@@ -3492,6 +4542,8 @@ pub async fn serve_mcp() -> Result<()> {
     let signal = tokio::select! {
         result = running.waiting() => {
             tree_spiller.remove_current();
+            crate::agent_seat::shutdown();
+            crate::virtual_pen::shutdown();
             result?;
             return Ok(());
         }
@@ -3499,6 +4551,8 @@ pub async fn serve_mcp() -> Result<()> {
         _ = interrupt.recv() => libc::SIGINT,
     };
     tree_spiller.remove_current();
+    crate::agent_seat::shutdown();
+    crate::virtual_pen::shutdown();
     // Exit now: returning would wait forever for the stdin reader thread.
     std::process::exit(128 + signal);
 }
@@ -3591,9 +4645,84 @@ struct PostActionCaptureParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 95))]
     quality: Option<u8>,
+    /// Save the post-action screenshot to this absolute path instead of
+    /// returning it as image content; needs screenshot_after. The parent
+    /// directory must exist, and the extension must match format (.png, or
+    /// .jpg/.jpeg for jpeg). The file must not exist: file output creates a
+    /// new file and never replaces one. Refused over HTTP (mcp --listen). A
+    /// failed write is reported in screenshot_error, and the action's ok stays
+    /// true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    screenshot_file_path: Option<String>,
     /// Include a fresh compacted AT-SPI accessibility tree snapshot after the action (default false). Also refreshes cached element_index values.
+    /// It reads at most 1000 nodes and depth 32; when accessibility_tree_truncated
+    /// is true, call get_app_state with a higher max_nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     include_tree: Option<bool>,
+}
+
+/// The fields of a tool call that decide whether its screenshot_file_path
+/// can be used.
+#[derive(Deserialize)]
+struct ScreenshotFileRequest {
+    #[serde(default)]
+    screenshot_file_path: Option<String>,
+    #[serde(default)]
+    format: Option<ScreenshotOutputFormat>,
+    #[serde(default)]
+    include_screenshot: Option<bool>,
+    #[serde(default)]
+    screenshot_after: Option<ScreenshotAfter>,
+}
+
+/// The refusal for a call whose screenshot_file_path cannot be used: over
+/// HTTP, without a capture to save, or with a path that fails
+/// `validate_screenshot_file_path`. `accepts_file` says whether the tool takes
+/// the parameter at all. Malformed arguments are left to the tool's own
+/// parameter errors.
+fn screenshot_file_refusal(
+    tool: &str,
+    arguments: Option<&rmcp::model::JsonObject>,
+    accepts_file: bool,
+    remote: bool,
+) -> Option<String> {
+    let arguments = arguments?;
+    if !accepts_file
+        || arguments
+            .get("screenshot_file_path")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return None;
+    }
+    let request: ScreenshotFileRequest =
+        serde_json::from_value(serde_json::Value::Object(arguments.clone())).ok()?;
+    let path = request.screenshot_file_path?;
+    if remote {
+        return Some(format!(
+            "{tool} was not run: {}",
+            crate::screenshot_file::REMOTE_REFUSAL
+        ));
+    }
+    let missing_capture = match tool {
+        "screenshot" => None,
+        "get_app_state" => (!request.include_screenshot.unwrap_or(true))
+            .then_some("screenshot_file_path needs include_screenshot=true"),
+        _ => request
+            .screenshot_after
+            .and_then(ScreenshotAfter::resolve)
+            .is_none()
+            .then_some("screenshot_file_path needs screenshot_after"),
+    };
+    if let Some(reason) = missing_capture {
+        return Some(format!("{tool} was not run: {reason}"));
+    }
+    crate::screenshot_file::validate_screenshot_file_path(
+        &path,
+        request.format.unwrap_or(ScreenshotOutputFormat::Png),
+        remote,
+    )
+    .err()
+    .map(|error| format!("{tool} was not run: {error:#}"))
 }
 
 impl PostActionCaptureParams {
@@ -3615,12 +4744,16 @@ impl PostActionCaptureParams {
 
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 struct PostActionObservation {
-    /// Post-action screenshot metadata when `screenshot_after` was requested; the image itself is the first `image` content block.
+    /// Post-action screenshot metadata when `screenshot_after` was requested; the image itself is the first `image` content block, or the file at `file_path` when `screenshot_file_path` was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     screenshot: Option<ScreenshotSummary>,
     /// Post-action screenshot capture error when a requested `screenshot_after` capture failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     screenshot_error: Option<String>,
+    /// Names the post-action tree, which replaced the action's snapshot. Pass
+    /// it with element_index actions on that tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<String>,
     /// Post-action compacted AT-SPI accessibility tree when `include_tree=true` was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     accessibility_tree: Option<TreeNodes>,
@@ -3644,26 +4777,45 @@ struct PostActionObservation {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ActivateWindowParams {
+    /// Window id from a recent list_windows. The first target field set
+    /// decides, in this order: window_id, terminal fields, pid, app_id,
+    /// wm_class, title. With a terminal field, pid, app_id, wm_class and title
+    /// only narrow the terminal match, which must name one window.
     #[serde(
         default,
         deserialize_with = "crate::windowing::types::deserialize_window_id"
     )]
     #[schemars(range(max = crate::windowing::types::MAX_WINDOW_ID))]
     window_id: Option<u64>,
+    /// Process id. It must match exactly one window.
     #[serde(default)]
     pid: Option<u32>,
+    /// Terminal tty: /dev/pts/N, pts/N or N.
     #[serde(default)]
     tty: Option<String>,
+    /// Pid of the shell or foreground process on a terminal's tty, not the
+    /// terminal emulator (use pid for that).
     #[serde(default)]
     terminal_pid: Option<u32>,
+    /// Substring of the command name or command line of a terminal's shell
+    /// or foreground process, ignoring ASCII case.
     #[serde(default)]
     terminal_command: Option<String>,
+    /// Working directory of a terminal's shell or foreground process: an
+    /// absolute path, or a trailing path such as project/src.
     #[serde(default)]
     terminal_cwd: Option<String>,
+    /// Application id, ignoring ASCII case: the full desktop id, or its last
+    /// dot-separated segment outside a terminal match. A segment that matches several apps is
+    /// rejected.
     #[serde(default)]
     app_id: Option<String>,
+    /// Window manager class, an exact match ignoring ASCII case. When several
+    /// windows match outside a terminal match, the first wins.
     #[serde(default)]
     wm_class: Option<String>,
+    /// Window title substring, ignoring ASCII case. When several windows
+    /// match outside a terminal match, the first wins.
     #[serde(default)]
     title: Option<String>,
     #[serde(flatten)]
@@ -3695,7 +4847,7 @@ struct ActivateWindowOutput {
     error: Option<String>,
     permissions_hint: Option<String>,
     // Echo of the request for debugging. `serde_json::Value` has no fixed JSON
-    // schema, which strict MCP clients (Claude Code) reject in `outputSchema` —
+    // schema, which strict MCP clients (Claude Code) reject in `outputSchema`,
     // and one invalid tool fails the whole tool list. Keep it in the runtime
     // response (serde) but omit it from the generated schema.
     #[schemars(skip)]
@@ -3727,9 +4879,11 @@ struct MoveWindowParams {
 struct ResizeWindowParams {
     #[serde(flatten)]
     target: ActivateWindowParams,
-    /// New frame width in desktop pixels.
+    /// New width in desktop pixels: the frame through the GNOME Shell
+    /// extension, the client area on X11/EWMH.
     width: i32,
-    /// New frame height in desktop pixels.
+    /// New height in desktop pixels: the frame through the GNOME Shell
+    /// extension, the client area on X11/EWMH.
     height: i32,
 }
 
@@ -3812,12 +4966,13 @@ struct GetAppStateParams {
     /// and scopes the tree when possible.
     #[serde(default)]
     tty: Option<String>,
-    /// Terminal emulator pid. Resolves a window target and scopes the tree when
-    /// possible.
+    /// Pid of the shell or foreground process on a terminal's tty, not the
+    /// terminal emulator (use pid for that). Resolves a window target and
+    /// scopes the tree when possible.
     #[serde(default)]
     terminal_pid: Option<u32>,
-    /// Terminal command substring. Resolves a window target and scopes the tree
-    /// when possible.
+    /// Terminal command substring, ignoring ASCII case. Resolves a window
+    /// target and scopes the tree when possible.
     #[serde(default)]
     terminal_command: Option<String>,
     /// Terminal working directory. Resolves a window target and scopes the tree
@@ -3865,6 +5020,14 @@ struct GetAppStateParams {
     #[serde(default)]
     #[schemars(range(min = 1, max = 95))]
     quality: Option<u8>,
+    /// Save the screenshot to this absolute path instead of returning it as
+    /// image content; screenshot.file_path then names it. The parent directory
+    /// must exist, and the extension must match format (.png, or .jpg/.jpeg for
+    /// jpeg). The file must not exist: file output creates a new file and
+    /// never replaces one. Refused over HTTP (mcp --listen). A failed write is
+    /// reported in screenshot_error.
+    #[serde(default)]
+    screenshot_file_path: Option<String>,
     /// Include the full diagnostics report (large) and return tree nodes in the
     /// full encoding, with null and empty fields and action descriptions and
     /// keybindings. Default false: only the compact readiness block, and
@@ -3909,18 +5072,28 @@ impl GetAppStateParams {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ScreenshotParams {
+    /// Window id from a recent list_windows. The first target field set
+    /// decides, in this order: window_id, pid, app_id, wm_class, title.
     #[serde(
         default,
         deserialize_with = "crate::windowing::types::deserialize_window_id"
     )]
     #[schemars(range(max = crate::windowing::types::MAX_WINDOW_ID))]
     window_id: Option<u64>,
+    /// Process id. It must match exactly one window.
     #[serde(default)]
     pid: Option<u32>,
+    /// Application id, ignoring ASCII case: the full desktop id, or its last
+    /// dot-separated segment. A segment that matches several apps is
+    /// rejected.
     #[serde(default)]
     app_id: Option<String>,
+    /// Window manager class, an exact match ignoring ASCII case. When several
+    /// windows match, the first wins.
     #[serde(default)]
     wm_class: Option<String>,
+    /// Window title substring, ignoring ASCII case. When several windows
+    /// match, the first wins.
     #[serde(default)]
     title: Option<String>,
     /// Raise the targeted window before capture (default true). Ignored without
@@ -3930,6 +5103,18 @@ struct ScreenshotParams {
     /// Capture the whole desktop even when a window is targeted (default false).
     #[serde(default)]
     full_screen: Option<bool>,
+    /// Capture one monitor: its 0-based index in reading order. Monitors
+    /// whose vertical ranges overlap form a row; rows go top to bottom and
+    /// each row left to right, so side-by-side monitors are numbered left to
+    /// right even when they are not top-aligned. The desktop is captured and cropped to
+    /// that monitor before any resize, so a multi-monitor span is not shrunk
+    /// to fit max_width. The caption reports monitor, monitor_count,
+    /// monitor_x and monitor_y, the monitor's origin in full-desktop
+    /// coordinates: image pixel (px, py) is click x = monitor_x + px / scale,
+    /// y = monitor_y + py / scale. Not combined with a window target. Refused
+    /// when the monitor layout cannot be read.
+    #[serde(default)]
+    monitor: Option<u32>,
     /// Maximum returned screenshot width in pixels (default 1920, hard-capped).
     #[serde(default)]
     max_width: Option<u32>,
@@ -3949,6 +5134,13 @@ struct ScreenshotParams {
     #[serde(default)]
     #[schemars(range(min = 1, max = 95))]
     quality: Option<u8>,
+    /// Save the image to this absolute path instead of returning it as image
+    /// content; the caption's file_path then names it. The parent directory
+    /// must exist, and the extension must match format (.png, or .jpg/.jpeg for
+    /// jpeg). The file must not exist: file output creates a new file and
+    /// never replaces one. Refused over HTTP (mcp --listen).
+    #[serde(default)]
+    screenshot_file_path: Option<String>,
 }
 
 impl ScreenshotParams {
@@ -3987,7 +5179,8 @@ impl ScreenshotParams {
 }
 
 /// Screenshot metadata for `get_app_state` and post-action captures. The image
-/// bytes travel as a separate `image` content block, not inside this JSON.
+/// bytes travel as a separate `image` content block (issue #145), not inside
+/// this JSON, or are saved to `file_path` (issue #446).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct ScreenshotSummary {
     mime_type: String,
@@ -4014,6 +5207,10 @@ struct ScreenshotSummary {
     /// Title of the window when cropped to a window.
     #[serde(skip_serializing_if = "Option::is_none")]
     window_title: Option<String>,
+    /// The file the image was saved to when screenshot_file_path was given;
+    /// no image content block is returned then. bytes is its size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_path: Option<String>,
 }
 
 impl From<&ScreenshotCapture> for ScreenshotSummary {
@@ -4034,13 +5231,15 @@ impl From<&ScreenshotCapture> for ScreenshotSummary {
             quality: capture.quality,
             cropped_to_window: None,
             window_title: None,
+            file_path: None,
         }
     }
 }
 
 /// Assemble a structured tool result: the screenshot (when present) as a
 /// structured image block first, then the JSON report as text and as
-/// `structured_content`. Inlining base64 made hosts treat the image as text.
+/// `structured_content`. Inlining the base64 in the JSON made hosts treat a
+/// 100KB+ image as plain text tokens (issue #145).
 fn structured_tool_result<T: Serialize>(
     output: T,
     screenshot: Option<ScreenshotCapture>,
@@ -4048,7 +5247,13 @@ fn structured_tool_result<T: Serialize>(
     let value = serde_json::to_value(&output).map_err(|error| {
         ErrorData::internal_error(format!("failed to serialize tool output: {error}"), None)
     })?;
-    let is_error = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
+    // The one-time background notice is not a failure: repeating the call
+    // delivers it.
+    let is_error = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
+        && value
+            .pointer("/background/retry_to_continue")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true);
     let mut result = CallToolResult::structured(value);
     result.is_error = Some(is_error);
     if let Some(capture) = screenshot {
@@ -4072,10 +5277,18 @@ struct GetTreePageParams {
     /// First node to return, counted from the start of the cached tree (default 0).
     #[serde(default)]
     offset: Option<usize>,
+    /// snapshot_id of the get_app_state or include_tree result being paged.
+    /// If a later snapshot replaced it, no nodes are returned.
+    #[serde(default)]
+    snapshot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct GetTreePageOutput {
+    /// The paged snapshot; pass it with element_index actions on these nodes.
+    /// Absent when no tree is cached or the named snapshot was replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<String>,
     /// Nodes from `offset`, as many as fit in one result.
     nodes: TreeNodes,
     offset: usize,
@@ -4092,6 +5305,7 @@ fn tree_page(nodes: &[AccessibilityNode], detail: NodeDetail, offset: usize) -> 
     let node_count = nodes.len();
     if node_count == 0 {
         return GetTreePageOutput {
+            snapshot_id: None,
             nodes: TreeNodes::new(Vec::new(), detail),
             offset,
             next_offset: None,
@@ -4117,6 +5331,7 @@ fn tree_page(nodes: &[AccessibilityNode], detail: NodeDetail, offset: usize) -> 
         None => format!("Offset {offset} is past the end of the {node_count}-node tree."),
     };
     GetTreePageOutput {
+        snapshot_id: None,
         nodes: TreeNodes::new(rest[..fit].to_vec(), detail),
         offset: start,
         next_offset,
@@ -4208,6 +5423,11 @@ struct GetAppStateOutput {
     /// Screenshot metadata; the image itself is the first `image` content block.
     screenshot: Option<ScreenshotSummary>,
     screenshot_error: Option<String>,
+    /// Names this result's tree. Pass it with element_index or selector
+    /// actions and get_tree_page: a call against a tree a later snapshot
+    /// replaced is refused. Absent when the tree read failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<String>,
     /// Compacted tree, or its leading nodes when the whole tree is in
     /// `accessibility_tree_spill`. Nodes use the compact encoding (empty and
     /// default fields left out, actions by name) unless verbose=true.
@@ -4245,43 +5465,78 @@ enum ClickCoordinateSpace {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ClickParams {
+    /// Element index from the latest get_app_state or include_tree snapshot.
     #[serde(default)]
     element_index: Option<u32>,
+    /// snapshot_id of the get_app_state or include_tree result the
+    /// element_index or selector comes from. If a later snapshot replaced
+    /// it, the call is refused before any input. Without it, the element
+    /// resolves in the latest snapshot.
+    #[serde(default)]
+    snapshot_id: Option<String>,
+    /// Case-insensitive substring of the element's AT-SPI role.
     #[serde(default)]
     role: Option<String>,
+    /// Case-insensitive substring of the element's accessible name.
     #[serde(default)]
     name: Option<String>,
+    /// Case-insensitive substring of the element's text, name or description.
     #[serde(default)]
     text: Option<String>,
+    /// AT-SPI states the element must all have, case-insensitive (for
+    /// example focused, checked).
     #[serde(default)]
     states: Vec<String>,
+    /// Point x in raw screenshot capture pixels: the coordinate_width and
+    /// coordinate_height space. Divide preview pixels by the screenshot scale
+    /// first. With relative=true, measured from the window screenshot's crop origin.
+    /// With coordinate_space="atspi", a global AT-SPI screen x instead.
     #[serde(default)]
     x: Option<i32>,
+    /// Point y in raw screenshot capture pixels: the coordinate_width and
+    /// coordinate_height space. Divide preview pixels by the screenshot scale
+    /// first. With relative=true, measured from the window screenshot's crop origin.
+    /// With coordinate_space="atspi", a global AT-SPI screen y instead.
     #[serde(default)]
     y: Option<i32>,
     /// Pixel space for explicit x/y: raw screenshot capture pixels (default),
     /// or global AT-SPI screen coordinates mapped through the element's KWin window.
     #[serde(default)]
     coordinate_space: ClickCoordinateSpace,
+    /// Mouse button: left (default), right or middle. side, extra, forward and
+    /// back reach only the portal and ydotool routes, which treat an unknown
+    /// name as left. Native X11 refuses any other name.
     #[serde(default)]
     button: Option<String>,
+    /// Number of clicks (default 1), clamped to 1 to 10.
     #[serde(default)]
     click_count: Option<u32>,
     // Optional window target: when set, the window is raised/focused before the
     // click so a coordinate click reliably lands on the intended app rather than
     // whatever window happens to be stacked on top at that pixel.
+    /// Window id from a recent list_windows. The first target field set
+    /// decides, in this order: window_id, pid, app_id, wm_class, window_title.
     #[serde(
         default,
         deserialize_with = "crate::windowing::types::deserialize_window_id"
     )]
     #[schemars(range(max = crate::windowing::types::MAX_WINDOW_ID))]
     window_id: Option<u64>,
+    /// Process id. It must match exactly one window.
     #[serde(default)]
     pid: Option<u32>,
+    /// Application id, ignoring ASCII case: the full desktop id, or its last
+    /// dot-separated segment. A segment that matches several apps is
+    /// rejected.
     #[serde(default)]
     app_id: Option<String>,
+    /// Window manager class, an exact match ignoring ASCII case. When several
+    /// windows match, the first wins.
     #[serde(default)]
     wm_class: Option<String>,
+    /// Window title substring, ignoring ASCII case. When several windows
+    /// match, the first wins.
+    /// This tool names the field window_title; a title field is ignored.
     #[serde(default)]
     window_title: Option<String>,
     /// Interpret `x`/`y` from the clipped window screenshot crop origin, in
@@ -4290,6 +5545,19 @@ struct ClickParams {
     /// Requires a window target; missing targets are rejected.
     #[serde(default)]
     relative: Option<bool>,
+    /// "background" sends the input through the agent's own pointer, so the
+    /// user's pointer and keyboard focus stay where they are: on X11 without
+    /// a window manager (an XInput 2 master pointer) and on sway 1.10 or later
+    /// (a transient seat). On GNOME and KDE Plasma Wayland a virtual pen (a touch pan for
+    /// scroll) leaves the user's pointer alone, but a click still focuses the
+    /// window, and apps without tablet support ignore it. Needs x and y in
+    /// screenshot capture pixels over the window the call targets, without
+    /// relative or an element. Elsewhere the
+    /// first such call in a server session sends nothing and returns a
+    /// notice; repeated, and for every later such call, it goes through the
+    /// user's pointer as with "focus". Default: "focus".
+    #[serde(default)]
+    delivery: Option<KeyboardDelivery>,
     #[serde(flatten)]
     capture: PostActionCaptureParams,
 }
@@ -4352,18 +5620,32 @@ fn optional_window_target(
 /// cached element_index or selector must come from.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ElementActionTarget {
+    /// Window id from a recent list_windows. The first target field set
+    /// decides, in this order: window_id, pid, app_id, wm_class, window_title.
     #[serde(
         default,
         deserialize_with = "crate::windowing::types::deserialize_window_id"
     )]
     #[schemars(range(max = crate::windowing::types::MAX_WINDOW_ID))]
     window_id: Option<u64>,
+    /// Process id of the target app: an element another process owns is
+    /// refused. With pid alone, no window is needed. When pid picks the window
+    /// (with app_id, wm_class or window_title, or for
+    /// screenshot_after="window"), it must match exactly one.
     #[serde(default)]
     pid: Option<u32>,
+    /// Application id, ignoring ASCII case: the full desktop id, or its last
+    /// dot-separated segment. A segment that matches several apps is
+    /// rejected.
     #[serde(default)]
     app_id: Option<String>,
+    /// Window manager class, an exact match ignoring ASCII case. When several
+    /// windows match, the first wins.
     #[serde(default)]
     wm_class: Option<String>,
+    /// Window title substring, ignoring ASCII case. When several windows
+    /// match, the first wins.
+    /// This tool names the field window_title; a title field is ignored.
     #[serde(default)]
     window_title: Option<String>,
 }
@@ -4383,18 +5665,35 @@ impl ElementActionTarget {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ActionParams {
+    /// Element index from the latest get_app_state or include_tree snapshot.
     #[serde(default)]
     element_index: Option<u32>,
+    /// snapshot_id of the get_app_state or include_tree result the
+    /// element_index or selector comes from. If a later snapshot replaced
+    /// it, the call is refused before any input. Without it, the element
+    /// resolves in the latest snapshot.
+    #[serde(default)]
+    snapshot_id: Option<String>,
+    /// A node's object_ref from get_app_state or get_tree_page. It names the
+    /// AT-SPI object itself, not a snapshot index, and wins over element_index
+    /// and the selectors.
     #[serde(default)]
     element_identifier: Option<String>,
+    /// Case-insensitive substring of the element's AT-SPI role.
     #[serde(default)]
     role: Option<String>,
+    /// Case-insensitive substring of the element's accessible name.
     #[serde(default)]
     name: Option<String>,
+    /// Case-insensitive substring of the element's text, name or description.
     #[serde(default)]
     text: Option<String>,
+    /// AT-SPI states the element must all have, case-insensitive (for
+    /// example focused, checked).
     #[serde(default)]
     states: Vec<String>,
+    /// AT-SPI action to invoke: its name or description, ignoring ASCII case,
+    /// or its 0-based index. Default: the element's first action.
     #[serde(default)]
     action: Option<String>,
     #[serde(flatten)]
@@ -4416,18 +5715,38 @@ impl ActionParams {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct SetValueParams {
+    /// Element index from the latest get_app_state or include_tree snapshot.
     #[serde(default)]
     element_index: Option<u32>,
+    /// snapshot_id of the get_app_state or include_tree result the
+    /// element_index or selector comes from. If a later snapshot replaced
+    /// it, the call is refused before any input. Without it, the element
+    /// resolves in the latest snapshot.
+    #[serde(default)]
+    snapshot_id: Option<String>,
+    /// A node's object_ref from get_app_state or get_tree_page. It names the
+    /// AT-SPI object itself, not a snapshot index, and wins over element_index
+    /// and the selectors.
     #[serde(default)]
     element_identifier: Option<String>,
+    /// Case-insensitive substring of the element's AT-SPI role.
     #[serde(default)]
     role: Option<String>,
+    /// Case-insensitive substring of the element's accessible name.
     #[serde(default)]
     name: Option<String>,
+    /// Case-insensitive substring of the element's text, name or description.
     #[serde(default)]
     text: Option<String>,
+    /// AT-SPI states the element must all have, case-insensitive (for
+    /// example focused, checked).
     #[serde(default)]
     states: Vec<String>,
+    /// A value that parses as a floating-point number (such as 5, -2.5, 1e3,
+    /// inf or NaN, with no surrounding spaces) sets an element with the
+    /// AT-SPI Value interface (slider, spin button). Otherwise the text
+    /// replaces an editable text element's contents. Text on a Value-only
+    /// element is refused.
     value: String,
     #[serde(flatten)]
     target: ElementActionTarget,
@@ -4448,30 +5767,58 @@ impl SetValueParams {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ScrollParams {
+    /// Element index from the latest get_app_state or include_tree snapshot.
     #[serde(default)]
     element_index: Option<u32>,
+    /// snapshot_id of the get_app_state or include_tree result the
+    /// element_index comes from. If a later snapshot replaced it, the call
+    /// is refused before any input. Without it, the element resolves in the
+    /// latest snapshot.
+    #[serde(default)]
+    snapshot_id: Option<String>,
+    /// Point x to scroll at in raw screenshot capture pixels: the coordinate_width and
+    /// coordinate_height space. Divide preview pixels by the screenshot scale
+    /// first. With relative=true, measured from the window screenshot's crop origin.
+    /// Without x/y or element_index, the target window's centre, or the pointer.
     #[serde(default)]
     x: Option<i32>,
+    /// Point y to scroll at in raw screenshot capture pixels: the coordinate_width and
+    /// coordinate_height space. Divide preview pixels by the screenshot scale
+    /// first. With relative=true, measured from the window screenshot's crop origin.
     #[serde(default)]
     y: Option<i32>,
+    /// up, down, left or right (case-insensitive).
     direction: String,
+    /// Distance in pages (default 1), 5 wheel notches each. The sign is
+    /// ignored (direction sets it), and any value sends at least one notch.
     #[serde(default)]
     #[schemars(range(min = -100, max = 100))]
     pages: Option<f64>,
     // Optional window target (parity with click): the window is raised/focused
     // before scrolling so the wheel events land on the intended app.
+    /// Window id from a recent list_windows. The first target field set
+    /// decides, in this order: window_id, pid, app_id, wm_class, window_title.
     #[serde(
         default,
         deserialize_with = "crate::windowing::types::deserialize_window_id"
     )]
     #[schemars(range(max = crate::windowing::types::MAX_WINDOW_ID))]
     window_id: Option<u64>,
+    /// Process id. It must match exactly one window.
     #[serde(default)]
     pid: Option<u32>,
+    /// Application id, ignoring ASCII case: the full desktop id, or its last
+    /// dot-separated segment. A segment that matches several apps is
+    /// rejected.
     #[serde(default)]
     app_id: Option<String>,
+    /// Window manager class, an exact match ignoring ASCII case. When several
+    /// windows match, the first wins.
     #[serde(default)]
     wm_class: Option<String>,
+    /// Window title substring, ignoring ASCII case. When several windows
+    /// match, the first wins.
+    /// This tool names the field window_title; a title field is ignored.
     #[serde(default)]
     window_title: Option<String>,
     /// Interpret `x`/`y` from the clipped window screenshot crop origin, in
@@ -4480,8 +5827,35 @@ struct ScrollParams {
     /// Requires a window target; missing targets are rejected.
     #[serde(default)]
     relative: Option<bool>,
+    /// "background" sends the input through the agent's own pointer, so the
+    /// user's pointer and keyboard focus stay where they are: on X11 without
+    /// a window manager (an XInput 2 master pointer) and on sway 1.10 or later
+    /// (a transient seat). On GNOME and KDE Plasma Wayland a virtual pen (a touch pan for
+    /// scroll) leaves the user's pointer alone, but a click still focuses the
+    /// window, and apps without tablet support ignore it. Needs x and y in
+    /// screenshot capture pixels over the window the call targets, without
+    /// relative or an element. Elsewhere the
+    /// first such call in a server session sends nothing and returns a
+    /// notice; repeated, and for every later such call, it goes through the
+    /// user's pointer as with "focus". Default: "focus".
+    #[serde(default)]
+    delivery: Option<KeyboardDelivery>,
     #[serde(flatten)]
     capture: PostActionCaptureParams,
+}
+
+/// Whether a click resolves its element in the cached tree: an index or
+/// selector, unless a full capture-space point wins over it.
+fn click_resolves_cached_element(params: &ClickParams) -> bool {
+    (params.element_index.is_some() || !params.selector().is_empty())
+        && (params.x.zip(params.y).is_none()
+            || params.coordinate_space == ClickCoordinateSpace::Atspi)
+}
+
+/// Whether a scroll takes its point from a cached element: an element_index
+/// without a full x/y point. A lone x or y does not make a point.
+fn scroll_resolves_cached_element(params: &ScrollParams) -> bool {
+    params.element_index.is_some() && params.x.zip(params.y).is_none()
 }
 
 fn scroll_units(pages: Option<f64>) -> std::result::Result<i32, String> {
@@ -4509,73 +5883,279 @@ impl ScrollParams {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct DragParams {
+    /// Start x in raw screenshot capture pixels: the coordinate_width space.
+    /// Divide preview pixels by the screenshot scale first.
     start_x: i32,
+    /// Start y in raw screenshot capture pixels.
     start_y: i32,
+    /// End x in raw screenshot capture pixels.
     end_x: i32,
+    /// End y in raw screenshot capture pixels.
     end_y: i32,
-    #[serde(flatten)]
-    capture: PostActionCaptureParams,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
-struct PressKeyParams {
-    key: String,
+    /// Window id from a recent list_windows: the window a background drag
+    /// runs in. The first target field set decides, in this order:
+    /// window_id, pid, app_id, wm_class, window_title. A drag with
+    /// "focus" delivery ignores the target.
     #[serde(
         default,
         deserialize_with = "crate::windowing::types::deserialize_window_id"
     )]
     #[schemars(range(max = crate::windowing::types::MAX_WINDOW_ID))]
     window_id: Option<u64>,
+    /// Process id. It must match exactly one window.
     #[serde(default)]
     pid: Option<u32>,
-    #[serde(default)]
-    tty: Option<String>,
-    #[serde(default)]
-    terminal_pid: Option<u32>,
-    #[serde(default)]
-    terminal_command: Option<String>,
-    #[serde(default)]
-    terminal_cwd: Option<String>,
+    /// Application id, ignoring ASCII case: the full desktop id, or its last
+    /// dot-separated segment.
     #[serde(default)]
     app_id: Option<String>,
+    /// Window manager class, an exact match ignoring ASCII case.
     #[serde(default)]
     wm_class: Option<String>,
+    /// Window title substring, ignoring ASCII case.
+    #[serde(default)]
+    window_title: Option<String>,
+    /// "background" drags with a virtual pen on GNOME and KDE Plasma Wayland, so the
+    /// user's pointer stays where it is; both points must be on the target
+    /// window, with no window stacked above them. Elsewhere the first such
+    /// call in a server session sends nothing and returns a notice;
+    /// repeated, and for every later such call, the drag goes through the
+    /// user's pointer as with "focus". Default: "focus".
+    #[serde(default)]
+    delivery: Option<KeyboardDelivery>,
+    #[serde(flatten)]
+    capture: PostActionCaptureParams,
+}
+
+impl DragParams {
+    fn window_target(&self) -> Option<WindowTarget> {
+        optional_window_target(
+            self.window_id,
+            self.pid,
+            &self.app_id,
+            &self.wm_class,
+            &self.window_title,
+        )
+    }
+}
+
+/// How type_text and press_key deliver input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum KeyboardDelivery {
+    /// Focus the target window, then type into it.
+    Focus,
+    /// Leave the user's keyboard focus alone and deliver through a route the
+    /// call names.
+    Background,
+}
+
+/// The background delivery fields type_text and press_key share.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+struct BackgroundKeyboardParams {
+    /// "focus" focuses the target window and types into it. "background"
+    /// leaves the user's keyboard focus where it is and delivers through the
+    /// route the call names: an element (element_index, element_identifier
+    /// or role/name/states), a browser_tab, or a terminal (tty, terminal_pid,
+    /// terminal_command, terminal_cwd, or a terminal window) whose program
+    /// runs in tmux. When no route serves the target, the first such call in
+    /// a server session sends nothing and returns a notice; repeated, and
+    /// for every later such call, the input goes through normal focused
+    /// input (an element gets keyboard focus first, a browser_tab targets
+    /// the one window whose title contains it). A wrong or ambiguous target is still an
+    /// error. Default: "background" when an element or browser_tab is named,
+    /// else "focus".
+    #[serde(default)]
+    delivery: Option<KeyboardDelivery>,
+    /// Background delivery to an element: its element_index from the latest
+    /// get_app_state or include_tree snapshot. type_text inserts at its caret
+    /// (or end) through AT-SPI EditableText and reads it back; press_key runs
+    /// the AT-SPI action the key means (Enter or space on a button or menu
+    /// item, space on a check box, radio button or toggle, Enter on a link
+    /// or on a single-line field with an activate action).
+    #[serde(default)]
+    element_index: Option<u32>,
+    /// snapshot_id of the result element_index or the selector comes from.
+    /// If a later snapshot replaced it, the call is refused before input.
+    #[serde(default)]
+    snapshot_id: Option<String>,
+    /// A node's object_ref from get_app_state or get_tree_page, for
+    /// background delivery to that element. Wins over element_index and the
+    /// selectors.
+    #[serde(default)]
+    element_identifier: Option<String>,
+    /// Background delivery to the element whose AT-SPI role contains this,
+    /// ignoring case (with name and states, it must match one element).
+    #[serde(default)]
+    role: Option<String>,
+    /// Background delivery to the element whose accessible name contains
+    /// this, ignoring case.
+    #[serde(default)]
+    name: Option<String>,
+    /// AT-SPI states the background target element must all have.
+    #[serde(default)]
+    states: Vec<String>,
+    /// Background delivery to a browser tab over DevTools: a target id, or a
+    /// case-insensitive substring of one page's URL or title. Needs
+    /// CODEX_COMPUTER_USE_DEVTOOLS (the loopback port of a browser the user
+    /// started with --remote-debugging-port, or its DevToolsActivePort
+    /// file). Input goes to the tab's focused element.
+    #[serde(default)]
+    browser_tab: Option<String>,
+}
+
+impl BackgroundKeyboardParams {
+    fn selector(&self) -> ElementSelector<'_> {
+        ElementSelector {
+            role: self.role.as_deref(),
+            name: self.name.as_deref(),
+            text: None,
+            states: &self.states,
+        }
+    }
+
+    fn names_element(&self) -> bool {
+        self.element_index.is_some()
+            || trimmed_nonempty(self.element_identifier.as_deref()).is_some()
+            || !self.selector().is_empty()
+    }
+
+    fn browser_tab(&self) -> Option<&str> {
+        trimmed_nonempty(self.browser_tab.as_deref())
+    }
+
+    /// Whether the call asks for background delivery. An element or tab has
+    /// no focus route, so naming one with delivery "focus" is refused.
+    fn background(&self) -> std::result::Result<bool, String> {
+        let named = self.names_element() || self.browser_tab().is_some();
+        match self.delivery {
+            Some(KeyboardDelivery::Background) => Ok(true),
+            Some(KeyboardDelivery::Focus) if named => Err(
+                "Nothing was sent: an element or browser_tab is delivered in the background only; drop delivery or pass delivery=\"background\".".to_string(),
+            ),
+            Some(KeyboardDelivery::Focus) => Ok(false),
+            None => Ok(named),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+struct PressKeyParams {
+    /// Key or chord in the grammar the tool description gives, for example
+    /// Enter or Ctrl+Shift+T.
+    key: String,
+    /// Window id from a recent list_windows. The first target field set
+    /// decides, in this order: window_id, terminal fields, pid, app_id,
+    /// wm_class, title. With a terminal field, pid, app_id, wm_class and title
+    /// only narrow the terminal match, which must name one window.
+    #[serde(
+        default,
+        deserialize_with = "crate::windowing::types::deserialize_window_id"
+    )]
+    #[schemars(range(max = crate::windowing::types::MAX_WINDOW_ID))]
+    window_id: Option<u64>,
+    /// Process id. It must match exactly one window.
+    #[serde(default)]
+    pid: Option<u32>,
+    /// Terminal tty: /dev/pts/N, pts/N or N.
+    #[serde(default)]
+    tty: Option<String>,
+    /// Pid of the shell or foreground process on a terminal's tty, not the
+    /// terminal emulator (use pid for that).
+    #[serde(default)]
+    terminal_pid: Option<u32>,
+    /// Substring of the command name or command line of a terminal's shell
+    /// or foreground process, ignoring ASCII case.
+    #[serde(default)]
+    terminal_command: Option<String>,
+    /// Working directory of a terminal's shell or foreground process: an
+    /// absolute path, or a trailing path such as project/src.
+    #[serde(default)]
+    terminal_cwd: Option<String>,
+    /// Application id, ignoring ASCII case: the full desktop id, or its last
+    /// dot-separated segment outside a terminal match. A segment that matches several apps is
+    /// rejected.
+    #[serde(default)]
+    app_id: Option<String>,
+    /// Window manager class, an exact match ignoring ASCII case. When several
+    /// windows match outside a terminal match, the first wins.
+    #[serde(default)]
+    wm_class: Option<String>,
+    /// Window title substring, ignoring ASCII case. When several windows
+    /// match outside a terminal match, the first wins.
     #[serde(default)]
     title: Option<String>,
+    #[serde(flatten)]
+    background: BackgroundKeyboardParams,
     #[serde(flatten)]
     capture: PostActionCaptureParams,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct TypeTextParams {
+    /// Literal text to type, sent as characters, not as key names.
     text: String,
+    /// Window id from a recent list_windows. The first target field set
+    /// decides, in this order: window_id, terminal fields, pid, app_id,
+    /// wm_class, title. With a terminal field, pid, app_id, wm_class and title
+    /// only narrow the terminal match, which must name one window.
     #[serde(
         default,
         deserialize_with = "crate::windowing::types::deserialize_window_id"
     )]
     #[schemars(range(max = crate::windowing::types::MAX_WINDOW_ID))]
     window_id: Option<u64>,
+    /// Process id. It must match exactly one window.
     #[serde(default)]
     pid: Option<u32>,
+    /// Terminal tty: /dev/pts/N, pts/N or N.
     #[serde(default)]
     tty: Option<String>,
+    /// Pid of the shell or foreground process on a terminal's tty, not the
+    /// terminal emulator (use pid for that).
     #[serde(default)]
     terminal_pid: Option<u32>,
+    /// Substring of the command name or command line of a terminal's shell
+    /// or foreground process, ignoring ASCII case.
     #[serde(default)]
     terminal_command: Option<String>,
+    /// Working directory of a terminal's shell or foreground process: an
+    /// absolute path, or a trailing path such as project/src.
     #[serde(default)]
     terminal_cwd: Option<String>,
+    /// Application id, ignoring ASCII case: the full desktop id, or its last
+    /// dot-separated segment outside a terminal match. A segment that matches several apps is
+    /// rejected.
     #[serde(default)]
     app_id: Option<String>,
+    /// Window manager class, an exact match ignoring ASCII case. When several
+    /// windows match outside a terminal match, the first wins.
     #[serde(default)]
     wm_class: Option<String>,
+    /// Window title substring, ignoring ASCII case. When several windows
+    /// match outside a terminal match, the first wins.
     #[serde(default)]
     title: Option<String>,
+    #[serde(flatten)]
+    background: BackgroundKeyboardParams,
     #[serde(flatten)]
     capture: PostActionCaptureParams,
 }
 
 impl PressKeyParams {
+    /// Point the window selectors at `target`, for focused input.
+    fn set_window_target(&mut self, target: &WindowTarget) {
+        self.window_id = target.window_id;
+        self.pid = target.pid;
+        self.tty = target.tty.clone();
+        self.terminal_pid = target.terminal_pid;
+        self.terminal_command = target.terminal_command.clone();
+        self.terminal_cwd = target.terminal_cwd.clone();
+        self.app_id = target.app_id.clone();
+        self.wm_class = target.wm_class.clone();
+        self.title = target.title.clone();
+    }
+
     fn window_target(&self) -> WindowTarget {
         WindowTarget {
             window_id: self.window_id,
@@ -4592,6 +6172,19 @@ impl PressKeyParams {
 }
 
 impl TypeTextParams {
+    /// Point the window selectors at `target`, for focused input.
+    fn set_window_target(&mut self, target: &WindowTarget) {
+        self.window_id = target.window_id;
+        self.pid = target.pid;
+        self.tty = target.tty.clone();
+        self.terminal_pid = target.terminal_pid;
+        self.terminal_command = target.terminal_command.clone();
+        self.terminal_cwd = target.terminal_cwd.clone();
+        self.app_id = target.app_id.clone();
+        self.wm_class = target.wm_class.clone();
+        self.title = target.title.clone();
+    }
+
     fn window_target(&self) -> WindowTarget {
         WindowTarget {
             window_id: self.window_id,
@@ -4624,6 +6217,10 @@ struct ActionOutput {
 struct ActionToolOutput {
     #[serde(flatten)]
     action: ActionOutput,
+    /// For a call that asked for background delivery: whether a background
+    /// route delivered it, or why not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    background: Option<BackgroundReport>,
     #[serde(flatten)]
     observation: PostActionObservation,
 }
@@ -4637,6 +6234,104 @@ struct SetValueToolOutput {
     verified: Option<bool>,
     #[serde(flatten)]
     observation: PostActionObservation,
+}
+
+/// Start of every type_text success message from the AT-SPI route. Those
+/// results were read back, so type_text does not add its unverified note.
+const TYPE_TEXT_ATSPI_ROUTE: &str = "Typed through AT-SPI EditableText";
+/// Start of an AT-SPI route failure after an edit was attempted.
+const TYPE_TEXT_ATSPI_UNVERIFIED: &str = "AT-SPI EditableText insert was not verified";
+
+/// The portal preflight refusal that may take the AT-SPI route: the keymap
+/// was read and a layout group cannot type a character. A keymap that could
+/// not be read or checked keeps its error.
+fn atspi_fallback_trigger(
+    error: &anyhow::Error,
+) -> Option<crate::keyboard_keymap::MissingLayoutKeysym> {
+    error
+        .downcast_ref::<crate::keyboard_keymap::MissingLayoutKeysym>()
+        .copied()
+}
+
+/// The first character that portal typing sends as a key press (Enter, Tab,
+/// BackSpace, Escape, Delete and the like), not as text.
+fn key_press_character(text: &str) -> Option<char> {
+    text.chars().find(|ch| ch.is_control())
+}
+
+fn type_text_control_character_refusal(refusal: &str, key: char) -> String {
+    format!(
+        "{refusal} The AT-SPI text fallback was not used: the text contains U+{:04X}, which typing sends as a key press such as Enter or Tab, and inserting it is not the same. Type the text without it, then send the key with press_key.",
+        key as u32
+    )
+}
+
+/// The type_text result for one AT-SPI insert outcome. `Ok` is a verified
+/// success message.
+fn type_text_atspi_result(
+    refusal: &str,
+    missing: crate::keyboard_keymap::MissingLayoutKeysym,
+    text: &str,
+    insert: Result<FocusedTextInsert>,
+) -> std::result::Result<String, String> {
+    const MAY_HAVE_CHANGED: &str = "The field may have changed; re-observe it before retrying.";
+    let because = format!("because GNOME {}", missing.summary());
+    let route = format!("{TYPE_TEXT_ATSPI_ROUTE} {because}");
+    let unverified = format!("{TYPE_TEXT_ATSPI_UNVERIFIED}: the text was sent {because}");
+    match insert {
+        Ok(FocusedTextInsert::Verified {
+            role,
+            replaced_selection,
+            caret_after_text,
+        }) => {
+            let mut message = format!(
+                "{route}. The focused {role} reads back the text at the insertion point, with the rest of the field unchanged."
+            );
+            if replaced_selection {
+                message.push_str(" The text replaced the selection.");
+            }
+            if !caret_after_text {
+                message.push_str(" The caret could not be moved after the text.");
+            }
+            Ok(message)
+        }
+        Ok(FocusedTextInsert::NotEditable(reason)) => {
+            Err(format!("{refusal} No AT-SPI text fallback: {reason}."))
+        }
+        Ok(FocusedTextInsert::PasswordField) => Err(format!(
+            "{refusal} The focused field is a password field, so the AT-SPI text fallback was not used. set_value can fill it."
+        )),
+        Ok(FocusedTextInsert::PasswordUnverifiable) => Err(format!(
+            "{refusal} No AT-SPI text fallback: the field is a password field."
+        )),
+        Ok(FocusedTextInsert::Mismatch {
+            expected_count,
+            read_count,
+            read_text,
+            read_truncated,
+        }) => Err(format!(
+            "{unverified}, but the field does not read it back: expected {text:?} at the insertion point, the rest unchanged, and {expected_count} characters in all; read {read_text:?}{} at the insertion point and {read_count} characters. {MAY_HAVE_CHANGED}",
+            if read_truncated { " (first part)" } else { "" }
+        )),
+        Ok(FocusedTextInsert::ReadbackFailed) => Err(format!(
+            "{unverified}, but reading the field back failed. {MAY_HAVE_CHANGED}"
+        )),
+        Ok(FocusedTextInsert::ReadbackTimedOut) => Err(format!(
+            "{unverified}, but reading the field back timed out. {MAY_HAVE_CHANGED}"
+        )),
+        Ok(FocusedTextInsert::EditFailed {
+            reason,
+            may_have_changed,
+        }) => Err(format!(
+            "{TYPE_TEXT_ATSPI_UNVERIFIED}: {reason}. {}",
+            if may_have_changed {
+                MAY_HAVE_CHANGED
+            } else {
+                "No text was changed."
+            }
+        )),
+        Err(error) => Err(format!("{refusal} No AT-SPI text fallback: {error:#}.")),
+    }
 }
 
 fn editable_text_action_result(
@@ -4725,6 +6420,8 @@ impl ComputerUseLinux {
         )
     }
 
+    // Literal text needs a layout-aware route even when raw ydotool input is
+    // available. KDE uses clipboard paste; compatible compositors use wtype.
     fn should_prefer_portal_text_backend(&self) -> bool {
         prefer_portal_text_backend(
             env_flag_enabled_any(&[
@@ -4742,6 +6439,14 @@ impl ComputerUseLinux {
         )
     }
 
+    /// Portal keyboard policy for `press_key` chords. Unlike literal text
+    /// (where KDE prefers the clipboard paste backend), key chords have no
+    /// clipboard route, so the portal keyboard session is preferred on ANY
+    /// Wayland session, including Plasma. An already-active keyboard
+    /// session (e.g. established by a KDE clipboard paste) is reused even
+    /// when ydotool is available, so the consent the user already granted
+    /// keeps covering key chords; otherwise the portal is preferred only
+    /// when ydotool is absent or the portal is forced.
     async fn should_prefer_portal_keyboard_for_chords(&self) -> bool {
         if env_flag_enabled_any(&[
             "COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD",
@@ -4791,19 +6496,16 @@ impl ComputerUseLinux {
             && self.is_kde_wayland_session()
     }
 
-    fn should_prefer_xdotool_pointer(&self) -> bool {
-        crate::diagnostics::hydrate_session_bus_env();
-        prefer_xdotool_pointer(
-            env_flag_enabled_any(&[
-                "COMPUTER_USE_LINUX_FORCE_YDOTOOL_POINTER",
-                "CODEX_COMPUTER_USE_FORCE_YDOTOOL_POINTER",
-            ]),
-            env::var("XDG_SESSION_TYPE").ok().as_deref(),
-            env_var_non_empty("DISPLAY"),
-            env::var("WAYLAND_DISPLAY").ok().as_deref(),
-        )
-    }
-
+    /// Keyboard policy for X11 sessions: prefer `xdotool` (XTEST).
+    ///
+    /// ydotool writes raw evdev scancodes to a virtual uinput device. On X11
+    /// the server then re-interprets them through the active XKB layout, so
+    /// `press_key "Return"` and chords like `ctrl+a` land as stray characters,
+    /// and literal text can mangle symbols/digits (issue #58). XTEST resolves
+    /// keysyms against the live layout instead.
+    ///
+    /// `COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD=1` opts out;
+    /// `COMPUTER_USE_LINUX_FORCE_XDOTOOL_KEYBOARD=1` forces it on.
     fn should_prefer_xdotool_keyboard(&self) -> bool {
         prefer_xdotool_keyboard(
             env_flag_enabled_any(&[
@@ -4826,14 +6528,6 @@ impl ComputerUseLinux {
                 "COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD",
                 "CODEX_COMPUTER_USE_FORCE_YDOTOOL_KEYBOARD",
             ]),
-            env_flag_enabled_any(&[
-                "COMPUTER_USE_LINUX_FORCE_XDOTOOL_KEYBOARD",
-                "CODEX_COMPUTER_USE_FORCE_XDOTOOL_KEYBOARD",
-            ]),
-            env_flag_enabled_any(&[
-                "COMPUTER_USE_LINUX_FORCE_PORTAL_KEYBOARD",
-                "CODEX_COMPUTER_USE_FORCE_PORTAL_KEYBOARD",
-            ]),
             self.is_wayland_session(),
             crate::diagnostics::wtype_compatible_wayland_desktop(
                 env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
@@ -4853,6 +6547,19 @@ impl ComputerUseLinux {
         Some(wtype_text_mode_for_desktop(
             env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
         ))
+    }
+
+    fn should_prefer_xdotool_pointer(&self) -> bool {
+        crate::diagnostics::hydrate_session_bus_env();
+        prefer_xdotool_pointer(
+            env_flag_enabled_any(&[
+                "COMPUTER_USE_LINUX_FORCE_YDOTOOL_POINTER",
+                "CODEX_COMPUTER_USE_FORCE_YDOTOOL_POINTER",
+            ]),
+            env::var("XDG_SESSION_TYPE").ok().as_deref(),
+            env_var_non_empty("DISPLAY"),
+            env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        )
     }
 
     fn is_cosmic_wayland_session(&self) -> bool {
@@ -5086,12 +6793,65 @@ impl ComputerUseLinux {
         Ok(window)
     }
 
+    /// Saves a prepared screenshot to `path` for screenshot_file_path and
+    /// returns the path. The caller then returns no image content for it.
+    async fn save_screenshot_file(
+        &self,
+        capture: &ScreenshotCapture,
+        path: &str,
+    ) -> Result<String> {
+        let target = crate::screenshot_file::validate_screenshot_file_path(
+            path,
+            capture.format,
+            self.http_transport,
+        )?;
+        let bytes = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(data_url_payload(&capture.data_url))
+                .context("failed to decode the screenshot for screenshot_file_path")?
+        };
+        tokio::task::spawn_blocking(move || {
+            crate::screenshot_file::write_screenshot_file(&target, &bytes)
+        })
+        .await
+        .context("screenshot file writer stopped")??;
+        Ok(path.to_string())
+    }
+
     async fn capture_post_action_observation(
         &self,
         capture: &PostActionCaptureParams,
         target: Option<&WindowTarget>,
         fallback_window: Option<&WindowInfo>,
         raised: TargetRaised,
+        scope: PostActionScope,
+    ) -> (
+        PostActionObservation,
+        Option<ScreenshotCapture>,
+        Vec<String>,
+    ) {
+        self.capture_post_action_observation_with(
+            capture,
+            target,
+            fallback_window,
+            raised,
+            scope,
+            false,
+        )
+        .await
+    }
+
+    /// `settled` skips the post-action settle delay for a tree read right
+    /// after a screenshot of the same action, which already waited it.
+    async fn capture_post_action_observation_with(
+        &self,
+        capture: &PostActionCaptureParams,
+        target: Option<&WindowTarget>,
+        fallback_window: Option<&WindowInfo>,
+        raised: TargetRaised,
+        scope: PostActionScope,
+        settled: bool,
     ) -> (
         PostActionObservation,
         Option<ScreenshotCapture>,
@@ -5102,15 +6862,38 @@ impl ComputerUseLinux {
         if screenshot_scope.is_none() && !include_tree {
             return (PostActionObservation::default(), None, Vec::new());
         }
+        let bound = scope.bound;
 
         let mut observation = PostActionObservation::default();
         let mut screenshot_capture = None;
         let mut notes = Vec::new();
         let mut resolved_window: Option<WindowInfo> = None;
+        // A failed file output is reported like a failed capture, but it says
+        // nothing about the desktop, so it leaves the diagnostics cached.
+        let mut screenshot_capture_failed = false;
 
         if let Some(scope) = screenshot_scope {
             let options = capture.screenshot_options();
-            let result: Result<(ScreenshotCapture, bool, Option<String>, Option<String>)> = async {
+            let mut file_output_failed = false;
+            #[allow(clippy::type_complexity)]
+            let result: Result<(
+                ScreenshotCapture,
+                bool,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )> = async {
+                // A path that cannot be written is reported without a capture.
+                if let Some(path) = capture.screenshot_file_path.as_deref() {
+                    if let Err(error) = crate::screenshot_file::validate_screenshot_file_path(
+                        path,
+                        options.format.unwrap_or(ScreenshotOutputFormat::Png),
+                        self.http_transport,
+                    ) {
+                        file_output_failed = true;
+                        return Err(error);
+                    }
+                }
                 let _pipeline = crate::screenshot::screenshot_pipeline_permit().await?;
                 let crop_window = match scope {
                     ScreenshotAfterScope::Screen => None,
@@ -5180,28 +6963,43 @@ impl ComputerUseLinux {
                 })
                 .await
                 .context("post-action screenshot resize failed")?;
-                Ok((prepared, cropped, window_label, off_screen_note))
+                let file_path = match capture.screenshot_file_path.as_deref() {
+                    Some(path) => match self.save_screenshot_file(&prepared, path).await {
+                        Ok(saved) => Some(saved),
+                        Err(error) => {
+                            file_output_failed = true;
+                            return Err(error);
+                        }
+                    },
+                    None => None,
+                };
+                Ok((prepared, cropped, window_label, off_screen_note, file_path))
             }
             .await;
 
             match result {
-                Ok((prepared, cropped, window_title, off_screen_note)) => {
+                Ok((prepared, cropped, window_title, off_screen_note, file_path)) => {
                     let mut summary = ScreenshotSummary::from(&prepared);
                     summary.cropped_to_window = Some(cropped);
                     summary.window_title = window_title;
+                    // A saved image is not returned inline.
+                    if file_path.is_none() {
+                        screenshot_capture = Some(prepared);
+                    }
+                    summary.file_path = file_path;
                     observation.screenshot = Some(summary);
-                    screenshot_capture = Some(prepared);
                     if let Some(note) = off_screen_note {
                         notes.push(note);
                     }
                 }
                 Err(error) => {
+                    screenshot_capture_failed = !file_output_failed;
                     let error = format!("{error:#}");
                     notes.push(format!("Post-action screenshot failed: {error}"));
                     observation.screenshot_error = Some(error);
                 }
             }
-        } else if !cfg!(test) {
+        } else if !settled && !cfg!(test) {
             sleep(Duration::from_millis(120)).await;
         }
 
@@ -5215,7 +7013,12 @@ impl ComputerUseLinux {
                         .ok()
                         .and_then(|windows| {
                             resolve_window_target(&windows, target)
-                                .inspect_err(|_| self.diagnostics.invalidate())
+                                .inspect_err(|_| {
+                                    // A bound app can legitimately have zero or several windows.
+                                    if !bound {
+                                        self.diagnostics.invalidate();
+                                    }
+                                })
                                 .ok()
                                 .cloned()
                         })
@@ -5235,40 +7038,44 @@ impl ComputerUseLinux {
             // that app may not be the one holding it.
             let window_targeted = resolved_window.is_some()
                 && (target.is_some_and(WindowTarget::has_target) || fallback_window.is_some());
-            let target_pid = resolved_window
-                .as_ref()
-                .and_then(|window| window.pid)
-                .or_else(|| target.and_then(|target| target.pid))
-                .or_else(|| {
-                    if window_targeted {
-                        return None;
-                    }
-                    self.last_snapshot
-                        .lock()
-                        .ok()
-                        .and_then(|snapshot| snapshot.pid)
-                });
+            let PostActionScope {
+                pid: cached_pid,
+                tree: cached_tree,
+                ..
+            } = self.post_action_scope_for_capture(scope);
+            // A bound owner's pid is the element's verified bus owner. Its
+            // window's listed pid can differ: a Flatpak app's roots belong
+            // to xdg-dbus-proxy, not to the process the compositor lists.
+            let target_pid = if bound {
+                target
+                    .and_then(|target| target.pid)
+                    .or_else(|| resolved_window.as_ref().and_then(|window| window.pid))
+            } else {
+                resolved_window
+                    .as_ref()
+                    .and_then(|window| window.pid)
+                    .or_else(|| target.and_then(|target| target.pid))
+                    .or(cached_pid.filter(|_| !window_targeted))
+            };
+            // A pid scopes the tree to every root it owns. A window the
+            // compositor listed is alive, so when its pid owns no root (a
+            // Flatpak app registers through xdg-dbus-proxy) its title finds
+            // the root instead. A bound element owner gets no such fallback.
+            let window_pid = resolved_window.as_ref().and_then(|window| window.pid);
             let candidates = accessibility_filter_candidates(resolved_window.as_ref());
-            let mut app_filter = None;
-            if let Some(pid) = target_pid {
-                if let Ok(apps) = list_accessible_apps(200).await {
-                    app_filter = select_accessibility_object_ref(&apps, pid, &candidates);
-                }
-            }
-            if app_filter.is_none() {
-                app_filter = candidates.into_iter().next();
-            }
+            let fallback_name = candidates
+                .first()
+                .filter(|_| !bound && window_pid.is_some() && window_pid == target_pid)
+                .cloned();
+            let app_filter = if target_pid.is_none() {
+                candidates.into_iter().next()
+            } else {
+                None
+            };
             let accessibility_target_requested = target.is_some_and(WindowTarget::has_target)
                 || target_pid.is_some()
                 || app_filter.is_some();
             let (max_nodes, max_depth) = crate::atspi_tree::snapshot_limits(None, None);
-            let cached_tree = self.last_snapshot.lock().ok().and_then(|snapshot| {
-                Some(CachedTreeWindow {
-                    scope: snapshot.window_scope.clone()?,
-                    pid: snapshot.pid,
-                    window: snapshot.window_id.zip(snapshot.window_backend.clone()),
-                })
-            });
             let window_title = post_action_window_title(
                 target,
                 resolved_window.as_ref(),
@@ -5288,6 +7095,7 @@ impl ComputerUseLinux {
                 app_filter.as_deref(),
                 target_pid,
                 window_title.as_deref(),
+                fallback_name.as_deref(),
                 max_nodes,
                 max_depth,
             )
@@ -5301,7 +7109,7 @@ impl ComputerUseLinux {
                         .await
                         .unwrap_or(false) =>
                 {
-                    self.commit_snapshot(&[], None).await;
+                    self.commit_cleared_snapshot().await;
                     let error = "GNOME accessibility is disabled; call setup_accessibility first."
                         .to_string();
                     notes.push(format!("Post-action accessibility tree failed: {error}"));
@@ -5324,19 +7132,28 @@ impl ComputerUseLinux {
                         snapshot.window_scope.as_deref(),
                         narrowed_through_cache.as_ref(),
                     );
-                    self.commit_observed_snapshot(
-                        &nodes,
-                        snapshot.root_pid,
-                        tree_window,
-                        snapshot.window_scope.clone(),
-                    )
-                    .await;
+                    observation.snapshot_id = Some(
+                        self.commit_observed_snapshot(
+                            &nodes,
+                            snapshot.root_pid,
+                            tree_window,
+                            snapshot.window_scope.clone(),
+                        )
+                        .await,
+                    );
                     if let Some(warning) = unscoped_accessibility_tree_warning(
                         snapshot.scoped,
                         true,
                         accessibility_target_requested,
                     ) {
                         notes.push(warning.to_string());
+                    }
+                    if let Some(note) = unmatched_accessibility_pid_note(
+                        target_pid,
+                        snapshot.root_pid,
+                        snapshot.app_filter_matched,
+                    ) {
+                        notes.push(note);
                     }
                     if let Some(note) = truncated_accessibility_tree_note(snapshot.truncated) {
                         notes.push(note.to_string());
@@ -5358,7 +7175,7 @@ impl ComputerUseLinux {
                     observation.accessibility_tree_truncated = Some(snapshot.truncated);
                 }
                 Err(error) => {
-                    self.commit_snapshot(&[], None).await;
+                    self.commit_cleared_snapshot().await;
                     let error = format!("{error:#}");
                     notes.push(format!("Post-action accessibility tree failed: {error}"));
                     observation.accessibility_tree = Some(TreeNodes::default());
@@ -5370,13 +7187,84 @@ impl ComputerUseLinux {
             }
         }
 
-        if observation.screenshot_error.is_some()
+        if screenshot_capture_failed
             || observation.accessibility_error.is_some()
             || observation.accessibility_tree_raw_count == Some(0)
         {
             self.diagnostics.invalidate();
         }
         (observation, screenshot_capture, notes)
+    }
+
+    async fn capture_element_observation(
+        &self,
+        capture: &PostActionCaptureParams,
+        screenshot_target: Option<&WindowTarget>,
+        tree_target: std::result::Result<&ElementObservationTarget, &String>,
+    ) -> (
+        PostActionObservation,
+        Option<ScreenshotCapture>,
+        Vec<String>,
+    ) {
+        // Screenshots keep the caller's target (or focused-window fallback).
+        // An element's verified owner scopes only the accessibility tree.
+        let screenshot_params = PostActionCaptureParams {
+            include_tree: Some(false),
+            ..capture.clone()
+        };
+        let (screenshot_observation, screenshot, mut notes) = self
+            .capture_post_action_observation(
+                &screenshot_params,
+                screenshot_target,
+                None,
+                TargetRaised::No,
+                PostActionScope::default(),
+            )
+            .await;
+        if !capture.include_tree.unwrap_or(false) {
+            return (screenshot_observation, screenshot, notes);
+        }
+
+        let (mut observation, _, tree_notes) = match tree_target {
+            Ok(target) => {
+                // The dispatched element's scope was bound before the action.
+                // A later snapshot must not narrow its process to another window.
+                let tree_params = PostActionCaptureParams {
+                    include_tree: Some(true),
+                    ..Default::default()
+                };
+                // A screenshot of this action already waited the settle delay.
+                self.capture_post_action_observation_with(
+                    &tree_params,
+                    Some(&target.owner),
+                    None,
+                    TargetRaised::No,
+                    PostActionScope::bound_to(target),
+                    capture.screenshot_scope().is_some(),
+                )
+                .await
+            }
+            Err(error) => {
+                // Like every failed post-action read: empty tree fields, and
+                // the replaced snapshot is not left for index calls.
+                self.commit_cleared_snapshot().await;
+                let message = format!("Post-action element observation failed: {error}");
+                let observation = PostActionObservation {
+                    accessibility_tree: Some(TreeNodes::default()),
+                    accessibility_tree_raw_count: Some(0),
+                    tree_scoped: Some(false),
+                    accessibility_tree_truncated: Some(false),
+                    accessibility_error: Some(message.clone()),
+                    ..Default::default()
+                };
+                self.diagnostics.invalidate();
+                (observation, None, vec![message])
+            }
+        };
+        observation.screenshot = screenshot_observation.screenshot;
+        observation.screenshot_error = screenshot_observation.screenshot_error;
+        notes.extend(tree_notes);
+        (observation, screenshot, notes)
     }
 
     /// `structured_tool_result` for an action. A failed action can mean the
@@ -5397,27 +7285,45 @@ impl ComputerUseLinux {
 
     async fn finish_action_output(
         &self,
+        output: ActionOutput,
+        capture: &PostActionCaptureParams,
+        target: Option<&WindowTarget>,
+        raised: TargetRaised,
+        scope: PostActionScope,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.finish_background_output(output, capture, target, raised, scope, None)
+            .await
+    }
+
+    /// finish_action_output with the background delivery report of a call
+    /// that asked for it.
+    async fn finish_background_output(
+        &self,
         mut output: ActionOutput,
         capture: &PostActionCaptureParams,
         target: Option<&WindowTarget>,
         raised: TargetRaised,
+        scope: PostActionScope,
+        background: Option<BackgroundReport>,
     ) -> Result<CallToolResult, ErrorData> {
         if !output.ok {
             return self.action_tool_result(
                 ActionToolOutput {
                     action: output,
+                    background,
                     observation: PostActionObservation::default(),
                 },
                 None,
             );
         }
         let (observation, screenshot, notes) = self
-            .capture_post_action_observation(capture, target, None, raised)
+            .capture_post_action_observation(capture, target, None, raised, scope)
             .await;
         output = with_notes(output, notes);
         self.action_tool_result(
             ActionToolOutput {
                 action: output,
+                background,
                 observation,
             },
             screenshot,
@@ -5429,7 +7335,8 @@ impl ComputerUseLinux {
         mut output: ActionOutput,
         verified: Option<bool>,
         capture: &PostActionCaptureParams,
-        target: Option<&WindowTarget>,
+        screenshot_target: Option<&WindowTarget>,
+        target: std::result::Result<&ElementObservationTarget, &String>,
     ) -> Result<CallToolResult, ErrorData> {
         if !output.ok && verified != Some(false) {
             return self.action_tool_result(
@@ -5442,7 +7349,7 @@ impl ComputerUseLinux {
             );
         }
         let (observation, screenshot, notes) = self
-            .capture_post_action_observation(capture, target, None, TargetRaised::No)
+            .capture_element_observation(capture, screenshot_target, target)
             .await;
         output = with_notes(output, notes);
         self.action_tool_result(
@@ -5482,6 +7389,7 @@ impl ComputerUseLinux {
                 Some(target),
                 fallback_window,
                 TargetRaised::Yes,
+                PostActionScope::default(),
             )
             .await;
         let message = (!notes.is_empty()).then(|| notes.join(" "));
@@ -5517,6 +7425,7 @@ impl ComputerUseLinux {
                 Some(target),
                 fallback_window,
                 TargetRaised::Yes,
+                PostActionScope::default(),
             )
             .await;
         for note in notes {
@@ -5561,6 +7470,23 @@ impl ComputerUseLinux {
         capture_width: u32,
         capture_height: u32,
     ) -> Result<WindowCoordinateMap> {
+        // The target was resolved before this capture was taken. Umbriel's
+        // bounds depend on what the capture covers, so they are read again
+        // for the frame in hand: bounds for another capture space are never
+        // applied to it.
+        let relisted;
+        let window = if window.backend == crate::windowing::backends::umbriel::UMBRIEL_BACKEND {
+            relisted = crate::windowing::backends::umbriel::window_for_capture(
+                window,
+                capture_width,
+                capture_height,
+            )
+            .await
+            .context("could not read the target window's bounds for this capture")?;
+            &relisted
+        } else {
+            window
+        };
         let bounds = window.bounds.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "targeted screenshot requires window bounds; refusing to return the full desktop"
@@ -5637,6 +7563,21 @@ impl ComputerUseLinux {
             .focused_window
             .as_ref()
             .unwrap_or(&focus.requested_window);
+        // Umbriel's bounds depend on what the capture covers: read them for
+        // the capture the caller's coordinates come from. Before the first
+        // capture of a session there is none yet, and the pointer's own
+        // capture comes after this mapping, so one is taken here instead of
+        // trusting bounds that only assume what the capture will cover.
+        let relisted;
+        let window = if window.backend == crate::windowing::backends::umbriel::UMBRIEL_BACKEND {
+            relisted = window_for_primed_capture(self.capture_space_rect(), |width, height| {
+                crate::windowing::backends::umbriel::window_for_capture(window, width, height)
+            })
+            .await?;
+            &relisted
+        } else {
+            window
+        };
         if !matches!(
             window.backend.as_str(),
             GNOME_SHELL_EXTENSION_BACKEND
@@ -5725,7 +7666,18 @@ impl ComputerUseLinux {
             return Some(explicit.to_string());
         }
 
-        let target_pid = window_context.and_then(|window| window.pid).or(params.pid);
+        if params.window_id.is_some() && window_context.is_none() {
+            return Some(UNMATCHABLE_ACCESSIBILITY_APP_FILTER.to_string());
+        }
+
+        if window_context
+            .and_then(|window| window.pid)
+            .or(params.pid.filter(|_| params.window_id.is_none()))
+            .is_some()
+        {
+            // Let the PID-scoped traversal discover every toolkit root.
+            return None;
+        }
         let candidates = accessibility_filter_candidates(window_context);
         let app_id = trimmed_nonempty(params.app_id.as_deref()).map(|requested| {
             window_context
@@ -5735,20 +7687,11 @@ impl ComputerUseLinux {
         let needs_app_id_evidence = app_id.is_some_and(|app_id| {
             !app_id.starts_with("window:") && !crate::windows::app_id_leaf(app_id).is_empty()
         });
-        let apps = if target_pid.is_some() || needs_app_id_evidence {
+        let apps = if needs_app_id_evidence {
             list_apps().await.ok()
         } else {
             None
         };
-
-        if let Some(target_pid) = target_pid {
-            if let Some(object_ref) = apps
-                .as_deref()
-                .and_then(|apps| select_accessibility_object_ref(apps, target_pid, &candidates))
-            {
-                return Some(object_ref);
-            }
-        }
 
         if let Some(app_id) = app_id {
             if !app_id.starts_with("window:") {
@@ -5756,7 +7699,9 @@ impl ComputerUseLinux {
             }
         }
 
-        if candidates.is_empty() && trimmed_nonempty(params.app_id.as_deref()).is_some() {
+        if candidates.is_empty()
+            && (params.window_id.is_some() || trimmed_nonempty(params.app_id.as_deref()).is_some())
+        {
             return Some(UNMATCHABLE_ACCESSIBILITY_APP_FILTER.to_string());
         }
         candidates.into_iter().next()
@@ -5934,6 +7879,10 @@ impl ComputerUseLinux {
         }
         if let Ok(mut guard) = self.desktop_size.lock() {
             *guard = Some((width, height));
+        }
+        if let Ok(mut layout) = self.capture_layout.lock() {
+            layout.generation = layout.generation.wrapping_add(1);
+            layout.monitors = CaptureMonitors::Unread;
         }
     }
 
@@ -6124,15 +8073,23 @@ impl ComputerUseLinux {
     /// by the screenshot pipeline), for checks against click coordinates.
     /// Best-effort; None disables the check.
     async fn capture_space_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        self.capture_space_rect_with(raw_capture_size).await
+    }
+
+    async fn capture_space_rect_with<C, CFut>(&self, capture: C) -> Option<(i32, i32, i32, i32)>
+    where
+        C: FnOnce() -> CFut,
+        CFut: Future<Output = Option<(u32, u32)>>,
+    {
         let cached = self.desktop_size.lock().ok().and_then(|guard| *guard);
         if let Some((w, h)) = cached {
             return Some((0, 0, w as i32, h as i32));
         }
         // One-time prime: a full-frame capture reveals the desktop size when
         // no prior capture is available.
-        let raw = capture_screenshot_raw().await.ok()?;
-        self.cache_desktop_size(raw.width, raw.height);
-        (raw.width > 0 && raw.height > 0).then_some((0, 0, raw.width as i32, raw.height as i32))
+        let (width, height) = capture().await?;
+        self.cache_desktop_size(width, height);
+        (width > 0 && height > 0).then_some((0, 0, width as i32, height as i32))
     }
 
     /// Warn when a targeted window pokes outside every monitor: clicks and
@@ -6148,7 +8105,7 @@ impl ComputerUseLinux {
         }
         // Window bounds are logical pixels: prefer the extension's logical
         // monitor layout (same space). The physical capture rect is a safe
-        // fallback — on scaled displays it is at least as large as the logical
+        // fallback: on scaled displays it is at least as large as the logical
         // union, so it can only under-warn, never false-positive.
         let rects = match self.logical_monitor_rects().await {
             Some(rects) => rects,
@@ -6173,25 +8130,203 @@ impl ComputerUseLinux {
             return None;
         }
         Some(format!(
-            "WARNING: the target window (bounds {x},{y} {w}x{h}) is only ~{visible_pct}% on-screen; off-screen regions are missing from screenshots and unreachable by coordinate input. Use move_window/resize_window to bring it fully on-screen."
+            "WARNING: the target window (bounds {x},{y} {w}x{h}) is only ~{visible_pct}% on-screen; off-screen regions are missing from screenshots and unreachable by coordinate input. Use move_window/resize_window (GNOME Shell extension or X11/EWMH only) to bring it fully on-screen."
         ))
     }
 
-    /// Warn when a click/scroll coordinate is outside the captured desktop.
-    /// Click coordinates are physical capture-space pixels, so compare ONLY
-    /// against the capture rect — the extension's logical layout is a
-    /// different space on scaled displays and would false-positive. This is a
-    /// best-effort warning: never request a new capture (and possibly consent)
-    /// merely to decide whether to append a note to an input result.
-    async fn off_screen_note_for_point(&self, x: i32, y: i32) -> Option<String> {
+    /// The off-screen note for a click or scroll coordinate.
+    async fn off_screen_note_for_point(
+        &self,
+        x: i32,
+        y: i32,
+        route: PointerRoute,
+    ) -> Option<String> {
+        self.named_off_screen_note("coordinate", x, y, route).await
+    }
+
+    /// Warn when a point is outside the captured desktop or on none of its
+    /// monitors. `name` calls the point out, such as "coordinate" or "start
+    /// coordinate". Points are capture pixels, so the logical monitor layout
+    /// is scaled onto the capture first; without a layout that fits the
+    /// capture, only the capture rectangle is checked. The text says what
+    /// `route` did with such a point. This is a best-effort warning: never
+    /// request a new capture (and possibly consent) merely to decide whether
+    /// to append a note to an input result.
+    async fn named_off_screen_note(
+        &self,
+        name: &str,
+        x: i32,
+        y: i32,
+        route: PointerRoute,
+    ) -> Option<String> {
         let (mw, mh) = self.desktop_size.lock().ok().and_then(|guard| *guard)?;
-        let visible = x >= 0 && y >= 0 && (x as u32) < mw && (y as u32) < mh;
-        if visible {
+        let in_capture = x >= 0 && y >= 0 && (x as u32) < mw && (y as u32) < mh;
+        if !in_capture {
+            return match route {
+                PointerRoute::X11 => {
+                    // The X server clamps each axis to the screen first.
+                    let clamped = (
+                        x.clamp(0, i32::try_from(mw).unwrap_or(i32::MAX) - 1),
+                        y.clamp(0, i32::try_from(mh).unwrap_or(i32::MAX) - 1),
+                    );
+                    let in_gap =
+                        self.capture_monitor_rects((mw, mh))
+                            .await
+                            .is_some_and(|monitors| {
+                                !point_on_capture_monitor(&monitors, clamped.0, clamped.1)
+                            });
+                    Some(if in_gap {
+                        format!(
+                            "WARNING: {name} {x},{y} is outside the captured desktop ({mw}x{mh}); the X server keeps the pointer on the screen, but the nearest point there, {},{}, is on no monitor, so the input landed at a monitor edge or on no visible pixel.",
+                            clamped.0, clamped.1
+                        )
+                    } else {
+                        format!(
+                            "WARNING: {name} {x},{y} is outside the captured desktop ({mw}x{mh}); the X server keeps the pointer on the screen, so the input landed at an edge instead."
+                        )
+                    })
+                }
+                // The device clamped the point, and the clamp note says where.
+                PointerRoute::Uinput => None,
+                // The portal sent nothing; its error says so.
+                PointerRoute::Portal => Some(format!(
+                    "WARNING: {name} {x},{y} is outside the captured desktop ({mw}x{mh})."
+                )),
+            };
+        }
+        let monitors = self.capture_monitor_rects((mw, mh)).await?;
+        if point_on_capture_monitor(&monitors, x, y) {
             return None;
         }
-        Some(format!(
-            "WARNING: coordinate {x},{y} is outside the captured desktop ({mw}x{mh}); the input landed on no visible pixel."
-        ))
+        Some(match route {
+            PointerRoute::Portal => format!(
+                "WARNING: {name} {x},{y} is on no monitor of the captured desktop ({mw}x{mh})."
+            ),
+            PointerRoute::X11 | PointerRoute::Uinput => format!(
+                "WARNING: {name} {x},{y} is on no monitor of the captured desktop ({mw}x{mh}); the input landed at a monitor edge or on no visible pixel."
+            ),
+        })
+    }
+
+    /// The off-screen note for each drag endpoint, naming the start and the
+    /// end. Only the endpoints are checked: the portal moves intermediate
+    /// motion onto the nearest shared monitor, and on X11 and uinput the drop
+    /// goes to the end point.
+    async fn drag_off_screen_notes(
+        &self,
+        start: (i32, i32),
+        end: (i32, i32),
+        route: PointerRoute,
+    ) -> Vec<String> {
+        let mut notes = Vec::new();
+        for (name, (x, y)) in [("start coordinate", start), ("end coordinate", end)] {
+            notes.extend(self.named_off_screen_note(name, x, y, route).await);
+        }
+        notes
+    }
+
+    /// The notes for a uinput drag: per endpoint, the clamp note, then the
+    /// monitor check of the point the device emitted.
+    async fn uinput_drag_notes(
+        &self,
+        result: &std::result::Result<crate::abs_pointer::DragLanding, String>,
+    ) -> Vec<String> {
+        let Ok(landing) = result else {
+            return Vec::new();
+        };
+        let mut notes = Vec::new();
+        for (name, landing) in [
+            ("start coordinate", landing.start),
+            ("end coordinate", landing.end),
+        ] {
+            notes.extend(abs_pointer_clamp_note(name, landing));
+            let (x, y) = landing.emitted;
+            notes.extend(
+                self.named_off_screen_note(name, x, y, PointerRoute::Uinput)
+                    .await,
+            );
+        }
+        notes
+    }
+
+    /// The off-screen note for a portal click or scroll at a capture point.
+    /// The caller holds a cached portal session, so a layout read takes the
+    /// session's layout and needs no query when the session has one.
+    async fn portal_off_screen_note(&self, point: Option<(i32, i32)>) -> Option<String> {
+        let (x, y) = point?;
+        self.off_screen_note_for_point(x, y, PointerRoute::Portal)
+            .await
+    }
+
+    /// The off-screen note for the point the uinput pointer emitted, which
+    /// is inside the capture after its clamp.
+    async fn uinput_off_screen_note(
+        &self,
+        result: &std::result::Result<crate::abs_pointer::PointerLanding, String>,
+    ) -> Option<String> {
+        let (x, y) = result.as_ref().ok()?.emitted;
+        self.off_screen_note_for_point(x, y, PointerRoute::Uinput)
+            .await
+    }
+
+    /// The cached capture's monitors in capture pixels, or None when the
+    /// layout is unknown or a Wayland layout does not scale evenly onto the
+    /// capture. The layout is read at most once per capture: from the portal
+    /// session when one is cached, as the portal checks points against it,
+    /// otherwise from the compositor, or from RandR on X11.
+    async fn capture_monitor_rects(
+        &self,
+        capture: (u32, u32),
+    ) -> Option<Vec<(i64, i64, i64, i64)>> {
+        let (generation, monitors) = {
+            let layout = self.capture_layout.lock().ok()?;
+            (layout.generation, layout.monitors.clone())
+        };
+        let monitors = match monitors {
+            CaptureMonitors::Unread => {
+                let read = self.read_monitor_layout().await;
+                if let Ok(mut layout) = self.capture_layout.lock() {
+                    if layout.generation == generation {
+                        layout.monitors = read.clone();
+                    }
+                }
+                read
+            }
+            read => read,
+        };
+        match monitors {
+            CaptureMonitors::Logical(rects) => monitor_rects_in_capture(&rects, capture),
+            CaptureMonitors::Root(rects) => root_monitor_rects(&rects),
+            CaptureMonitors::Unread | CaptureMonitors::Unknown => None,
+        }
+    }
+
+    async fn read_monitor_layout(&self) -> CaptureMonitors {
+        let wayland = self.is_wayland_session();
+        let layout = match self
+            .cached_portal_pointer_session()
+            .and_then(|session| session.monitor_layout().map(<[_]>::to_vec))
+        {
+            Some(layout) => Some(layout),
+            None => match crate::remote_desktop::kwin_desktop_layout().await {
+                Some(layout) => Some(layout),
+                // An X client could make a Wayland compositor start Xwayland.
+                None if wayland => crate::remote_desktop::compositor_desktop_layout().await,
+                None => crate::remote_desktop::logical_desktop_layout().await,
+            },
+        };
+        let Some(layout) = layout else {
+            return CaptureMonitors::Unknown;
+        };
+        let rects = layout
+            .iter()
+            .map(|monitor| (monitor.x, monitor.y, monitor.width, monitor.height))
+            .collect();
+        if wayland {
+            CaptureMonitors::Logical(rects)
+        } else {
+            CaptureMonitors::Root(rects)
+        }
     }
 
     /// Post-input feedback: which AT-SPI element holds keyboard focus in the
@@ -6345,9 +8480,135 @@ impl ComputerUseLinux {
     /// Readers may perform slow AT-SPI owner checks before resolving a click
     /// or scroll again. Keep the snapshot stable for the whole input operation;
     /// otherwise a checked index could resolve to a different app's node.
+    #[cfg(test)]
     async fn commit_snapshot(&self, nodes: &[AccessibilityNode], target_pid: Option<u32>) {
         let _input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         self.cache_snapshot(nodes, target_pid);
+    }
+
+    /// Drop the cached tree, under the input lock like every store. Over HTTP
+    /// the tree stays: other clients still hold its snapshot_id.
+    async fn commit_cleared_snapshot(&self) {
+        if self.require_snapshot_ids {
+            return;
+        }
+        let _input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        self.clear_snapshot();
+    }
+
+    /// The cached tree's pid and window scope, for a post-action tree with
+    /// no target of its own: always on stdio, and over HTTP only when the
+    /// action named that snapshot, since another client may have stored it.
+    fn post_action_scope(
+        &self,
+        cached: &CachedAccessibilitySnapshot,
+        named_snapshot: Option<&str>,
+    ) -> PostActionScope {
+        if !self.snapshot_readable_by_call(cached, named_snapshot) {
+            return PostActionScope::default();
+        }
+        let tree = cached.window_scope.clone().map(|scope| CachedTreeWindow {
+            scope,
+            pid: cached.pid,
+            window: cached.window_id.zip(cached.window_backend.clone()),
+        });
+        PostActionScope {
+            pid: cached.pid,
+            tree,
+            bound: false,
+        }
+    }
+
+    /// Whether a call may read the cached snapshot: always on stdio, and over
+    /// HTTP only when the call named it, since another client may have stored it.
+    fn snapshot_readable_by_call(
+        &self,
+        cached: &CachedAccessibilitySnapshot,
+        named_snapshot: Option<&str>,
+    ) -> bool {
+        !self.require_snapshot_ids
+            || trimmed_nonempty(named_snapshot).is_some_and(|named| named == cached.id)
+    }
+
+    /// On stdio the post-action tree reads the scope cached at capture time.
+    fn cached_post_action_context(&self) -> PostActionScope {
+        self.last_snapshot
+            .lock()
+            .map(|snapshot| self.post_action_scope(&snapshot, None))
+            .unwrap_or_default()
+    }
+
+    /// Over HTTP the scope was taken under the action's input lock; stdio
+    /// reads the cache. A scope bound to an element's owner holds on both.
+    fn post_action_scope_for_capture(&self, carried: PostActionScope) -> PostActionScope {
+        if self.require_snapshot_ids || carried.bound {
+            carried
+        } else {
+            self.cached_post_action_context()
+        }
+    }
+
+    /// Drop the cached tree and its spill file. The empty snapshot has no id,
+    /// so no result names it and every snapshot_id is refused until the next
+    /// tree is stored.
+    fn clear_snapshot(&self) {
+        self.tree_spiller.remove_current();
+        if let Ok(mut cached) = self.last_snapshot.lock() {
+            *cached = CachedAccessibilitySnapshot::default();
+        }
+    }
+
+    /// The snapshot_id of the cached tree, empty when none is cached.
+    #[cfg(test)]
+    fn cached_snapshot_id(&self) -> String {
+        self.last_snapshot
+            .lock()
+            .map(|snapshot| snapshot.id.clone())
+            .unwrap_or_default()
+    }
+
+    /// Refuse an element call whose `snapshot_id` names a replaced snapshot,
+    /// and return the scope its post-action tree may reuse. Callers hold the
+    /// input lock, which every store takes, so the snapshot checked here is
+    /// the one the call then resolves its element in; one lock section reads
+    /// the id and the scope.
+    fn check_element_snapshot(
+        &self,
+        action: &str,
+        snapshot_id: Option<&str>,
+        names_cached_element: bool,
+    ) -> std::result::Result<PostActionScope, String> {
+        let (cached_id, scope) = self
+            .last_snapshot
+            .lock()
+            .map(|snapshot| {
+                (
+                    snapshot.id.clone(),
+                    self.post_action_scope(&snapshot, snapshot_id),
+                )
+            })
+            .unwrap_or_default();
+        if !names_cached_element {
+            return Ok(scope);
+        }
+        self.require_snapshot_id(action, snapshot_id)?;
+        check_snapshot_id(snapshot_id, &cached_id, &self.snapshot_ids.prefix)
+            .map_err(|message| format!("{action} was not sent: {message}"))?;
+        Ok(scope)
+    }
+
+    /// Over HTTP, refuse a cached-element call that names no snapshot.
+    fn require_snapshot_id(
+        &self,
+        action: &str,
+        snapshot_id: Option<&str>,
+    ) -> std::result::Result<(), String> {
+        if self.require_snapshot_ids && trimmed_nonempty(snapshot_id).is_none() {
+            return Err(format!(
+                "{action} was not sent: snapshot_id is required over HTTP for element_index and selector calls, because another client's get_app_state can replace the cached tree. Pass the snapshot_id from your get_app_state result."
+            ));
+        }
+        Ok(())
     }
 
     /// Commit a post-action tree with the window it was taken for and its
@@ -6358,7 +8619,7 @@ impl ComputerUseLinux {
         target_pid: Option<u32>,
         window: Option<(u64, String)>,
         window_scope: Option<String>,
-    ) {
+    ) -> String {
         let _input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         self.store_snapshot_for(
             nodes,
@@ -6369,7 +8630,7 @@ impl ComputerUseLinux {
                 detail: NodeDetail::Compact,
                 window_scope,
             },
-        );
+        )
     }
 
     async fn commit_app_state_snapshot(
@@ -6380,42 +8641,45 @@ impl ComputerUseLinux {
         params: &GetAppStateParams,
         scoped: bool,
         shape: TreeShape,
-    ) {
+    ) -> String {
         let _input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         let recovery_scope = scoped.then(|| AccessibilityRecoveryScope {
             params: params.clone(),
             target_pid,
         });
-        self.store_snapshot(nodes, target_pid, recovery_scope, window, shape);
+        self.store_snapshot(nodes, target_pid, recovery_scope, window, shape)
     }
 
-    fn cache_snapshot(&self, nodes: &[AccessibilityNode], target_pid: Option<u32>) {
-        self.cache_snapshot_with_scope(nodes, target_pid, None);
+    #[cfg(test)]
+    fn cache_snapshot(&self, nodes: &[AccessibilityNode], target_pid: Option<u32>) -> String {
+        self.cache_snapshot_with_scope(nodes, target_pid, None)
     }
 
+    #[cfg(test)]
     fn cache_snapshot_with_scope(
         &self,
         nodes: &[AccessibilityNode],
         target_pid: Option<u32>,
         recovery_scope: Option<AccessibilityRecoveryScope>,
-    ) {
-        self.cache_snapshot_with_window(nodes, target_pid, recovery_scope, None);
+    ) -> String {
+        self.cache_snapshot_with_window(nodes, target_pid, recovery_scope, None)
     }
 
+    #[cfg(test)]
     fn cache_snapshot_with_window(
         &self,
         nodes: &[AccessibilityNode],
         target_pid: Option<u32>,
         recovery_scope: Option<AccessibilityRecoveryScope>,
         window: Option<&WindowInfo>,
-    ) {
+    ) -> String {
         self.store_snapshot(
             nodes,
             target_pid,
             recovery_scope,
             window,
             TreeShape::default(),
-        );
+        )
     }
 
     /// Replace the cached snapshot in one write, so its nodes, ownership,
@@ -6427,17 +8691,18 @@ impl ComputerUseLinux {
         recovery_scope: Option<AccessibilityRecoveryScope>,
         window: Option<&WindowInfo>,
         shape: TreeShape,
-    ) {
+    ) -> String {
         self.store_snapshot_for(
             nodes,
             target_pid,
             recovery_scope,
             window.map(|window| (window.window_id, window.backend.clone())),
             shape,
-        );
+        )
     }
 
-    /// store_snapshot for a window given as its id and backend.
+    /// store_snapshot for a window given as its id and backend. Returns the
+    /// new snapshot's id.
     fn store_snapshot_for(
         &self,
         nodes: &[AccessibilityNode],
@@ -6445,11 +8710,13 @@ impl ComputerUseLinux {
         recovery_scope: Option<AccessibilityRecoveryScope>,
         window: Option<(u64, String)>,
         shape: TreeShape,
-    ) {
+    ) -> String {
         // A spilled file matches only the snapshot it was written from.
         self.tree_spiller.remove_current();
+        let id = self.snapshot_ids.next();
         if let Ok(mut cached) = self.last_snapshot.lock() {
             *cached = CachedAccessibilitySnapshot {
+                id: id.clone(),
                 nodes: nodes.to_vec(),
                 pid: target_pid,
                 window_id: window.as_ref().map(|(window_id, _)| *window_id),
@@ -6459,11 +8726,12 @@ impl ComputerUseLinux {
                 window_scope: shape.window_scope,
             };
         }
+        id
     }
 
     #[cfg(test)]
     fn clear_cached_nodes(&self) {
-        self.cache_snapshot(&[], None);
+        self.clear_snapshot();
     }
 
     /// The window the cached snapshot was taken for, with its backend.
@@ -6949,6 +9217,8 @@ impl ComputerUseLinux {
             app_filter.as_deref(),
             accessibility_snapshot_target_pid(app_filter.as_deref(), target_pid),
             window_title.as_deref(),
+            // Recovery re-finds an element by its verified owner only.
+            None,
             max_nodes,
             max_depth,
         )
@@ -6964,25 +9234,193 @@ impl ComputerUseLinux {
         &self,
         params: &ActionParams,
         requested_action: Option<&str>,
-    ) -> Json<ActionOutput> {
-        self.perform_element_action_with(
-            params,
-            requested_action,
-            |object_ref, requested_action| async move {
-                invoke_accessibility_action(&object_ref, requested_action.as_deref()).await
-            },
-            |scope| async move { self.refresh_action_snapshot(&scope).await },
+    ) -> (
+        Json<ActionOutput>,
+        std::result::Result<ElementObservationTarget, String>,
+    ) {
+        let target = Mutex::new(None);
+        let capture_requested = params.capture.include_tree.unwrap_or(false);
+        // The post-action tree follows the element's bound owner, not the
+        // snapshot scope the call checked.
+        let (output, _) = self
+            .perform_element_action_with(
+                params,
+                requested_action,
+                |object_ref, requested_action| {
+                    let target = &target;
+                    async move {
+                        if capture_requested {
+                            let mut bound = self
+                                .element_observation_target(
+                                    &params.target,
+                                    &object_ref,
+                                    params.snapshot_id.as_deref(),
+                                )
+                                .await;
+                            let mut stored = target.lock().unwrap();
+                            if let (Ok(bound), Some(Ok(previous))) = (&mut bound, stored.as_ref()) {
+                                bound.inherit_tree_window(previous);
+                            }
+                            *stored = Some(bound);
+                        }
+                        invoke_accessibility_action(&object_ref, requested_action.as_deref()).await
+                    }
+                },
+                |scope| async move { self.refresh_action_snapshot(&scope).await },
+            )
+            .await;
+        (
+            output,
+            target
+                .into_inner()
+                .unwrap()
+                .unwrap_or_else(|| Ok(ElementObservationTarget::default())),
         )
-        .await
+    }
+
+    /// The dispatched element's verified owner and the window range its
+    /// tree keeps. Over HTTP the range comes only from a snapshot the call
+    /// named, as for every other post-action tree.
+    async fn element_observation_target(
+        &self,
+        requested: &ElementActionTarget,
+        object_ref: &str,
+        named_snapshot: Option<&str>,
+    ) -> std::result::Result<ElementObservationTarget, String> {
+        let selector_owner = if requested.window_id.is_none() && requested.pid.is_none() {
+            Some(
+                self.element_action_owner(requested.window_target().as_ref())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let mut target = self
+            .element_observation_target_with(requested, object_ref, named_snapshot, || async {
+                object_ref_application_pid(object_ref).await
+            })
+            .await?;
+        if let Some(owner) = selector_owner.filter(|owner| owner.exact_window) {
+            check_identifier_owner(target.pid, owner.pid)?;
+            // The preceding target check verifies pidless windows through the
+            // observed snapshot. A raw, uncached identifier has no such proof.
+            let observed_pidless_window = owner.pid.is_none()
+                && self.last_snapshot.lock().ok().is_some_and(|snapshot| {
+                    self.snapshot_readable_by_call(&snapshot, named_snapshot)
+                        && snapshot
+                            .nodes
+                            .iter()
+                            .any(|node| node.object_ref == object_ref)
+                        && owner.window.as_ref().is_some_and(|(window_id, backend)| {
+                            snapshot.window_id == Some(*window_id)
+                                && snapshot.window_backend.as_ref() == Some(backend)
+                        })
+                });
+            // Adding the verified PID must not override a title/app/class
+            // selector that already identified one of this process's windows.
+            if owner.pid == target.pid || observed_pidless_window {
+                target.window_id = owner.window.map(|(window_id, _)| window_id);
+            }
+        }
+        let tree_window = self.last_snapshot.lock().ok().and_then(|snapshot| {
+            if snapshot.pid.is_none()
+                || snapshot.pid != target.pid
+                || !snapshot
+                    .nodes
+                    .iter()
+                    .any(|node| node.object_ref == object_ref)
+            {
+                return None;
+            }
+            self.post_action_scope(&snapshot, named_snapshot).tree
+        });
+        Ok(ElementObservationTarget {
+            owner: target,
+            tree_window,
+        })
+    }
+
+    async fn element_observation_target_with<F, Fut>(
+        &self,
+        requested: &ElementActionTarget,
+        object_ref: &str,
+        named_snapshot: Option<&str>,
+        owner_pid: F,
+    ) -> std::result::Result<WindowTarget, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Option<u32>>>,
+    {
+        let cached_target = self.last_snapshot.lock().ok().and_then(|snapshot| {
+            if !self.snapshot_readable_by_call(&snapshot, named_snapshot) {
+                return None;
+            }
+            let node = snapshot
+                .nodes
+                .iter()
+                .find(|node| node.object_ref == object_ref)?;
+            let window_id = snapshot.window_scope.as_deref().and_then(|scope| {
+                // A narrowed tree also keeps dialogs and other toolkit roots.
+                // Only this node's nearest window ancestor proves its window.
+                let mut ancestor = node;
+                for _ in 0..snapshot.nodes.len() {
+                    if crate::atspi_tree::is_window_role(&ancestor.role) {
+                        return ancestor
+                            .name
+                            .as_deref()
+                            .filter(|name| *name == scope)
+                            .and(snapshot.window_id);
+                    }
+                    let parent_index = ancestor.parent_index?;
+                    ancestor = snapshot
+                        .nodes
+                        .iter()
+                        .find(|node| node.index == parent_index)?;
+                }
+                None
+            });
+            Some(WindowTarget {
+                pid: snapshot.pid,
+                window_id,
+                ..Default::default()
+            })
+            .filter(WindowTarget::has_target)
+        });
+        let observed_pid = cached_target.as_ref().and_then(|target| target.pid);
+        let mut target = requested
+            .window_target()
+            .or(cached_target)
+            .unwrap_or_default();
+        // window_id takes precedence over a caller's pid. Keep the dispatched
+        // object's observed owner for a window that the action may close.
+        if observed_pid.is_some() {
+            target.pid = observed_pid;
+        } else if requested.window_id.is_some() {
+            target.pid = None;
+        }
+        if target.pid.is_some() {
+            return Ok(target);
+        }
+        // Resolve the dispatched object, never the app that happens to be in
+        // front or an unrelated snapshot replaced by another MCP client. Even
+        // a pidless compositor window needs this owner if the window closes.
+        let pid = owner_pid()
+            .await
+            .map_err(|error| format!("could not read the element owner's PID: {error:#}"))?
+            .ok_or_else(|| {
+                "the dispatched element has no verified app or window owner".to_string()
+            })?;
+        target.pid = Some(pid);
+        Ok(target)
     }
 
     async fn perform_element_action_with<I, R, IFut, RFut>(
         &self,
         params: &ActionParams,
         requested_action: Option<&str>,
-        mut invoke: I,
+        invoke: I,
         refresh: R,
-    ) -> Json<ActionOutput>
+    ) -> (Json<ActionOutput>, PostActionScope)
     where
         I: FnMut(String, Option<String>) -> IFut,
         IFut: Future<Output = Result<crate::atspi_tree::ActionInvocation>>,
@@ -6991,6 +9429,46 @@ impl ComputerUseLinux {
     {
         let _input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         let received = Some(serde_json::json!(params.clone()));
+        // An element_identifier names the object itself, not a snapshot node.
+        match self.check_element_snapshot(
+            "perform_action",
+            params.snapshot_id.as_deref(),
+            trimmed_nonempty(params.element_identifier.as_deref()).is_none()
+                && (params.element_index.is_some() || !params.selector().is_empty()),
+        ) {
+            Ok(scope) => (
+                self.perform_checked_element_action(
+                    params,
+                    requested_action,
+                    invoke,
+                    refresh,
+                    received,
+                )
+                .await,
+                scope,
+            ),
+            Err(message) => (
+                action_error_output(message, &received),
+                PostActionScope::default(),
+            ),
+        }
+    }
+
+    /// The rest of perform_action; the caller holds the input lock.
+    async fn perform_checked_element_action<I, R, IFut, RFut>(
+        &self,
+        params: &ActionParams,
+        requested_action: Option<&str>,
+        mut invoke: I,
+        refresh: R,
+        received: Option<serde_json::Value>,
+    ) -> Json<ActionOutput>
+    where
+        I: FnMut(String, Option<String>) -> IFut,
+        IFut: Future<Output = Result<crate::atspi_tree::ActionInvocation>>,
+        R: FnOnce(AccessibilityRecoveryScope) -> RFut,
+        RFut: Future<Output = Result<RefreshedAccessibilitySnapshot>>,
+    {
         if let Err(message) = self
             .check_element_action_target(
                 &params.target,
@@ -7046,7 +9524,7 @@ impl ComputerUseLinux {
                 &received,
             );
         };
-        let original_pid = recovery_scope.params.pid.or(recovery_scope.target_pid);
+        let original_pid = action_recovery_target_pid(&recovery_scope, None);
         let observed_window_scope =
             recovery_scope.params.window_id.is_some() && original_window.is_some();
         if original_pid.is_none() && !observed_window_scope {
@@ -7108,7 +9586,7 @@ impl ComputerUseLinux {
         );
         // A recovery tree has not been shown to the caller. Its compacted
         // indices must never silently replace indices from get_app_state.
-        self.cache_snapshot(&[], None);
+        self.clear_snapshot();
         let recovered = match resolve_semantic_node(
             &nodes,
             &params.selector(),
@@ -7151,6 +9629,7 @@ fn action_recovery_target_pid(
     scope
         .params
         .pid
+        .filter(|_| scope.params.window_id.is_none())
         .or(scope.target_pid)
         .or(resolved_window_pid)
 }
@@ -7674,6 +10153,20 @@ fn truncated_accessibility_tree_note(truncated: bool) -> Option<&'static str> {
     )
 }
 
+fn unmatched_accessibility_pid_note(
+    target_pid: Option<u32>,
+    root_pid: Option<u32>,
+    app_filter_matched: bool,
+) -> Option<String> {
+    if root_pid.is_some() || app_filter_matched {
+        return None;
+    }
+    let pid = target_pid?;
+    Some(format!(
+        "No AT-SPI application root matched pid {pid}; the tree is empty. The app may have closed, may not expose accessibility, or may connect through a proxy. Run list_apps, then call get_app_state with app_name_or_bundle_identifier set to its accessibility name or root reference."
+    ))
+}
+
 fn shell_only_accessibility_tree_note(
     nodes: &[AccessibilityNode],
     scoped: bool,
@@ -8066,36 +10559,6 @@ fn accessibility_snapshot_target_pid(
     }
 }
 
-fn select_accessibility_object_ref(
-    apps: &[AccessibleAppSummary],
-    target_pid: u32,
-    candidates: &[String],
-) -> Option<String> {
-    let mut pid_matches = apps.iter().filter(|app| app.pid == Some(target_pid));
-    let first = pid_matches.next()?;
-    let second = pid_matches.next();
-
-    if second.is_none() {
-        return Some(first.object_ref.clone());
-    }
-
-    let lowered_candidates = candidates
-        .iter()
-        .map(|candidate| candidate.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-
-    apps.iter()
-        .filter(|app| app.pid == Some(target_pid))
-        .find(|app| {
-            let name = app.name.as_deref().unwrap_or_default().to_ascii_lowercase();
-            lowered_candidates
-                .iter()
-                .any(|candidate| !candidate.is_empty() && name.contains(candidate))
-        })
-        .map(|app| app.object_ref.clone())
-        .or_else(|| Some(first.object_ref.clone()))
-}
-
 fn accessibility_filter_candidates(window_context: Option<&WindowInfo>) -> Vec<String> {
     let Some(window) = window_context else {
         return Vec::new();
@@ -8230,6 +10693,1374 @@ fn prepare_app_state_screenshot(
         };
     }
     prepare_screenshot_payload(raw, options)
+}
+
+/// What background delivery sends.
+#[derive(Debug, Clone, Copy)]
+enum BackgroundInput<'a> {
+    Text(&'a str),
+    Key(&'a str),
+}
+
+impl BackgroundInput<'_> {
+    fn action(&self) -> &'static str {
+        match self {
+            BackgroundInput::Text(_) => "type_text",
+            BackgroundInput::Key(_) => "press_key",
+        }
+    }
+}
+
+/// The route a background type_text or press_key takes. Each one reaches its
+/// target without moving the compositor's keyboard focus.
+#[derive(Debug, Clone)]
+enum BackgroundRoute {
+    /// The element the call names, through AT-SPI.
+    Element,
+    /// A browser tab over DevTools; the selector is its id, URL or title.
+    BrowserTab(String),
+    /// The program in a terminal, by its tty. The pid is the terminal
+    /// window's own process when the tty came from a window: its terminal
+    /// must hold that tty's pty master, so a terminal whose pts belongs to
+    /// another devpts instance (a container) is never mistaken for one here.
+    Terminal(std::path::PathBuf, Option<u32>),
+    /// A whole window, through the agent's own keyboard focus (an X11 master
+    /// keyboard, a sway transient seat, or Hyprland sendkeystate).
+    Seat(Box<WindowInfo>, crate::agent_seat::SeatKind),
+}
+
+impl BackgroundRoute {
+    /// The route name results report.
+    fn name(&self) -> String {
+        match self {
+            BackgroundRoute::Element => "atspi-element".to_string(),
+            BackgroundRoute::BrowserTab(_) => "devtools-tab".to_string(),
+            BackgroundRoute::Terminal(..) => "terminal".to_string(),
+            BackgroundRoute::Seat(_, kind) => kind.name().to_string(),
+        }
+    }
+}
+
+/// Why a background route did not deliver.
+#[derive(Debug)]
+enum BackgroundRefusal {
+    /// No background route serves this target or input in this session (the
+    /// desktop, window manager or app lacks one), and nothing was sent.
+    /// Focused input can deliver it instead.
+    NoRoute(String),
+    /// A wrong, ambiguous or unsafe target, or a failure after input
+    /// started. The call fails.
+    Failed(String),
+}
+
+impl From<String> for BackgroundRefusal {
+    fn from(message: String) -> Self {
+        BackgroundRefusal::Failed(message)
+    }
+}
+
+type BackgroundResult<T> = std::result::Result<T, BackgroundRefusal>;
+
+/// Where focused input goes when background delivery has no route.
+#[derive(Debug, Clone, Default)]
+struct FocusFallback {
+    target: WindowTarget,
+    /// The AT-SPI element to give its window's keyboard focus first.
+    element: Option<String>,
+}
+
+/// What a background type_text, press_key, click or scroll came to.
+enum BackgroundOutcome {
+    /// A background route ran, or the call failed. The route is named when
+    /// the input was delivered.
+    Done(ActionOutput, Option<String>),
+    /// No background route serves the call; focused input to the fallback
+    /// target would deliver it.
+    Unavailable {
+        reason: String,
+        fallback: FocusFallback,
+    },
+}
+
+/// How a call that asked for background delivery was delivered.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct BackgroundReport {
+    /// The call asked for background delivery.
+    requested: bool,
+    /// A background route delivered the input. False: the input went, or
+    /// would go, through the user's keyboard focus and pointer.
+    used: bool,
+    /// The background route used: atspi-element, devtools-tab, terminal,
+    /// x11-master, sway-transient-seat, hyprland-send-key-state, gnome-pen,
+    /// gnome-touch, kwin-pen or kwin-touch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<String>,
+    /// False on the one-time notice: nothing was sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivered: Option<bool>,
+    /// Why no background route serves the call (on the notice).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// Repeat the same call to send it through normal focused input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_to_continue: Option<bool>,
+}
+
+impl BackgroundReport {
+    fn routed(route: String) -> Self {
+        Self {
+            requested: true,
+            used: true,
+            route: Some(route),
+            delivered: None,
+            reason: None,
+            retry_to_continue: None,
+        }
+    }
+
+    fn focused() -> Self {
+        Self {
+            requested: true,
+            used: false,
+            route: None,
+            delivered: None,
+            reason: None,
+            retry_to_continue: None,
+        }
+    }
+
+    fn notice(reason: &str) -> Self {
+        Self {
+            requested: true,
+            used: false,
+            route: None,
+            delivered: Some(false),
+            reason: Some(reason.to_string()),
+            retry_to_continue: Some(true),
+        }
+    }
+}
+
+/// The one-time notice when background delivery has no route.
+const BACKGROUND_NOTICE: &str = "Normal input would move the user's keyboard focus and pointer to the target. agent-workspace-linux (https://github.com/agent-sh/agent-workspace-linux) gives the agent its own session that never shares input with the user. To continue with normal input, repeat the call; this notice is not shown again in this session.";
+
+/// The window backend each seat route addresses windows through.
+fn seat_backend_matches(kind: crate::agent_seat::SeatKind, window: &WindowInfo) -> bool {
+    use crate::agent_seat::SeatKind;
+    use crate::windowing::backends::i3::{I3_BACKEND, SWAY_CONTAINER_ID_BASE};
+    let backend = window.backend.as_str();
+    match kind {
+        // i3 answers before EWMH on i3, with plain X11 window ids.
+        SeatKind::X11Master => {
+            backend == crate::windowing::backends::x11::X11_BACKEND
+                || (backend == I3_BACKEND && window.window_id < SWAY_CONTAINER_ID_BASE)
+        }
+        SeatKind::SwayTransientSeat => backend == crate::windowing::backends::i3::I3_BACKEND,
+        SeatKind::HyprlandSendKeyState => backend == registry::HYPRLAND_BACKEND,
+    }
+}
+
+/// A seat failure: no route (nothing sent, focused input can deliver), or a
+/// failure that says whether input may already have gone out.
+fn seat_refusal(error: &anyhow::Error) -> BackgroundRefusal {
+    if crate::agent_seat::lacks_route(error) {
+        BackgroundRefusal::NoRoute(format!("{error:#}"))
+    } else if crate::agent_seat::input_started(error) {
+        BackgroundRefusal::Failed(format!("Input through the agent seat stopped partway and may have been partly delivered; re-observe the target before retrying: {error:#}"))
+    } else {
+        BackgroundRefusal::Failed(format!(
+            "Nothing was sent through the agent seat: {error:#}"
+        ))
+    }
+}
+
+/// A background pointer call for the GNOME virtual pen, in capture pixels.
+#[derive(Debug, Clone, Copy)]
+enum PenRequest {
+    Click {
+        at: (i32, i32),
+        button: crate::agent_seat::PointerButton,
+        count: u32,
+    },
+    Drag {
+        start: (i32, i32),
+        end: (i32, i32),
+    },
+    Scroll {
+        at: (i32, i32),
+        dx: i32,
+        dy: i32,
+    },
+}
+
+/// The windows the virtual pen checks a point against, bottom to top.
+async fn pen_windows(
+    desktop: crate::virtual_pen::Desktop,
+) -> anyhow::Result<Vec<crate::windowing::types::WindowInfo>> {
+    match desktop {
+        crate::virtual_pen::Desktop::Gnome => {
+            crate::windowing::backends::gnome::extension_windows_stacked().await
+        }
+        // The indicator's overlay surfaces take no input (an empty input
+        // region), so they cover nothing.
+        crate::virtual_pen::Desktop::Kwin => {
+            Ok(crate::windowing::backends::kwin::windows_stacked()
+                .await?
+                .into_iter()
+                .filter(|window| !window.pid.is_some_and(is_indicator_process))
+                .collect())
+        }
+    }
+}
+
+/// What a pen or touch action did to the user's keyboard focus: the
+/// compositor focuses the window a tip press or a touch lands on.
+/// Whether pid runs this server's on-screen indicator.
+fn is_indicator_process(pid: u32) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| {
+        exe.file_name()
+            .is_some_and(|name| name == "codex-computer-use-indicator")
+    })
+}
+
+fn pen_focus_sentence(before: Option<u64>, after: Option<Option<u64>>) -> String {
+    match after {
+        None => "The user's keyboard focus could not be read back.".to_string(),
+        Some(after) if after == before => "The user's keyboard focus did not move.".to_string(),
+        Some(Some(after)) => format!(
+            "The compositor gave window_id {after} keyboard focus{}, so the user's typing now goes there.",
+            before
+                .map(|before| format!(" (it was on window_id {before})"))
+                .unwrap_or_default()
+        ),
+        Some(None) => "The user's keyboard focus left the window it was on.".to_string(),
+    }
+}
+
+fn seat_focus_sentence(unchanged: Option<bool>) -> &'static str {
+    match unchanged {
+        Some(true) => "the user's keyboard focus did not move.",
+        Some(false) => {
+            "the user's keyboard focus changed during the call; check it before sending more."
+        }
+        None => "the user's keyboard focus could not be read back.",
+    }
+}
+
+/// What a pointer or keyboard call that may have asked for background
+/// delivery did to its window, for the post-action crop: focused input
+/// (including the fallback) raises it, a background route does not.
+fn background_target_raised(background: bool, report: Option<&BackgroundReport>) -> TargetRaised {
+    if report.map_or(background, |report| report.used) {
+        TargetRaised::No
+    } else {
+        TargetRaised::Yes
+    }
+}
+
+/// A reason as one sentence.
+fn as_sentence(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.ends_with(['.', '!', '?']) {
+        reason.to_string()
+    } else {
+        format!("{reason}.")
+    }
+}
+
+impl ComputerUseLinux {
+    /// A handle for a new MCP session: shared state, with its own one-time
+    /// background notice.
+    pub fn for_new_session(&self) -> Self {
+        Self {
+            background_notice_shown: Arc::default(),
+            ..self.clone()
+        }
+    }
+
+    /// The first call in a server session that asked for background
+    /// delivery and has no route gets a notice and sends nothing. Every later
+    /// one goes through focused input (None here).
+    fn background_notice(
+        &self,
+        action: &str,
+        reason: &str,
+        received: Option<serde_json::Value>,
+    ) -> Option<(ActionOutput, BackgroundReport)> {
+        if self
+            .background_notice_shown
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some((
+            ActionOutput {
+                ok: false,
+                implemented: true,
+                action: action.to_string(),
+                message: format!(
+                    "Not sent: background delivery is not available here: {} {BACKGROUND_NOTICE}",
+                    as_sentence(reason)
+                ),
+                received,
+            },
+            BackgroundReport::notice(reason),
+        ))
+    }
+
+    /// Before focused input that stands in for an element route, give the
+    /// element its window's keyboard focus.
+    async fn focus_fallback_element(
+        &self,
+        fallback: &FocusFallback,
+    ) -> std::result::Result<(), String> {
+        let Some(object_ref) = fallback.element.as_deref() else {
+            return Ok(());
+        };
+        crate::atspi_tree::focus_element(object_ref)
+            .await
+            .map_err(|error| format!("Nothing was sent: no background route reaches the element, and giving it keyboard focus for normal input failed: {error:#}."))
+    }
+
+    /// Where focused input goes when a route cannot deliver: the same window
+    /// target; for a browser tab, the one window whose title contains the
+    /// tab's name; for an element, its window, with the element focused
+    /// first.
+    async fn focus_fallback(
+        &self,
+        route: &BackgroundRoute,
+        target: &WindowTarget,
+        background: &BackgroundKeyboardParams,
+        input: BackgroundInput<'_>,
+    ) -> std::result::Result<FocusFallback, String> {
+        match route {
+            BackgroundRoute::BrowserTab(tab) => {
+                let windows = list_windows()
+                    .await
+                    .map_err(|error| format!("Nothing was sent: {error:#}"))?;
+                let needle = tab.to_lowercase();
+                let shows_tab = |window: &&WindowInfo| {
+                    window
+                        .title
+                        .as_deref()
+                        .is_some_and(|title| title.to_lowercase().contains(&needle))
+                };
+                let window = if target.has_target() {
+                    let window = resolve_window_target(&windows, target)
+                        .map_err(|error| format!("Nothing was sent: {error:#}"))?;
+                    if !shows_tab(&window) {
+                        return Err(format!("Nothing was sent: no background route reaches the tab, and window_id {} does not show a tab titled like {tab:?}, so normal input could go to another tab.", window.window_id));
+                    }
+                    window
+                } else {
+                    let matches = windows.iter().filter(shows_tab).collect::<Vec<_>>();
+                    match matches.as_slice() {
+                        [window] => *window,
+                        [] => return Err(format!("Nothing was sent: no background route reaches the tab, and no window title contains {tab:?} for normal input; name the browser window or set {}.", crate::devtools::DEVTOOLS_ENV)),
+                        several => return Err(format!("Nothing was sent: no background route reaches the tab, and {} window titles contain {tab:?}; name the browser window.", several.len())),
+                    }
+                };
+                Ok(FocusFallback {
+                    target: WindowTarget {
+                        window_id: Some(window.window_id),
+                        ..WindowTarget::default()
+                    },
+                    element: None,
+                })
+            }
+            BackgroundRoute::Element => {
+                let identifier = trimmed_nonempty(background.element_identifier.as_deref());
+                self.check_element_snapshot(
+                    "background fallback",
+                    background.snapshot_id.as_deref(),
+                    identifier.is_none(),
+                )?;
+                // The purpose the route resolved the element with, so the
+                // fallback focuses the same node.
+                let purpose = match input {
+                    BackgroundInput::Text(_) => ElementResolvePurpose::SetValue,
+                    BackgroundInput::Key(_) => ElementResolvePurpose::Action,
+                };
+                let object_ref = self.resolve_object_ref(
+                    background.element_index,
+                    identifier,
+                    &background.selector(),
+                    purpose,
+                )?;
+                const NO_WINDOW: &str = "Nothing was sent: no background route reaches the element, and normal input needs the element's window; pass its window_id or pid.";
+                let window = if target.has_target() {
+                    target.clone()
+                } else if identifier.is_some() {
+                    return Err(NO_WINDOW.to_string());
+                } else {
+                    let snapshot = self
+                        .last_snapshot
+                        .lock()
+                        .map_err(|_| NO_WINDOW.to_string())?;
+                    match (snapshot.window_id, snapshot.pid) {
+                        (Some(window_id), _) => WindowTarget {
+                            window_id: Some(window_id),
+                            ..WindowTarget::default()
+                        },
+                        (None, Some(pid)) => WindowTarget {
+                            pid: Some(pid),
+                            ..WindowTarget::default()
+                        },
+                        (None, None) => return Err(NO_WINDOW.to_string()),
+                    }
+                };
+                Ok(FocusFallback {
+                    target: window,
+                    element: Some(object_ref),
+                })
+            }
+            _ => Ok(FocusFallback {
+                target: target.clone(),
+                element: None,
+            }),
+        }
+    }
+
+    /// Which background route serves the call, or why none does. Order:
+    /// element, browser tab, terminal, agent seat.
+    async fn background_route(
+        &self,
+        background: &BackgroundKeyboardParams,
+        target: &WindowTarget,
+    ) -> BackgroundResult<BackgroundRoute> {
+        let element = background.names_element();
+        let tab = background.browser_tab();
+        if element && tab.is_some() {
+            return Err(
+                "Nothing was sent: name an element or a browser_tab, not both."
+                    .to_string()
+                    .into(),
+            );
+        }
+        if element {
+            if target.has_terminal_target() {
+                return Err(
+                    "Nothing was sent: terminal selectors do not combine with an element target."
+                        .to_string()
+                        .into(),
+                );
+            }
+            return Ok(BackgroundRoute::Element);
+        }
+        if let Some(tab) = tab {
+            return Ok(BackgroundRoute::BrowserTab(tab.to_string()));
+        }
+        if let Some(tty) = target.tty.as_deref().filter(|tty| !tty.trim().is_empty()) {
+            return crate::background_input::tty_path(tty)
+                .map(|tty| BackgroundRoute::Terminal(tty, None))
+                .map_err(|error| format!("Nothing was sent: {error}.").into());
+        }
+        // A pid inside a tmux pane has no terminal window of its own; its
+        // stdin names the pane's tty.
+        if let Some(pid) = target
+            .terminal_pid
+            .filter(|_| target.terminal_command.is_none() && target.terminal_cwd.is_none())
+        {
+            if let Some(tty) = crate::background_input::process_tty(pid) {
+                return Ok(BackgroundRoute::Terminal(tty, None));
+            }
+        }
+        if !target.has_target() {
+            return Err(BackgroundRefusal::NoRoute(format!(
+                "the call names no element, browser_tab ({} set), terminal or window that background input can reach",
+                crate::devtools::DEVTOOLS_ENV
+            )));
+        }
+        let windows = list_windows()
+            .await
+            .map_err(|error| format!("Nothing was sent: {error:#}"))?;
+        let window = resolve_window_target(&windows, target)
+            .map_err(|error| format!("Nothing was sent: {error:#}"))?;
+        let seat = crate::agent_seat::availability();
+        match window.terminal.as_ref() {
+            Some(terminal) => {
+                let tty = crate::background_input::tty_path(&terminal.tty)
+                    .map_err(|error| format!("Nothing was sent: {error}."))?;
+                // A terminal no channel reaches still takes keys through the
+                // agent seat, like any other window.
+                if let Ok(kind) = seat {
+                    if seat_backend_matches(kind, window)
+                        && !crate::background_input::probe_terminal(&tty)
+                            .await
+                            .is_ok_and(|probe| probe.channel.is_some())
+                    {
+                        return Ok(BackgroundRoute::Seat(Box::new(window.clone()), kind));
+                    }
+                }
+                Ok(BackgroundRoute::Terminal(tty, window.pid))
+            }
+            None => match seat {
+                Ok(kind) if seat_backend_matches(kind, window) => {
+                    Ok(BackgroundRoute::Seat(Box::new(window.clone()), kind))
+                }
+                Ok(_) => Err(BackgroundRefusal::NoRoute(format!(
+                    "window_id {} comes from the {} window backend, which the agent seat cannot address",
+                    window.window_id, window.backend
+                ))),
+                Err(reason) => Err(BackgroundRefusal::NoRoute(format!(
+                    "window_id {} is not a terminal with a known tty. {reason}",
+                    window.window_id
+                ))),
+            },
+        }
+    }
+
+    /// Keys to a whole window through the agent's own keyboard focus.
+    async fn background_seat(
+        &self,
+        window: &WindowInfo,
+        kind: crate::agent_seat::SeatKind,
+        input: BackgroundInput<'_>,
+        input_guard: InputOperationGuard,
+    ) -> BackgroundResult<String> {
+        use crate::agent_seat::{self as seat, SeatKind};
+        let action = input.action();
+        let (shown, strokes) = match input {
+            BackgroundInput::Text(text) => (
+                text,
+                seat::text_strokes(text).map_err(BackgroundRefusal::NoRoute)?,
+            ),
+            BackgroundInput::Key(key) => {
+                let press = crate::hyprland_input::chord_to_key_press(key)
+                    .ok_or_else(|| "Unsupported key.".to_string())?;
+                (key, vec![seat::chord_stroke(&press)?])
+            }
+        };
+        // Hyprland's checks come before the indicator: a call they turn away
+        // sends nothing.
+        let hyprland_presses = if kind == SeatKind::HyprlandSendKeyState {
+            let presses = match input {
+                BackgroundInput::Text(text) => crate::hyprland_input::text_to_key_presses(text)
+                    .map_err(BackgroundRefusal::NoRoute)?,
+                BackgroundInput::Key(key) => vec![crate::hyprland_input::chord_to_key_press(key)
+                    .ok_or_else(|| "Unsupported key.".to_string())?],
+            };
+            match crate::windowing::backends::hyprland::devices_json().await {
+                Ok(json) if crate::hyprland_input::keymap_is_us(&json) => {}
+                Ok(_) => return Err(BackgroundRefusal::NoRoute("Hyprland background input maps keys for a US layout, and the active keymap is not US".to_string())),
+                Err(error) => return Err(format!("Nothing was sent: {error:#}").into()),
+            }
+            Some(presses)
+        } else {
+            None
+        };
+        // The user's focus is elsewhere, so whether the target's field is
+        // secret is unknown; the indicator masks what it shows.
+        if action == "press_key" {
+            self.indicator.keys(shown, true).await;
+        } else {
+            self.indicator.text(action, shown, true).await;
+        }
+        if let Some(presses) = hyprland_presses {
+            crate::windowing::backends::hyprland::send_key_events(window.window_id, &presses)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            return Ok(format!(
+                "Sent {} key presses to window_id {} through Hyprland sendkeystate; the user's focus, cursor and workspace did not change.",
+                presses.len(),
+                window.window_id
+            ));
+        }
+        let count = strokes.len();
+        let report = seat::send_keys(kind, seat::SeatTarget::from(window), strokes, input_guard)
+            .await
+            .map_err(|error| seat_refusal(&error))?;
+        Ok(format!(
+            "Sent {count} keys to window_id {} through the agent seat {} ({}); {}",
+            window.window_id,
+            report.seat,
+            report.route.name(),
+            seat_focus_sentence(report.user_focus_unchanged)
+        ))
+    }
+
+    /// click or scroll with delivery "background": the agent seat's own
+    /// pointer moves, never the user's.
+    #[allow(clippy::too_many_arguments)]
+    async fn background_pointer(
+        &self,
+        action: &'static str,
+        point: (Option<i32>, Option<i32>),
+        target: Option<WindowTarget>,
+        unsupported_target: bool,
+        input: impl FnOnce(f64, f64) -> crate::agent_seat::PointerInput,
+        received: Option<serde_json::Value>,
+        input_guard: impl Send + 'static,
+    ) -> BackgroundOutcome {
+        use crate::agent_seat::{self as seat, SeatKind};
+        let fail = |message: String| {
+            BackgroundOutcome::Done(action_result(action, Err(message), received.clone()), None)
+        };
+        let unavailable = |reason: String| BackgroundOutcome::Unavailable {
+            reason,
+            fallback: FocusFallback::default(),
+        };
+        if unsupported_target {
+            return unavailable(format!("a background {action} takes x and y in screenshot capture pixels, without relative, coordinate_space or an element"));
+        }
+        let (Some(x), Some(y)) = point else {
+            return unavailable(format!(
+                "a background {action} needs x and y in screenshot capture pixels"
+            ));
+        };
+        if let Ok(desktop) = crate::virtual_pen::availability() {
+            let request = match input(f64::from(x), f64::from(y)) {
+                seat::PointerInput::Click { button, count, .. } => PenRequest::Click {
+                    at: (x, y),
+                    button,
+                    count,
+                },
+                seat::PointerInput::Scroll { dx, dy, .. } => {
+                    PenRequest::Scroll { at: (x, y), dx, dy }
+                }
+            };
+            return self
+                .background_pen(desktop, action, request, target, received, input_guard)
+                .await;
+        }
+        let kind = match seat::availability() {
+            Ok(SeatKind::HyprlandSendKeyState) => {
+                return unavailable("Hyprland has one seat and no second pointer; its background route (sendkeystate) sends keys only".to_string());
+            }
+            Ok(kind) => kind,
+            Err(reason) => return unavailable(reason),
+        };
+        // The point must land on a named window: the seat checks that the
+        // window is the one under the agent pointer before pressing.
+        let Some(target) = target.filter(|target| target.has_target()) else {
+            return unavailable(format!("a background {action} needs a window target (window_id, pid, app_id, wm_class or window_title) for the window under x and y"));
+        };
+        let window = match list_windows().await {
+            Ok(windows) => match resolve_window_target(&windows, &target) {
+                Ok(window) => window.clone(),
+                Err(error) => return fail(format!("Nothing was sent: {error:#}")),
+            },
+            // X11 without a window manager has no window list (wmctrl needs
+            // one); the seat itself checks that this window is the top-level
+            // under the agent pointer before it presses anything.
+            Err(_) if kind == SeatKind::X11Master && target.window_id.is_some() => WindowInfo {
+                window_id: target.window_id.unwrap_or_default(),
+                title: None,
+                app_id: None,
+                wm_class: None,
+                pid: None,
+                bounds: None,
+                workspace: None,
+                focused: false,
+                hidden: false,
+                client_type: None,
+                backend: crate::windowing::backends::x11::X11_BACKEND.to_string(),
+                terminal: None,
+            },
+            Err(error) => return fail(format!("Nothing was sent: {error:#}")),
+        };
+        if !seat_backend_matches(kind, &window) {
+            return unavailable(format!("window_id {} comes from the {} window backend, which the agent seat cannot address", window.window_id, window.backend));
+        }
+        self.indicator.action(action).await;
+        match seat::send_pointer(kind, seat::SeatTarget::from(&window), input(f64::from(x), f64::from(y)), input_guard).await {
+            Ok(report) => BackgroundOutcome::Done(
+                pointer_action_result(successful_action_with_focus(
+                    action,
+                    &format!(
+                        "Sent the {action} at ({x}, {y}) through the agent seat {}'s pointer; the user's pointer did not move, and {}",
+                        report.seat,
+                        seat_focus_sentence(report.user_focus_unchanged)
+                    ),
+                    received,
+                    None,
+                )),
+                Some(kind.name().to_string()),
+            ),
+            Err(error) => match seat_refusal(&error) {
+                BackgroundRefusal::NoRoute(reason) => unavailable(reason),
+                BackgroundRefusal::Failed(message) => fail(message),
+            },
+        }
+    }
+
+    /// click, drag or scroll with delivery "background" on GNOME: a virtual
+    /// pen clicks and drags, a virtual touchscreen pans, and the user's mouse
+    /// pointer stays where it is. The point must be on the target window,
+    /// with no window stacked above it there.
+    async fn background_pen(
+        &self,
+        desktop: crate::virtual_pen::Desktop,
+        action: &'static str,
+        request: PenRequest,
+        target: Option<WindowTarget>,
+        received: Option<serde_json::Value>,
+        input_guard: impl Send + 'static,
+    ) -> BackgroundOutcome {
+        use crate::virtual_pen::{self as pen, Gesture, PenButton, PenError};
+        let fail = |message: String| {
+            BackgroundOutcome::Done(action_result(action, Err(message), received.clone()), None)
+        };
+        let unavailable = |reason: String| BackgroundOutcome::Unavailable {
+            reason,
+            fallback: FocusFallback::default(),
+        };
+        let Some(target) = target.filter(|target| target.has_target()) else {
+            return unavailable(format!("a background {action} needs a window target (window_id, pid, app_id, wm_class or window_title) for the window under the point"));
+        };
+        // Before the extension: GNOME Shell turns extensions off on the lock
+        // screen, and focused input must not stand in there either.
+        if pen::screen_locked(desktop).await {
+            return fail("Nothing was sent: the screen is locked.".to_string());
+        }
+        if desktop == pen::Desktop::Kwin {
+            if let Some(reason) = pen::kwin_blocker().await {
+                return fail(format!("Nothing was sent: {reason}."));
+            }
+        }
+        let windows = match pen_windows(desktop).await {
+            Ok(windows) => windows,
+            Err(error) => {
+                return unavailable(match desktop {
+                    pen::Desktop::Gnome => format!("the virtual pen checks which window is under the point through the Codex GNOME Shell extension, which did not answer ({error:#}); run setup_window_targeting"),
+                    pen::Desktop::Kwin => format!("the virtual pen checks which window is under the point through KWin scripting, which did not answer ({error:#})"),
+                })
+            }
+        };
+        let window = match resolve_window_target(&windows, &target) {
+            Ok(window) => window.clone(),
+            Err(error) => {
+                // KWin's list holds only what the user can see; say why a
+                // window KWin has is not in it.
+                if desktop == pen::Desktop::Kwin {
+                    if let Ok(all) = crate::windowing::backends::kwin::list_windows().await {
+                        if let Ok(window) = resolve_window_target(&all, &target) {
+                            if !windows
+                                .iter()
+                                .any(|shown| shown.window_id == window.window_id)
+                            {
+                                return fail(format!("Nothing was sent: window_id {} is minimized, hidden, or not on the desktop and activity the user sees.", window.window_id));
+                            }
+                        }
+                    }
+                }
+                return fail(format!("Nothing was sent: {error:#}"));
+            }
+        };
+        let cached = self.desktop_size.lock().ok().and_then(|guard| *guard);
+        let capture = match cached {
+            Some(size) => size,
+            None => match raw_capture_size().await {
+                Some((width, height)) => {
+                    self.cache_desktop_size(width, height);
+                    (width, height)
+                }
+                None => return fail(
+                    "Nothing was sent: the screenshot size is unknown; take a screenshot first."
+                        .to_string(),
+                ),
+            },
+        };
+        let monitors = match desktop {
+            pen::Desktop::Gnome => pen::current_monitors().await,
+            pen::Desktop::Kwin => pen::kwin_monitors().await,
+        };
+        let monitors = match monitors {
+            Ok(monitors) => monitors,
+            Err(error) => {
+                return unavailable(format!(
+                    "the compositor's monitor layout could not be read: {error:#}"
+                ))
+            }
+        };
+        let check = |windows: &[crate::windowing::types::WindowInfo], point| match desktop {
+            pen::Desktop::Gnome => pen::check_point_on_target(windows, window.window_id, point),
+            pen::Desktop::Kwin => {
+                pen::check_point_on_visible_target(windows, window.window_id, point)
+            }
+        };
+        let layout = match pen::Layout::new(monitors, capture) {
+            Ok(layout) => layout,
+            Err(error) => return fail(format!("Nothing was sent: {}", as_sentence(&error))),
+        };
+        let on_target = |(x, y): (i32, i32)| {
+            let point = layout.logical_point(x, y);
+            check(&windows, point)
+                .map(|rect| (point, rect))
+                .map_err(|error| format!("Nothing was sent: {}", as_sentence(&error)))
+        };
+        let (gesture, route, shown) = match request {
+            PenRequest::Click { at, button, count } => {
+                let (point, _) = match on_target(at) {
+                    Ok(found) => found,
+                    Err(message) => return fail(message),
+                };
+                let button = match button {
+                    crate::agent_seat::PointerButton::Left => PenButton::Tip,
+                    crate::agent_seat::PointerButton::Right => PenButton::Upper,
+                    crate::agent_seat::PointerButton::Middle => PenButton::Lower,
+                };
+                (
+                    Gesture::Click {
+                        at: point,
+                        button,
+                        count,
+                    },
+                    desktop.pen_route(),
+                    format!("the {action} at ({}, {}) through a virtual pen", at.0, at.1),
+                )
+            }
+            PenRequest::Drag { start, end } => {
+                let (first, _) = match on_target(start) {
+                    Ok(found) => found,
+                    Err(message) => return fail(message),
+                };
+                if let Err(message) = on_target(end) {
+                    return fail(format!(
+                        "{message} A background drag stays inside one window."
+                    ));
+                }
+                let path = std::iter::once(first)
+                    .chain(
+                        crate::pointer_path::drag_points(start, end)
+                            .map(|(x, y)| layout.logical_point(x, y)),
+                    )
+                    .collect();
+                (
+                    Gesture::Drag { path },
+                    desktop.pen_route(),
+                    format!(
+                        "the drag from ({}, {}) to ({}, {}) through a virtual pen",
+                        start.0, start.1, end.0, end.1
+                    ),
+                )
+            }
+            PenRequest::Scroll { at, dx, dy } => {
+                let (point, rect) = match on_target(at) {
+                    Ok(found) => found,
+                    Err(message) => return fail(message),
+                };
+                let Some(monitor) = layout.monitor_at(point) else {
+                    return fail("Nothing was sent: no monitor holds the point.".to_string());
+                };
+                // A touchscreen maps to one monitor, through that monitor's
+                // rotation, which the device values here do not apply.
+                if monitor.transform == u32::MAX {
+                    return fail("Nothing was sent: a background scroll pans with a virtual touchscreen, and this monitor's rotation could not be read (kscreen-doctor -j).".to_string());
+                }
+                if monitor.transform != 0 {
+                    return fail("Nothing was sent: a background scroll pans with a virtual touchscreen, and this monitor is rotated or flipped.".to_string());
+                }
+                // Scrolling down moves the content up: the finger moves up.
+                let motion = (
+                    -f64::from(dx) * pen::PAN_PER_NOTCH,
+                    -f64::from(dy) * pen::PAN_PER_NOTCH,
+                );
+                let strokes =
+                    match pen::pan_strokes(point, motion, &pen::pan_bounds(&rect, &monitor.rect)) {
+                        Ok(strokes) => strokes,
+                        Err(error) => {
+                            return fail(format!("Nothing was sent: {}", as_sentence(&error)))
+                        }
+                    };
+                // Every stroke ends on the target too, with nothing above it.
+                for (_, end) in &strokes {
+                    if let Err(error) = check(&windows, *end) {
+                        return fail(format!(
+                            "Nothing was sent: the pan would end off the target: {}",
+                            as_sentence(&error)
+                        ));
+                    }
+                }
+                let distance: f64 = strokes
+                    .iter()
+                    .map(|(from, to)| (to.0 - from.0).abs() + (to.1 - from.1).abs())
+                    .sum();
+                let count = strokes.len();
+                (
+                    Gesture::Pan { strokes },
+                    desktop.touch_route(),
+                    format!(
+                        "the scroll at ({}, {}) as a {distance:.0} px touch pan in {count} stroke{} through a virtual touchscreen",
+                        at.0,
+                        at.1,
+                        if count == 1 { "" } else { "s" }
+                    ),
+                )
+            }
+        };
+        self.indicator.action(action).await;
+        let focused_before = windows
+            .iter()
+            .find(|window| window.focused)
+            .map(|window| window.window_id);
+        let sent = tokio::task::spawn_blocking(move || {
+            let _hold = input_guard;
+            pen::perform(&gesture, &layout, desktop)
+        })
+        .await;
+        match sent {
+            Err(error) => fail(format!("The virtual pen task failed: {error}")),
+            Ok(Err(PenError::NoRoute(reason))) => unavailable(reason),
+            Ok(Err(PenError::NotSent(message))) => fail(format!(
+                "Nothing was sent through the virtual pen: {}",
+                as_sentence(&message)
+            )),
+            Ok(Err(PenError::Partial(message))) => fail(format!(
+                "Input through the virtual pen stopped partway and may have been partly delivered; re-observe the target before retrying: {}",
+                as_sentence(&message)
+            )),
+            Ok(Ok(())) => {
+                let focused_after = pen_windows(desktop)
+                    .await
+                    .ok()
+                    .map(|windows| {
+                        windows
+                            .iter()
+                            .find(|window| window.focused)
+                            .map(|window| window.window_id)
+                    });
+                let focus = pen_focus_sentence(focused_before, focused_after);
+                let limits = if route == desktop.touch_route() {
+                    "A touch pan scrolls only where the app pans on touch; re-observe to confirm."
+                } else {
+                    "An app without tablet support does not see pen input; re-observe to confirm."
+                };
+                BackgroundOutcome::Done(
+                    pointer_action_result(successful_action_with_focus(
+                        action,
+                        &format!(
+                            "Sent {shown}; the user's mouse pointer did not move. {focus} {limits}"
+                        ),
+                        received,
+                        None,
+                    )),
+                    Some(route.to_string()),
+                )
+            }
+        }
+    }
+
+    /// type_text or press_key with delivery "background": never focuses a
+    /// window. When no route serves the target, it says why and where
+    /// focused input would go instead.
+    async fn dispatch_background_keyboard(
+        &self,
+        input: BackgroundInput<'_>,
+        target: &WindowTarget,
+        background: &BackgroundKeyboardParams,
+        received: Option<serde_json::Value>,
+    ) -> BackgroundOutcome {
+        let action = input.action();
+        let fail = |message: String| {
+            BackgroundOutcome::Done(action_result(action, Err(message), received.clone()), None)
+        };
+        let chord = match input {
+            BackgroundInput::Key(key) => match key_chord(key)
+                .and_then(|_| crate::hyprland_input::chord_to_key_press(key))
+            {
+                Some(press) => Some(crate::background_input::Chord::from_key_press(&press)),
+                None => return fail("Unsupported key. Use names like Enter, Escape, Tab, ArrowLeft, Super, Ctrl+L, or a single US keyboard letter/digit.".to_string()),
+            },
+            BackgroundInput::Text(_) => None,
+        };
+        let route = match self.background_route(background, target).await {
+            Ok(route) => route,
+            Err(BackgroundRefusal::Failed(message)) => return fail(message),
+            Err(BackgroundRefusal::NoRoute(reason)) => {
+                return self.unavailable(
+                    action,
+                    reason,
+                    FocusFallback {
+                        target: target.clone(),
+                        element: None,
+                    },
+                    received,
+                )
+            }
+        };
+        let result = match (&route, input, chord) {
+            (BackgroundRoute::Element, BackgroundInput::Text(text), _) => {
+                self.background_element_text(text, target, background).await
+            }
+            (BackgroundRoute::Element, BackgroundInput::Key(key), Some(chord)) => {
+                match self
+                    .background_element_key(key, &chord, target, background, received.clone())
+                    .await
+                {
+                    Ok(output) => {
+                        let route = output.ok.then(|| route.name());
+                        return BackgroundOutcome::Done(output, route);
+                    }
+                    Err(reason) => Err(BackgroundRefusal::NoRoute(reason)),
+                }
+            }
+            (BackgroundRoute::BrowserTab(tab), input, chord) => {
+                self.background_browser_tab(tab, input, chord.as_ref())
+                    .await
+            }
+            (BackgroundRoute::Terminal(tty, owner), input, chord) => {
+                self.background_terminal(tty, *owner, input, chord.as_ref())
+                    .await
+            }
+            (BackgroundRoute::Seat(window, kind), input, _) => {
+                let input_guard = InputOperationGuard::new(
+                    Arc::clone(&self.input_operation_lock).lock_owned().await,
+                );
+                self.background_seat(window, *kind, input, input_guard)
+                    .await
+            }
+            (BackgroundRoute::Element, BackgroundInput::Key(_), None) => {
+                Err("Unsupported key.".to_string().into())
+            }
+        };
+        match result {
+            Ok(message) => BackgroundOutcome::Done(
+                successful_action_with_focus(action, &message, received, None),
+                Some(route.name()),
+            ),
+            Err(BackgroundRefusal::Failed(message)) => fail(message),
+            Err(BackgroundRefusal::NoRoute(reason)) => {
+                match self.focus_fallback(&route, target, background, input).await {
+                    Ok(fallback) => self.unavailable(action, reason, fallback, received),
+                    // Neither route reaches the target: say why there is no
+                    // background route too.
+                    Err(message) => fail(format!(
+                        "{message} No background route: {}",
+                        as_sentence(&reason)
+                    )),
+                }
+            }
+        }
+    }
+
+    /// No route serves the call. With Hyprland background mode on, focused
+    /// input to a window target is the same sendkeystate route, so the call
+    /// fails instead.
+    fn unavailable(
+        &self,
+        action: &str,
+        reason: String,
+        fallback: FocusFallback,
+        received: Option<serde_json::Value>,
+    ) -> BackgroundOutcome {
+        if hyprland_background_applies(&fallback.target) {
+            return BackgroundOutcome::Done(
+                action_result(
+                    action,
+                    Err(format!(
+                        "Nothing was sent: {} Hyprland background mode (CODEX_COMPUTER_USE_HYPRLAND_BACKGROUND) is on, so normal input to a window goes through the same sendkeystate route.",
+                        as_sentence(&reason)
+                    )),
+                    received,
+                ),
+                None,
+            );
+        }
+        BackgroundOutcome::Unavailable { reason, fallback }
+    }
+
+    fn background_element_target(target: &WindowTarget) -> ElementActionTarget {
+        ElementActionTarget {
+            window_id: target.window_id,
+            pid: target.pid,
+            app_id: target.app_id.clone(),
+            wm_class: target.wm_class.clone(),
+            window_title: target.title.clone(),
+        }
+    }
+
+    /// The cached node an element_index or selector names, for its role.
+    fn background_cached_node(
+        &self,
+        background: &BackgroundKeyboardParams,
+    ) -> Option<AccessibilityNode> {
+        if trimmed_nonempty(background.element_identifier.as_deref()).is_some() {
+            return None;
+        }
+        self.resolve_cached_node(
+            background.element_index,
+            &background.selector(),
+            ElementResolvePurpose::SetValue,
+        )
+        .ok()
+    }
+
+    async fn background_element_text(
+        &self,
+        text: &str,
+        target: &WindowTarget,
+        background: &BackgroundKeyboardParams,
+    ) -> BackgroundResult<String> {
+        let _input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        let identifier = trimmed_nonempty(background.element_identifier.as_deref());
+        self.check_element_snapshot(
+            "type_text",
+            background.snapshot_id.as_deref(),
+            identifier.is_none(),
+        )?;
+        self.check_element_action_target(
+            &Self::background_element_target(target),
+            background.element_index,
+            identifier,
+            &background.selector(),
+            ElementResolvePurpose::SetValue,
+        )
+        .await?;
+        let object_ref = self.resolve_object_ref(
+            background.element_index,
+            identifier,
+            &background.selector(),
+            ElementResolvePurpose::SetValue,
+        )?;
+        // Mask unless the snapshot shows a field that is not a password.
+        let secret = self
+            .background_cached_node(background)
+            .is_none_or(|node| crate::indicator::is_secret_role(&node.role));
+        self.indicator.text("type_text", text, secret).await;
+        let insert = crate::atspi_tree::insert_text_into_element(&object_ref, text).await;
+        background_element_text_result(text, insert)
+    }
+
+    /// A key to a named element as the AT-SPI action it means. Err holds why
+    /// the key has no action there (no route; nothing was sent).
+    async fn background_element_key(
+        &self,
+        key: &str,
+        chord: &crate::background_input::Chord,
+        target: &WindowTarget,
+        background: &BackgroundKeyboardParams,
+        received: Option<serde_json::Value>,
+    ) -> std::result::Result<ActionOutput, String> {
+        let fail = |message: String| action_result("press_key", Err(message), received.clone());
+        let identifier = trimmed_nonempty(background.element_identifier.as_deref());
+        if let Err(message) = self.check_element_snapshot(
+            "press_key",
+            background.snapshot_id.as_deref(),
+            identifier.is_none(),
+        ) {
+            return Ok(fail(message));
+        }
+        // The element must belong to the window the call names, as for
+        // text: a key with no action falls back to that window.
+        if let Err(message) = self
+            .check_element_action_target(
+                &Self::background_element_target(target),
+                background.element_index,
+                identifier,
+                &background.selector(),
+                ElementResolvePurpose::Action,
+            )
+            .await
+        {
+            return Ok(fail(message));
+        }
+        let (role, states, actions) = match identifier {
+            Some(identifier) => {
+                match crate::atspi_tree::element_role_states_actions(identifier).await {
+                    Ok(described) => described,
+                    Err(error) => return Ok(fail(format!("Nothing was sent: {error:#}"))),
+                }
+            }
+            None => match self.resolve_cached_node(
+                background.element_index,
+                &background.selector(),
+                ElementResolvePurpose::Action,
+            ) {
+                Ok(node) => (
+                    node.role,
+                    node.states,
+                    node.actions.into_iter().map(|action| action.name).collect(),
+                ),
+                Err(message) => return Ok(fail(message)),
+            },
+        };
+        let action_name =
+            crate::background_input::element_key_action(chord, &role, &states, &actions)?;
+        self.indicator.keys(key, false).await;
+        let params = ActionParams {
+            element_index: background.element_index,
+            snapshot_id: background.snapshot_id.clone(),
+            element_identifier: background.element_identifier.clone(),
+            role: background.role.clone(),
+            name: background.name.clone(),
+            text: None,
+            states: background.states.clone(),
+            action: Some(action_name.clone()),
+            target: Self::background_element_target(target),
+            capture: PostActionCaptureParams::default(),
+        };
+        let (Json(mut output), _) = self
+            .perform_element_action(&params, Some(&action_name))
+            .await;
+        output.action = "press_key".to_string();
+        output.received = received;
+        if output.ok {
+            output.message = format!(
+                "{key} on the {role} ran its AT-SPI {action_name:?} action without keyboard focus; focus did not move. {}",
+                output.message
+            );
+        }
+        Ok(output)
+    }
+
+    async fn background_browser_tab(
+        &self,
+        selector: &str,
+        input: BackgroundInput<'_>,
+        chord: Option<&crate::background_input::Chord>,
+    ) -> BackgroundResult<String> {
+        if let Some(chord) = chord {
+            crate::devtools::key_supported(chord).map_err(BackgroundRefusal::NoRoute)?;
+        }
+        let port = crate::devtools::configured_port().map_err(BackgroundRefusal::NoRoute)?;
+        let tabs = crate::devtools::list_tabs(port)
+            .await
+            .map_err(|error| BackgroundRefusal::NoRoute(format!("{error:#}")))?;
+        let tab = crate::devtools::select_tab(&tabs, selector)
+            .map_err(|error| format!("Nothing was sent: {error}."))?
+            .clone();
+        let _input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        let place = format!("tab {} ({:?})", tab.id, tab.title);
+        let result = match (input, chord) {
+            (BackgroundInput::Text(text), _) => {
+                // The tab's field is unknown until DevTools reads it.
+                self.indicator.text("type_text", text, true).await;
+                match crate::devtools::insert_text(port, &tab, text).await {
+                    Ok(crate::devtools::TabTextOutcome::Verified { field }) => Ok(format!(
+                        "Inserted through DevTools Input.insertText into the focused {field} of {place}, which reads it back at the caret with the rest unchanged. OS keyboard focus did not move."
+                    )),
+                    Ok(crate::devtools::TabTextOutcome::PasswordVerified) => Ok(format!(
+                        "Inserted through DevTools Input.insertText into the focused password field of {place}; it reads back as expected. OS keyboard focus did not move."
+                    )),
+                    Ok(crate::devtools::TabTextOutcome::Unverified { field }) => Ok(format!(
+                        "Inserted through DevTools Input.insertText into the focused {field} of {place}; a contenteditable element is not read back, so re-observe it. OS keyboard focus did not move."
+                    )),
+                    Err(error) => Err(format!("{place}: {error}.")),
+                }
+            }
+            (BackgroundInput::Key(key), Some(chord)) => {
+                self.indicator.keys(key, false).await;
+                crate::devtools::press_key(port, &tab, chord)
+                    .await
+                    .map(|field| format!(
+                        "Sent {key} through DevTools Input.dispatchKeyEvent to {field} in {place}. Browser shortcuts handled outside the page do not run this way. OS keyboard focus did not move."
+                    ))
+                    .map_err(|error| format!("{place}: {error}."))
+            }
+            (BackgroundInput::Key(_), None) => Err("Unsupported key.".to_string()),
+        };
+        result.map_err(BackgroundRefusal::Failed)
+    }
+
+    async fn background_terminal(
+        &self,
+        tty: &Path,
+        owner: Option<u32>,
+        input: BackgroundInput<'_>,
+        chord: Option<&crate::background_input::Chord>,
+    ) -> BackgroundResult<String> {
+        use crate::background_input as bg;
+        let probe = bg::probe_terminal(tty)
+            .await
+            .map_err(|error| format!("Nothing was sent: {error:#}"))?;
+        if let Some(owner) = owner {
+            let held = probe
+                .emulator
+                .as_ref()
+                .is_some_and(|(_, holder)| bg::is_same_or_descendant(*holder, owner));
+            if !held {
+                return Err(format!(
+                    "Nothing was sent: the window's terminal (pid {owner}) does not hold the pty master of {} as this server sees it, so the tty may belong to another devpts instance, such as a container's. Pass the tty of a terminal on this host.",
+                    tty.display(),
+                )
+                .into());
+            }
+        }
+        let Some(channel) = probe.channel.as_ref() else {
+            return Err(BackgroundRefusal::NoRoute(probe.refusal(tty)));
+        };
+        let route = channel.describe();
+        if let Some(chord) = chord {
+            bg::terminal_key_supported(channel, chord).map_err(|reason| {
+                BackgroundRefusal::NoRoute(format!("{route} on {}: {reason}", tty.display()))
+            })?;
+        }
+        let _input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        let result = match (input, chord) {
+            (BackgroundInput::Text(text), _) => {
+                self.indicator.text("type_text", text, false).await;
+                bg::terminal_send_text(channel, tty, text)
+                    .await
+                    .map_err(|error| format!("{route} on {}: {error:#}", tty.display()))
+                    .map(|()| format!(
+                        "Sent to the program on {} through {route}. The terminal window was not focused. Terminal contents were not verified; re-observe before retrying.",
+                        tty.display()
+                    ))
+            }
+            (BackgroundInput::Key(key), Some(chord)) => {
+                self.indicator.keys(key, false).await;
+                bg::terminal_send_key(channel, tty, chord)
+                    .await
+                    .map_err(|error| format!("{route} on {}: {error}", tty.display()))
+                    .map(|sent| format!(
+                        "Sent {key} (as {sent}) to the program on {} through {route}. The terminal window was not focused.",
+                        tty.display()
+                    ))
+            }
+            (BackgroundInput::Key(_), None) => Err("Unsupported key.".to_string()),
+        };
+        result.map_err(BackgroundRefusal::Failed)
+    }
+}
+
+/// The background type_text result for an AT-SPI insert into a named element.
+/// An element AT-SPI cannot insert into has no route (nothing was sent).
+fn background_element_text_result(
+    text: &str,
+    insert: Result<FocusedTextInsert>,
+) -> BackgroundResult<String> {
+    const MAY_HAVE_CHANGED: &str = "The field may have changed; re-observe it before retrying.";
+    let failed = |message: String| Err(BackgroundRefusal::Failed(message));
+    match insert {
+        Ok(FocusedTextInsert::Verified { role, .. }) => Ok(format!(
+            "Inserted through AT-SPI EditableText into the named {role} without focusing it; it reads back the text at the insertion point with the rest unchanged. Keyboard focus did not move."
+        )),
+        Ok(FocusedTextInsert::PasswordUnverifiable) => Ok(
+            "Inserted through AT-SPI EditableText into the named password field without focusing it; its contents cannot be read back to verify. Keyboard focus did not move.".to_string(),
+        ),
+        Ok(FocusedTextInsert::NotEditable(reason)) => Err(BackgroundRefusal::NoRoute(reason)),
+        Ok(FocusedTextInsert::PasswordField) => Err(BackgroundRefusal::NoRoute(
+            "the element is a password field AT-SPI cannot insert into".to_string(),
+        )),
+        Ok(FocusedTextInsert::Mismatch {
+            expected_count,
+            read_count,
+            read_text,
+            read_truncated,
+        }) => failed(format!(
+            "AT-SPI took the insert, but the field does not read it back: expected {text:?} at the insertion point, the rest unchanged, and {expected_count} characters in all; read {read_text:?}{} at the insertion point and {read_count} characters. {MAY_HAVE_CHANGED}",
+            if read_truncated { " (first part)" } else { "" }
+        )),
+        Ok(FocusedTextInsert::ReadbackFailed) => failed(format!(
+            "AT-SPI took the insert, but reading the field back failed. {MAY_HAVE_CHANGED}"
+        )),
+        Ok(FocusedTextInsert::ReadbackTimedOut) => failed(format!(
+            "AT-SPI took the insert, but reading the field back timed out. {MAY_HAVE_CHANGED}"
+        )),
+        Ok(FocusedTextInsert::EditFailed {
+            reason,
+            may_have_changed,
+        }) => failed(format!(
+            "AT-SPI insert failed: {reason}. {}",
+            if may_have_changed {
+                MAY_HAVE_CHANGED
+            } else {
+                "No text was changed."
+            }
+        )),
+        Err(error) => failed(format!("Nothing was sent: {error:#}.")),
+    }
 }
 
 /// Whether targeted keyboard input goes through Hyprland background mode,
@@ -8409,6 +12240,152 @@ fn logical_window_crop_rect(
     let left = i32::try_from(left).map_err(|_| anyhow::anyhow!("scaled window x is invalid"))?;
     let top = i32::try_from(top).map_err(|_| anyhow::anyhow!("scaled window y is invalid"))?;
     Ok((left, top, width, height))
+}
+
+/// Scale logical monitor rectangles onto a capture of their bounding box, as
+/// (left, top, right, bottom) capture pixels. Edges round outward, so a pixel
+/// a monitor partly covers counts as on it. None for an empty or invalid
+/// layout, or a capture that is not the bounding box at one scale: the
+/// layout then describes another space.
+fn monitor_rects_in_capture(
+    monitors: &[(i32, i32, i32, i32)],
+    (capture_width, capture_height): (u32, u32),
+) -> Option<Vec<(i64, i64, i64, i64)>> {
+    if capture_width == 0
+        || capture_height == 0
+        || monitors
+            .iter()
+            .any(|(_, _, width, height)| *width <= 0 || *height <= 0)
+    {
+        return None;
+    }
+    let min_x = monitors.iter().map(|m| i64::from(m.0)).min()?;
+    let min_y = monitors.iter().map(|m| i64::from(m.1)).min()?;
+    let max_x = monitors
+        .iter()
+        .map(|m| i64::from(m.0) + i64::from(m.2))
+        .max()?;
+    let max_y = monitors
+        .iter()
+        .map(|m| i64::from(m.1) + i64::from(m.3))
+        .max()?;
+    let scale_x = f64::from(capture_width) / (max_x - min_x) as f64;
+    let scale_y = f64::from(capture_height) / (max_y - min_y) as f64;
+    if !scale_x.is_finite() || !scale_y.is_finite() || (scale_x - scale_y).abs() > 0.01 {
+        return None;
+    }
+    Some(
+        monitors
+            .iter()
+            .map(|&(x, y, width, height)| {
+                let (x, y) = (i64::from(x) - min_x, i64::from(y) - min_y);
+                (
+                    (x as f64 * scale_x).floor() as i64,
+                    (y as f64 * scale_y).floor() as i64,
+                    ((x + i64::from(width)) as f64 * scale_x).ceil() as i64,
+                    ((y + i64::from(height)) as f64 * scale_y).ceil() as i64,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// X11 monitor rectangles as (left, top, right, bottom) root pixels, the
+/// space of an X11 capture. They are not rebased or scaled: the root can be
+/// larger than the monitors' bounding box. None for an empty or invalid
+/// layout.
+fn root_monitor_rects(monitors: &[(i32, i32, i32, i32)]) -> Option<Vec<(i64, i64, i64, i64)>> {
+    if monitors.is_empty()
+        || monitors
+            .iter()
+            .any(|(_, _, width, height)| *width <= 0 || *height <= 0)
+    {
+        return None;
+    }
+    Some(
+        monitors
+            .iter()
+            .map(|&(x, y, width, height)| {
+                let (x, y) = (i64::from(x), i64::from(y));
+                (x, y, x + i64::from(width), y + i64::from(height))
+            })
+            .collect(),
+    )
+}
+
+/// A monitor's (left, top, right, bottom) edges in capture pixels.
+type MonitorEdges = (i64, i64, i64, i64);
+
+/// Monitor rectangles in reading order: monitors
+/// whose vertical ranges overlap form a row, rows go top to bottom and each
+/// row left to right. A row of monitors that are not top-aligned, such as a
+/// laptop panel bottom-aligned beside a taller external display, is still
+/// numbered left to right.
+fn monitors_in_reading_order(monitors: &[MonitorEdges]) -> Vec<MonitorEdges> {
+    let mut by_top = monitors.to_vec();
+    by_top.sort_by_key(|&(left, top, _, _)| (top, left));
+    // Each row with the lowest bottom edge of its monitors. A monitor joins
+    // the row when it overlaps it by more than 1 px: `monitor_rects_in_capture`
+    // rounds edges outward, so stacked monitors on a scaled capture can share
+    // 1 px at their common edge.
+    let mut rows: Vec<(i64, Vec<MonitorEdges>)> = Vec::new();
+    for monitor in by_top {
+        match rows.last_mut() {
+            Some((row_bottom, row)) if monitor.1 + 1 < *row_bottom => {
+                *row_bottom = (*row_bottom).max(monitor.3);
+                row.push(monitor);
+            }
+            _ => rows.push((monitor.3, vec![monitor])),
+        }
+    }
+    rows.into_iter()
+        .flat_map(|(_, mut row)| {
+            row.sort_by_key(|&(left, top, _, _)| (left, top));
+            row
+        })
+        .collect()
+}
+
+/// Monitor `index` of a capture, as a crop rectangle (x, y, width, height)
+/// clipped to the capture. `monitors` are (left, top, right, bottom) capture
+/// pixels; they are numbered in reading order (`monitors_in_reading_order`),
+/// so the order does not depend on how the compositor lists them.
+fn monitor_crop_rect(
+    monitors: &[(i64, i64, i64, i64)],
+    index: u32,
+    (capture_width, capture_height): (u32, u32),
+) -> std::result::Result<(i32, i32, u32, u32), String> {
+    let ordered = monitors_in_reading_order(monitors);
+    let count = ordered.len();
+    let &(left, top, right, bottom) = usize::try_from(index)
+        .ok()
+        .and_then(|index| ordered.get(index))
+        .ok_or_else(|| {
+            format!(
+                "monitor {index} does not exist; this desktop has {count} (0 to {})",
+                count.saturating_sub(1)
+            )
+        })?;
+    let left = left.clamp(0, i64::from(capture_width));
+    let top = top.clamp(0, i64::from(capture_height));
+    let right = right.clamp(left, i64::from(capture_width));
+    let bottom = bottom.clamp(top, i64::from(capture_height));
+    if right <= left || bottom <= top {
+        return Err(format!("monitor {index} is outside the capture"));
+    }
+    Ok((
+        left as i32,
+        top as i32,
+        (right - left) as u32,
+        (bottom - top) as u32,
+    ))
+}
+
+fn point_on_capture_monitor(monitors: &[(i64, i64, i64, i64)], x: i32, y: i32) -> bool {
+    let (x, y) = (i64::from(x), i64::from(y));
+    monitors
+        .iter()
+        .any(|&(left, top, right, bottom)| x >= left && x < right && y >= top && y < bottom)
 }
 
 fn clip_capture_rect(
@@ -8605,6 +12582,20 @@ fn unsafe_pointer_fallback(action: &str, received: Option<serde_json::Value>) ->
     }
 }
 
+fn portal_start_error(
+    action: &str,
+    error: anyhow::Error,
+    received: Option<serde_json::Value>,
+) -> ActionOutput {
+    ActionOutput {
+        ok: false,
+        implemented: true,
+        action: action.to_string(),
+        message: format!("Input was not sent because the remote desktop portal could not start; input was not replayed through ydotool: {error:#}"),
+        received,
+    }
+}
+
 fn abs_pointer_error(
     action: &str,
     error: String,
@@ -8615,6 +12606,77 @@ fn abs_pointer_error(
         implemented: true,
         action: action.to_string(),
         message: format!("Absolute pointer {action} may have started before it failed; input was not replayed through another backend: {error}"),
+        received,
+    }
+}
+
+/// Why the uinput pointer was not used, so the action was not sent.
+#[derive(Debug, PartialEq)]
+struct AbsPointerFailure {
+    detail: String,
+    /// The stale device was dropped, so the next call starts without one.
+    device_dropped: bool,
+}
+
+impl AbsPointerFailure {
+    fn lock_poisoned() -> Self {
+        Self {
+            detail: "absolute pointer lock was poisoned".to_string(),
+            device_dropped: false,
+        }
+    }
+
+    /// What the next call does once the stale device is gone. `retry` names
+    /// that call; `route` is [`ComputerUseLinux::pointer_retry_route`].
+    fn retry_note(&self, retry: &str, route: &str) -> String {
+        if !self.device_dropped {
+            return String::new();
+        }
+        format!(
+            " The stale device was removed. {retry} sizes a new device to a fresh screenshot; if that fails, {route}."
+        )
+    }
+}
+
+fn abs_pointer_not_sent(
+    action: &str,
+    failure: &AbsPointerFailure,
+    retry_route: &str,
+    received: Option<serde_json::Value>,
+) -> ActionOutput {
+    ActionOutput {
+        ok: false,
+        implemented: true,
+        action: action.to_string(),
+        message: format!(
+            "Absolute pointer {action} was not sent: {}; input was not replayed through another backend.{}",
+            failure.detail,
+            failure.retry_note("A retry", retry_route)
+        ),
+        received,
+    }
+}
+
+/// A KWin element click whose mapping worked but whose uinput pointer could
+/// not be used.
+fn kwin_abs_pointer_not_sent(
+    element_index: u32,
+    failure: &AbsPointerFailure,
+    retry_route: &str,
+    received: Option<serde_json::Value>,
+) -> ActionOutput {
+    ActionOutput {
+        ok: false,
+        implemented: true,
+        action: "click".to_string(),
+        message: format!(
+            "click was not sent: KWin mapped element_index {element_index}, but the uinput absolute pointer could not be used: {}. No pointer event was emitted.{}",
+            failure.detail,
+            failure.retry_note(
+                &format!("A retry of element_index {element_index}"),
+                retry_route
+            )
+        ),
         received,
     }
 }
@@ -8631,28 +12693,30 @@ fn abs_pointer_result(
                 implemented: true,
                 action: action.to_string(),
                 message: if action == "scroll" {
-                    "Pointer positioned through uinput; wheel input sent through ydotool."
+                    "Pointer positioned and wheel sent through the uinput absolute pointer."
                         .to_string()
                 } else {
                     "Action sent through the uinput absolute pointer.".to_string()
                 },
                 received,
             },
-            abs_pointer_clamp_note(landing),
+            abs_pointer_clamp_note("coordinate", landing),
         ),
         Err(error) => abs_pointer_error(action, error, received),
     }
 }
 
+/// Append the KWin mapping to a successful element click. The message
+/// already names the backend and holds its clamp or off-screen notes.
 fn kwin_element_click_dispatch_output(
     mut output: ActionOutput,
     kwin_click: Option<PreparedKwinElementClick>,
-    backend: &str,
 ) -> ActionOutput {
     if output.ok {
         if let Some(kwin_click) = kwin_click {
             output.message = format!(
-                "Click dispatched through {backend} using KWin element coordinate mapping: capture {},{}; portal logical {},{}. Dispatch only: UI activation was not verified.",
+                "{} KWin element coordinate mapping: capture {},{}; portal logical {},{}. Dispatch only: UI activation was not verified.",
+                output.message,
                 kwin_click.point.capture.0,
                 kwin_click.point.capture.1,
                 kwin_click.point.logical.0,
@@ -8675,20 +12739,6 @@ fn portal_action_error(
         message: format!(
             "Remote desktop portal {action} may have started before it failed; input was not replayed through another backend: {error:#}"
         ),
-        received,
-    }
-}
-
-fn portal_start_error(
-    action: &str,
-    error: anyhow::Error,
-    received: Option<serde_json::Value>,
-) -> ActionOutput {
-    ActionOutput {
-        ok: false,
-        implemented: true,
-        action: action.to_string(),
-        message: format!("Input was not sent because the remote desktop portal could not start; input was not replayed through ydotool: {error:#}"),
         received,
     }
 }
@@ -9085,10 +13135,15 @@ fn with_notes(mut output: ActionOutput, notes: impl IntoIterator<Item = String>)
     output
 }
 
-fn abs_pointer_clamp_note(landing: crate::abs_pointer::PointerLanding) -> Option<String> {
+/// Where the device moved a point it clamped. `name` calls out the point,
+/// such as "coordinate" or "start coordinate".
+fn abs_pointer_clamp_note(
+    name: &str,
+    landing: crate::abs_pointer::PointerLanding,
+) -> Option<String> {
     (landing.requested != landing.emitted).then(|| {
         format!(
-            "Requested coordinate {},{} was clamped to {},{} by the uinput absolute pointer.",
+            "Requested {name} {},{} was clamped to {},{} by the uinput absolute pointer.",
             landing.requested.0, landing.requested.1, landing.emitted.0, landing.emitted.1
         )
     })
@@ -9289,6 +13344,21 @@ where
     }
 }
 
+/// Wheel notches for a scroll in the kernel's signs: `REL_WHEEL` is positive
+/// up and `REL_HWHEEL` is positive right. libinput negates only the vertical
+/// axis, before per-device settings such as natural scrolling. Both wheel
+/// routes send them
+/// unchanged: the uinput pointer writes them, and `ydotool mousemove --wheel`
+/// writes its x to `REL_HWHEEL` and its y to `REL_WHEEL`.
+fn wheel_deltas(direction: ScrollDirection, units: i32) -> (i32, i32) {
+    match direction {
+        ScrollDirection::Up => (0, units),
+        ScrollDirection::Down => (0, -units),
+        ScrollDirection::Left => (-units, 0),
+        ScrollDirection::Right => (units, 0),
+    }
+}
+
 fn wheel_mousemove_args(dx: i32, dy: i32) -> Vec<String> {
     vec![
         "mousemove".to_string(),
@@ -9297,36 +13367,6 @@ fn wheel_mousemove_args(dx: i32, dy: i32) -> Vec<String> {
         dx.to_string(),
         dy.to_string(),
     ]
-}
-
-async fn run_cancellation_safe_guarded<G, T, F>(
-    guard: G,
-    operation: F,
-) -> (Option<G>, std::result::Result<T, String>)
-where
-    G: Send + 'static,
-    T: Send + 'static,
-    F: Future<Output = T> + Send + 'static,
-{
-    // Dropping a JoinHandle detaches its task, retaining the guard until the
-    // stateful input operation has completed even if the caller is cancelled.
-    match tokio::spawn(async move { (guard, operation.await) }).await {
-        Ok((guard, result)) => (Some(guard), Ok(result)),
-        Err(error) => (None, Err(format!("stateful input task failed: {error}"))),
-    }
-}
-
-async fn run_cancellation_safe_input<G, T, F>(
-    input_guard: G,
-    operation: F,
-) -> (Option<G>, std::result::Result<T, String>)
-where
-    G: Send + 'static,
-    T: Send + 'static,
-    F: Future<Output = std::result::Result<T, String>> + Send + 'static,
-{
-    let (input_guard, result) = run_cancellation_safe_guarded(input_guard, operation).await;
-    (input_guard, result.and_then(|result| result))
 }
 
 async fn run_ydotool_sequence(
@@ -9473,10 +13513,47 @@ where
         let pointer = guard
             .as_mut()
             .ok_or_else(|| "absolute pointer is unavailable".to_string())?;
-        operation(pointer).map_err(|error| format!("{error:#}"))
+        let result = operation(pointer).map_err(|error| format!("{error:#}"));
+        if result.is_err() {
+            // A failed write may have left a button down or an event half
+            // sent. Drop the device, which the kernel releases, so the next
+            // action builds a fresh one.
+            guard.take();
+        }
+        result
     })
     .await
     .map_err(|error| format!("absolute pointer task failed: {error}"))?
+}
+
+async fn run_cancellation_safe_guarded<G, T, F>(
+    guard: G,
+    operation: F,
+) -> (Option<G>, std::result::Result<T, String>)
+where
+    G: Send + 'static,
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    // Dropping a JoinHandle detaches its task, retaining the guard until the
+    // stateful input operation has completed even if the caller is cancelled.
+    match tokio::spawn(async move { (guard, operation.await) }).await {
+        Ok((guard, result)) => (Some(guard), Ok(result)),
+        Err(error) => (None, Err(format!("stateful input task failed: {error}"))),
+    }
+}
+
+async fn run_cancellation_safe_input<G, T, F>(
+    input_guard: G,
+    operation: F,
+) -> (Option<G>, std::result::Result<T, String>)
+where
+    G: Send + 'static,
+    T: Send + 'static,
+    F: Future<Output = std::result::Result<T, String>> + Send + 'static,
+{
+    let (input_guard, result) = run_cancellation_safe_guarded(input_guard, operation).await;
+    (input_guard, result.and_then(|result| result))
 }
 
 async fn run_ydotool(args: &[String]) -> std::result::Result<Output, String> {
@@ -9586,6 +13663,9 @@ impl KdeClipboardPasteError {
         }
     }
 
+    /// The clipboard write failed, but it may have taken effect (a timed out
+    /// call can still land). No paste was sent, yet the outcome is unknown,
+    /// so the text is not retyped through another backend.
     fn ambiguous_clipboard_set(message: String) -> Self {
         Self {
             message,
@@ -9593,6 +13673,31 @@ impl KdeClipboardPasteError {
             clear_portal_keyboard_session: false,
         }
     }
+}
+
+/// Put `text` on the clipboard. A failed write may still have landed, so
+/// put `previous` back and refuse to retype the text another way.
+async fn replace_kde_clipboard<F, Fut>(
+    text: &str,
+    previous: &str,
+    set: F,
+) -> std::result::Result<(), KdeClipboardPasteError>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = std::result::Result<(), String>>,
+{
+    let Err(set_error) = set(text.to_string()).await else {
+        return Ok(());
+    };
+    let message = match set(previous.to_string()).await {
+        Ok(()) => format!(
+            "KDE clipboard replacement failed ambiguously and the previous contents were restored; text was not replayed through another backend: {set_error}"
+        ),
+        Err(restore_error) => format!(
+            "KDE clipboard replacement failed ambiguously; restoring the previous contents also failed, and text was not replayed through another backend: {set_error}; restore failed: {restore_error}"
+        ),
+    };
+    Err(KdeClipboardPasteError::ambiguous_clipboard_set(message))
 }
 
 async fn run_kde_clipboard_paste_text(
@@ -9604,21 +13709,13 @@ async fn run_kde_clipboard_paste_text(
     let previous = kde_clipboard_contents()
         .await
         .map_err(KdeClipboardPasteError::before_text_input)?;
-    if let Err(set_error) = kde_set_clipboard_contents(text).await {
-        let restore_result = kde_set_clipboard_contents(&previous).await;
-        let message = match restore_result {
-            Ok(()) => format!(
-                "KDE clipboard replacement failed ambiguously and the previous contents were restored; text was not replayed through another backend: {set_error}"
-            ),
-            Err(restore_error) => format!(
-                "KDE clipboard replacement failed ambiguously; restoring the previous contents also failed, and text was not replayed through another backend: {set_error}; restore failed: {restore_error}"
-            ),
-        };
-        return Err(KdeClipboardPasteError::ambiguous_clipboard_set(message));
-    }
+    replace_kde_clipboard(text, &previous, |value| async move {
+        kde_set_clipboard_contents(&value).await
+    })
+    .await?;
 
     let (modifiers, keycode) = kde_clipboard_paste_chord(paste_shortcut);
-    let paste_result = press_keycode_chord(session, modifiers, keycode, Some(operation_guard))
+    let paste_result = press_keycode_chord(session, modifiers, keycode, operation_guard)
         .await
         .map_err(|error| format!("{error:#}"));
 
@@ -9799,6 +13896,13 @@ fn ydotool_output_error(output: Output) -> String {
     command_output_error("ydotool", output)
 }
 
+/// X11 keyboard input runs through `xdotool` (XTEST) instead of ydotool.
+///
+/// ydotool injects raw evdev keycodes into a virtual uinput device. Under X11
+/// the server re-interprets those scancodes through the active XKB layout, so
+/// named keys and chords land as unrelated glyphs and literal text can mangle
+/// symbols/digits (`_` → `%`, `1` → `+`). XTEST resolves keysyms against the
+/// live layout, which is what X11 clients actually expect. See issue #58.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyboardCommandBackend {
     Wtype,
@@ -9931,9 +14035,9 @@ where
     validate_wtype_text(text)?;
     validate_wtype_privacy(mode, secret)?;
     let available = if program.components().count() > 1 {
-        wtype_file_available(program)
+        executable_file(program)
     } else {
-        program.to_str().is_some_and(wtype_in_path)
+        program.to_str().is_some_and(which_in_path)
     };
     if !available {
         return fallback().await.map(|output| KeyboardCommandResult {
@@ -9942,6 +14046,9 @@ where
         });
     }
 
+    // wtype binds the last wl_seat it sees, which is the agent seat while
+    // one exists; drop it so focused text goes to the user's seat.
+    crate::agent_seat::release_before_seat_unaware_input().await;
     let mut command = TokioCommand::new(program);
     // wtype's stdin mode uploads a new keymap every 100 characters. On
     // Hyprland/Electron those changes can turn literal text into modifier
@@ -9971,7 +14078,8 @@ where
     };
     let output = match result {
         Ok(output) => output,
-        Err(error) if wtype_spawn_unavailable(&error) => {
+        // wtype never started, so nothing was typed: same as a missing wtype.
+        Err(error) if spawn_never_started(&error) => {
             return fallback().await.map(|output| KeyboardCommandResult {
                 output,
                 backend: KeyboardCommandBackend::Ydotool,
@@ -9979,14 +14087,13 @@ where
         }
         Err(error) => return Err(format!("{error:#}")),
     };
-    if output.status.success() {
-        Ok(KeyboardCommandResult {
-            output,
-            backend: KeyboardCommandBackend::Wtype,
-        })
-    } else {
-        Err(command_output_error("wtype", output))
+    if !output.status.success() {
+        return Err(command_output_error("wtype", output));
     }
+    Ok(KeyboardCommandResult {
+        output,
+        backend: KeyboardCommandBackend::Wtype,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10096,6 +14203,26 @@ fn validate_wtype_text(text: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// True when `xdotool` can drive this session: an X11 session with `DISPLAY`
+/// set and the binary present. `COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD=1`
+/// opts out; `COMPUTER_USE_LINUX_FORCE_XDOTOOL_KEYBOARD=1` forces it on.
+fn xdotool_available() -> bool {
+    which_in_path("xdotool")
+}
+
+fn wtype_available() -> bool {
+    which_in_path("wtype")
+}
+
+fn prefer_wtype_keyboard(
+    force_ydotool: bool,
+    is_wayland: bool,
+    compatible_desktop: bool,
+    available: bool,
+) -> bool {
+    !force_ydotool && is_wayland && compatible_desktop && available
+}
+
 /// Where `press_key` sends a chord.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChordRoute {
@@ -10188,6 +14315,7 @@ fn wtype_modifier_keysym(key: &str) -> Option<&'static str> {
 const WTYPE_KEY_SETTLE_MS: u64 = 50;
 
 async fn run_wtype_key(args: &[String]) -> std::result::Result<(), String> {
+    crate::agent_seat::release_before_seat_unaware_input().await;
     let mut command = TokioCommand::new("wtype");
     command
         .args(["-s", &WTYPE_KEY_SETTLE_MS.to_string()])
@@ -10202,55 +14330,12 @@ async fn run_wtype_key(args: &[String]) -> std::result::Result<(), String> {
     Ok(())
 }
 
-fn xdotool_available() -> bool {
-    which_in_path("xdotool")
-}
-
-fn wtype_available() -> bool {
-    wtype_in_path("wtype")
-}
-
-fn wtype_file_available(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-fn wtype_in_path(binary: &str) -> bool {
-    let Ok(path) = env::var("PATH") else {
-        return false;
-    };
-    env::split_paths(&path).any(|directory| wtype_file_available(&directory.join(binary)))
-}
-
-fn wtype_spawn_unavailable(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}");
-    [
-        "No such file or directory",
-        "Permission denied",
-        "Exec format error",
-        "Text file busy",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
-}
-
-fn prefer_wtype_keyboard(
-    force_ydotool: bool,
-    force_xdotool: bool,
-    force_portal: bool,
-    is_wayland: bool,
-    compatible_desktop: bool,
-    available: bool,
-) -> bool {
-    !force_ydotool
-        && !force_xdotool
-        && !force_portal
-        && is_wayland
-        && compatible_desktop
-        && available
-}
-
+/// Default per-character delay for `xdotool type`, in milliseconds (xdotool's
+/// own default). `--delay 0` lets XTEST key events race each other on some X
+/// servers (Cinnamon on Mint 22, issue #147): every character arrives, but in
+/// a random order. A small delay keeps them ordered.
+/// `CODEX_COMPUTER_USE_XDOTOOL_TYPE_DELAY_MS` overrides it, or the standalone
+/// `COMPUTER_USE_LINUX_XDOTOOL_TYPE_DELAY_MS`.
 const XDOTOOL_TYPE_DELAY_MS: u64 = 12;
 const XDOTOOL_TYPE_DELAY_ENV: &str = "CODEX_COMPUTER_USE_XDOTOOL_TYPE_DELAY_MS";
 const XDOTOOL_TYPE_DELAY_ENV_STANDALONE: &str = "COMPUTER_USE_LINUX_XDOTOOL_TYPE_DELAY_MS";
@@ -10283,22 +14368,48 @@ fn xdotool_type_args_with_delay(text: &str, delay_ms: u64) -> Vec<String> {
     ]
 }
 
+/// `xdotool type` spends about `delay_ms` per character, so long inputs need
+/// more than the flat input timeout.
 fn xdotool_type_timeout(text: &str, delay_ms: u64) -> Duration {
     let chars = text.chars().count() as u64;
     INPUT_COMMAND_TIMEOUT.saturating_add(Duration::from_millis(chars.saturating_mul(delay_ms)))
 }
 
 fn which_in_path(binary: &str) -> bool {
-    let Ok(path) = env::var("PATH") else {
-        return false;
-    };
-    env::split_paths(&path).any(|directory| {
-        std::fs::metadata(directory.join(binary))
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false)
-    })
+    env::var_os("PATH").is_some_and(|path| executable_in(&path, binary))
 }
 
+/// True when a directory of `path` (a `PATH` value) holds an executable
+/// `binary`.
+fn executable_in(path: &std::ffi::OsStr, binary: &str) -> bool {
+    env::split_paths(path).any(|dir| executable_file(&dir.join(binary)))
+}
+
+/// True when the program never started: exec found no file, no permission,
+/// no usable format or interpreter, or the file stayed busy after
+/// `spawn_retrying_busy` gave up.
+fn spawn_never_started(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|error| {
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT | libc::EACCES | libc::ENOEXEC | libc::ETXTBSY)
+            )
+        })
+}
+
+/// A regular file with an execute bit set, which exec needs.
+fn executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+/// Map our key grammar onto an `xdotool key` spec such as `ctrl+a`, `Return`,
+/// or `shift+F5`. Returns `None` for keys the grammar does not accept, so the
+/// caller keeps its existing "never silently dropped" error.
 fn xdotool_key_spec(key: &str) -> Option<String> {
     let parts = key
         .split('+')
@@ -10307,12 +14418,15 @@ fn xdotool_key_spec(key: &str) -> Option<String> {
         .collect::<Vec<_>>();
     let (key_part, modifier_parts) = parts.split_last()?;
 
+    // Validate through the same evdev grammar so both backends accept exactly
+    // the same input set.
     key_chord(key)?;
 
     let mut spec = Vec::new();
     for part in modifier_parts {
         spec.push(xdotool_modifier_name(part)?.to_string());
     }
+
     if modifier_parts.is_empty() {
         if let Some(bare) = xdotool_modifier_keysym(key_part) {
             return Some(bare.to_string());
@@ -10332,14 +14446,22 @@ fn xdotool_modifier_name(key: &str) -> Option<&'static str> {
     }
 }
 
+/// Standalone keysym for a bare modifier press (`press_key "Super"`).
 fn xdotool_modifier_keysym(key: &str) -> Option<&'static str> {
-    xdotool_modifier_name(key)
+    match normalize_key(key).as_str() {
+        "ctrl" | "control" => Some("ctrl"),
+        "alt" | "option" => Some("alt"),
+        "shift" => Some("shift"),
+        "meta" | "super" | "cmd" | "command" => Some("super"),
+        _ => None,
+    }
 }
 
 fn xdotool_keysym_name(key: &str) -> Option<String> {
     let normalized = normalize_key(key);
     let named = match normalized.as_str() {
         "enter" | "return" => "Return",
+        "kpenter" | "kp_enter" => "KP_Enter",
         "escape" | "esc" => "Escape",
         "tab" => "Tab",
         "backspace" => "BackSpace",
@@ -10423,6 +14545,9 @@ fn mouse_button_code(button: Option<&str>) -> String {
     .to_string()
 }
 
+/// Parse a chord like `Ctrl+Shift+P` into raw evdev codes: the held
+/// modifiers plus the final key. A bare modifier (`Super`) parses as a
+/// chord with no held modifiers whose key is the modifier itself.
 fn key_chord(key: &str) -> Option<(Vec<u16>, u16)> {
     let parts = key
         .split('+')
@@ -10483,6 +14608,7 @@ fn modifier_keysym(key: &str) -> Option<i32> {
 fn named_keysym(key: &str) -> Option<i32> {
     let keysym = match normalize_key(key).as_str() {
         "enter" | "return" => xkey::Return,
+        "kpenter" | "kp_enter" => xkey::KP_Enter,
         "escape" | "esc" => xkey::Escape,
         "tab" => xkey::Tab,
         "backspace" => xkey::BackSpace,
@@ -10549,6 +14675,7 @@ fn modifier_keycode(key: &str) -> Option<u16> {
 fn keycode(key: &str) -> Option<u16> {
     match normalize_key(key).as_str() {
         "enter" | "return" => Some(28),
+        "kpenter" | "kp_enter" => Some(96),
         "escape" | "esc" => Some(1),
         "tab" => Some(15),
         "backspace" => Some(14),
@@ -10679,14 +14806,15 @@ fn looks_like_desktop_app(name: &str, command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atspi_tree::{AccessibilityAction, Bounds};
+    use crate::windows::{WindowBounds, GNOME_SHELL_EXTENSION_BACKEND, NIRI_BACKEND};
+    use std::os::unix::fs::PermissionsExt;
+
     #[test]
     fn mcp_server_version_matches_cargo() {
         let info = rmcp::ServerHandler::get_info(&ComputerUseLinux::default());
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     }
-    use crate::atspi_tree::{AccessibilityAction, Bounds};
-    use crate::windows::{WindowBounds, GNOME_SHELL_EXTENSION_BACKEND, NIRI_BACKEND};
-    use std::os::unix::fs::PermissionsExt;
 
     /// Restores an environment variable when a test ends, including on panic.
     struct EnvVarGuard {
@@ -10721,106 +14849,101 @@ mod tests {
     /// take turns instead of racing each other under the parallel test runner.
     static SHELL_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// Exercise the real handlers in a separate process so backend overrides
+    /// Runs pointer dispatch tests in a child process so backend overrides
     /// cannot race other tests. All command programs are harmless stubs; the
     /// private datagram socket and invalid D-Bus address cannot reach a desktop.
-    #[test]
-    fn pointer_coordinate_backend_dispatch_is_safe() {
-        let dir = std::env::temp_dir().join(format!(
-            "cp-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(dir.clone());
-        let socket_path = dir.join("input.sock");
-        let _socket = std::os::unix::net::UnixDatagram::bind(&socket_path).unwrap();
-        for program in ["ydotool", "xdotool", "systemctl", "gnome-screenshot"] {
-            let path = dir.join(program);
-            std::fs::write(
-                &path,
-                r#"#!/bin/sh
+    struct PointerChildHarness {
+        dir: std::path::PathBuf,
+        socket_path: std::path::PathBuf,
+        _socket: std::os::unix::net::UnixDatagram,
+    }
+
+    impl PointerChildHarness {
+        fn new(prefix: &str) -> Self {
+            // The longest socket a run names: the scroll test's missing.sock.
+            let dir = crate::test_sockets::socket_fixture(
+                &format!(
+                    "{prefix}-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ),
+                "missing.sock",
+            );
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let socket_path = dir.join("input.sock");
+            let socket = std::os::unix::net::UnixDatagram::bind(&socket_path).unwrap();
+            for program in ["ydotool", "xdotool", "systemctl", "gnome-screenshot"] {
+                let path = dir.join(program);
+                std::fs::write(
+                    &path,
+                    r#"#!/bin/sh
 case "${0##*/}" in
   systemctl) exit 0 ;;
   gnome-screenshot) printf 'capture\n' >> "$CUL_POINTER_TEST_CAPTURE_LOG"; exit 1 ;;
   ydotool)
     case "$1" in help|--help) printf '%s\n' click mousemove type key debug; exit 0 ;; esac
+    # Like ydotool, fail when no daemon socket exists.
+    [ -S "$YDOTOOL_SOCKET" ] || { echo "ydotool: no daemon socket at $YDOTOOL_SOCKET" >&2; exit 2; }
     # Capability probes use their own socket. Record only dispatched input.
     [ "$YDOTOOL_SOCKET" = "$CUL_POINTER_TEST_SOCKET" ] || exit 0 ;;
 esac
 printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
 "#,
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                )
+                .unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            Self {
+                dir,
+                socket_path,
+                _socket: socket,
+            }
         }
-        for mode in [
-            "wayland-default",
-            "wayland-uncached",
-            "wayland-ydotool",
-            "wayland-portal",
-            "x11",
-        ] {
-            let log = dir.join(format!("{mode}.log"));
-            let capture_log = dir.join(format!("{mode}-capture.log"));
+
+        /// Run the child test `child` in `mode` on a Wayland session with the
+        /// uinput pointer disabled and no backend forced; `configure` changes
+        /// that.
+        fn run(&self, child: &str, mode: &str, configure: impl FnOnce(&mut Command)) -> ChildRun {
+            let log = self.dir.join(format!("{mode}.log"));
+            let capture_log = self.dir.join(format!("{mode}-capture.log"));
             let mut command = Command::new(std::env::current_exe().unwrap());
             command
-                .args([
-                    "--exact",
-                    "server::tests::pointer_coordinate_backend_child",
-                    "--nocapture",
-                ])
+                .args(["--exact", child, "--nocapture"])
                 .env_clear()
-                .env("PATH", &dir)
-                .env("HOME", &dir)
+                .env("PATH", &self.dir)
+                .env("HOME", &self.dir)
                 .env("CUL_POINTER_TEST_MODE", mode)
                 .env("CUL_POINTER_TEST_LOG", &log)
                 .env("CUL_POINTER_TEST_CAPTURE_LOG", &capture_log)
                 .env("COMPUTER_USE_LINUX_SCREENSHOT_BACKEND", "gnome-screenshot")
-                .env("CUL_POINTER_TEST_SOCKET", &socket_path)
-                .env("YDOTOOL_SOCKET", &socket_path)
-                .env("XDG_RUNTIME_DIR", &dir)
+                .env("CUL_POINTER_TEST_SOCKET", &self.socket_path)
+                .env("YDOTOOL_SOCKET", &self.socket_path)
+                .env("XDG_RUNTIME_DIR", &self.dir)
                 .env(
                     "DBUS_SESSION_BUS_ADDRESS",
-                    format!("unix:path={}/no-bus", dir.display()),
+                    format!("unix:path={}/no-bus", self.dir.display()),
                 )
                 .env("DISPLAY", ":9876")
-                .env(
-                    "WAYLAND_DISPLAY",
-                    if mode == "x11" { "" } else { "no-wayland" },
-                )
-                .env(
-                    "XDG_SESSION_TYPE",
-                    if mode == "x11" { "x11" } else { "wayland" },
-                )
+                .env("WAYLAND_DISPLAY", "no-wayland")
+                .env("XDG_SESSION_TYPE", "wayland")
                 .env("CU_DISABLE_ABS_POINTER", "1")
-                .env(
-                    "COMPUTER_USE_LINUX_FORCE_YDOTOOL_POINTER",
-                    if mode == "wayland-ydotool" { "1" } else { "0" },
-                )
-                .env(
-                    "COMPUTER_USE_LINUX_FORCE_PORTAL_POINTER",
-                    if mode == "wayland-portal" { "1" } else { "0" },
-                );
+                .env("COMPUTER_USE_LINUX_FORCE_YDOTOOL_POINTER", "0")
+                .env("COMPUTER_USE_LINUX_FORCE_PORTAL_POINTER", "0");
             for key in [
                 "DESKTOP_SESSION",
                 "HYPRLAND_INSTANCE_SIGNATURE",
+                "UMBRIEL_SOCKET",
                 "XAUTHORITY",
                 "XDG_SESSION_DESKTOP",
                 "XDG_CURRENT_DESKTOP",
             ] {
                 command.env(key, "pointer-test");
             }
+            configure(&mut command);
             let output = crate::command_runner::output_blocking_with_timeout(
                 &mut command,
                 "pointer backend regression",
@@ -10833,11 +14956,59 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            ChildRun {
+                commands: std::fs::read_to_string(&log).unwrap_or_default(),
+                captured: capture_log.exists(),
+            }
+        }
+    }
+
+    struct ChildRun {
+        /// Input commands the stubs recorded.
+        commands: String,
+        /// Whether the child asked the screenshot stub for a capture.
+        captured: bool,
+    }
+
+    impl Drop for PointerChildHarness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn pointer_coordinate_backend_dispatch_is_safe() {
+        let harness = PointerChildHarness::new("cul-pointer-safety");
+        for mode in [
+            "wayland-default",
+            "wayland-uncached",
+            "wayland-ydotool",
+            "wayland-portal",
+            "x11",
+        ] {
+            let run = harness.run(
+                "server::tests::pointer_coordinate_backend_child",
+                mode,
+                |command| match mode {
+                    "wayland-ydotool" => {
+                        command.env("COMPUTER_USE_LINUX_FORCE_YDOTOOL_POINTER", "1");
+                    }
+                    "wayland-portal" => {
+                        command.env("COMPUTER_USE_LINUX_FORCE_PORTAL_POINTER", "1");
+                    }
+                    "x11" => {
+                        command
+                            .env("WAYLAND_DISPLAY", "")
+                            .env("XDG_SESSION_TYPE", "x11");
+                    }
+                    _ => {}
+                },
+            );
             assert!(
-                !capture_log.exists(),
+                !run.captured,
                 "{mode}: a pointer warning triggered screenshot capture"
             );
-            let commands = std::fs::read_to_string(&log).unwrap_or_default();
+            let commands = run.commands;
             match mode {
                 "wayland-portal" => assert!(commands.is_empty(), "{commands}"),
                 "x11" => {
@@ -10854,6 +15025,693 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
                 }
                 _ => assert_eq!(commands, "ydotool mousemove --wheel -- 0 -5\n"),
             }
+        }
+    }
+
+    /// An untargeted scroll keeps the portal start error when its ydotool
+    /// fallback fails too (#389).
+    #[test]
+    fn untargeted_scroll_keeps_portal_start_error() {
+        let harness = PointerChildHarness::new("cul-scroll-portal-error");
+        // Without a ydotool daemon the portal is preferred, cannot start on
+        // the invalid bus, and the untargeted scroll falls back to ydotool.
+        let missing_socket = harness.dir.join("missing.sock");
+        let run = harness.run(
+            "server::tests::pointer_dispatch_child",
+            "portal-start-failure",
+            |command| {
+                command.env("YDOTOOL_SOCKET", &missing_socket);
+            },
+        );
+        assert!(!run.captured);
+    }
+
+    /// A coordinate scroll on Wayland sends the move and the wheel through
+    /// the uinput pointer in kernel signs, with no ydotool daemon running.
+    #[test]
+    fn uinput_scroll_sends_kernel_signed_wheel_without_ydotool() {
+        let harness = PointerChildHarness::new("cul-uinput-scroll");
+        let missing_socket = harness.dir.join("missing.sock");
+        let run = harness.run(
+            "server::tests::pointer_dispatch_child",
+            "uinput-scroll-direction",
+            |command| {
+                command
+                    .env("CU_DISABLE_ABS_POINTER", "0")
+                    .env("YDOTOOL_SOCKET", &missing_socket);
+            },
+        );
+        assert!(!run.captured);
+        assert!(run.commands.is_empty(), "{}", run.commands);
+    }
+
+    /// An element call naming a replaced snapshot is refused before any
+    /// window is raised or input is sent, on every element tool.
+    #[test]
+    fn element_calls_naming_a_replaced_snapshot_send_nothing() {
+        let harness = PointerChildHarness::new("cul-stale-snapshot");
+        let run = harness.run(
+            "server::tests::pointer_dispatch_child",
+            "stale-snapshot",
+            |_| {},
+        );
+        assert!(!run.captured);
+        assert!(run.commands.is_empty(), "{}", run.commands);
+    }
+
+    /// A uinput device sized for an earlier desktop is not reused: the
+    /// compositor spreads its range across the current layout, so every
+    /// point would land scaled and its result would carry no note (#389).
+    #[test]
+    fn stale_uinput_pointer_is_replaced() {
+        let harness = PointerChildHarness::new("cul-uinput-stale");
+        let run = harness.run(
+            "server::tests::pointer_dispatch_child",
+            "uinput-stale",
+            |command| {
+                command.env("CU_DISABLE_ABS_POINTER", "0");
+            },
+        );
+        // Unit-test builds refuse to create a real device, so each stale
+        // action fails closed. Only the click with no device asks for a
+        // capture, which the stub refuses. Nothing reaches ydotool.
+        assert!(run.captured);
+        assert!(run.commands.is_empty(), "{}", run.commands);
+    }
+
+    /// A harness whose xrandr and swaymsg report two monitors of different
+    /// heights, 2560x1440 at 0,0 and 1920x1080 at 2560,0, which leave
+    /// 2560..4480 x 1080..1440 of a 4480x1440 capture uncovered. Each layout
+    /// read is logged to the returned file. xdotool fails any command that
+    /// moves to 5001,1301, so a failed dispatch can be checked.
+    fn monitor_gap_harness(prefix: &str) -> (PointerChildHarness, std::path::PathBuf) {
+        let harness = PointerChildHarness::new(prefix);
+        let xrandr = harness.dir.join("xrandr");
+        std::fs::write(
+            &xrandr,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CUL_POINTER_TEST_LAYOUT_LOG"
+printf 'Monitors: 2\n 0: +*DP-1 2560/597x1440/336+0+0  DP-1\n 1: +HDMI-1 1920/527x1080/296+2560+0  HDMI-1\n'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&xrandr, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let swaymsg = harness.dir.join("swaymsg");
+        std::fs::write(
+            &swaymsg,
+            r#"#!/bin/sh
+printf 'swaymsg %s\n' "$*" >> "$CUL_POINTER_TEST_LAYOUT_LOG"
+printf '[{"active":true,"rect":{"x":0,"y":0,"width":2560,"height":1440},"scale":1.0},{"active":true,"rect":{"x":2560,"y":0,"width":1920,"height":1080},"scale":1.0}]'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&swaymsg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let xdotool = harness.dir.join("xdotool");
+        std::fs::write(
+            &xdotool,
+            r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
+case "$*" in *"-- 5001 1301"*) echo "xdotool: test failure" >&2; exit 1 ;; esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&xdotool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let layout_log = harness.dir.join("layout.log");
+        (harness, layout_log)
+    }
+
+    /// A coordinate in the gap of [`monitor_gap_harness`] gets a note on the
+    /// X11 and uinput routes; a coordinate on either monitor does not. The
+    /// note reads the layout once per capture and takes no capture (#391).
+    fn run_monitor_gap_child(mode: &str) {
+        let (harness, layout_log) = monitor_gap_harness("cul-monitor-gap");
+        let run = harness.run("server::tests::pointer_dispatch_child", mode, |command| {
+            command.env("CUL_POINTER_TEST_LAYOUT_LOG", &layout_log);
+            if mode == "x11-monitor-gap" {
+                command
+                    .env("WAYLAND_DISPLAY", "")
+                    .env("XDG_SESSION_TYPE", "x11");
+            } else {
+                command
+                    .env("CU_DISABLE_ABS_POINTER", "0")
+                    .env("SWAYSOCK", harness.dir.join("sway.sock"));
+            }
+        });
+        assert!(!run.captured, "{mode}: a note took a capture");
+        // The child caches two captures and acts on each. On Wayland the
+        // note never runs xrandr, which could start Xwayland.
+        let reads = if mode == "x11-monitor-gap" {
+            "--listactivemonitors\n--listactivemonitors\n"
+        } else {
+            "swaymsg -t get_outputs -r\nswaymsg -t get_outputs -r\n"
+        };
+        assert_eq!(
+            std::fs::read_to_string(&layout_log).unwrap_or_default(),
+            reads,
+            "{mode}"
+        );
+        let sent = if mode == "x11-monitor-gap" {
+            "xdotool mousemove -- 3000 1200 click"
+        } else {
+            // The uinput route emits the wheel from the absolute pointer
+            // device itself, so no wheel command is spawned.
+            assert!(
+                !run.commands.contains("mousemove --wheel"),
+                "{mode}: {}",
+                run.commands
+            );
+            return;
+        };
+        assert!(run.commands.contains(sent), "{mode}: {}", run.commands);
+    }
+
+    #[test]
+    fn x11_monitor_gap_coordinate_gets_a_note() {
+        run_monitor_gap_child("x11-monitor-gap");
+    }
+
+    #[test]
+    fn uinput_monitor_gap_coordinate_gets_a_note() {
+        run_monitor_gap_child("uinput-monitor-gap");
+    }
+
+    /// A drag checks the two endpoints its route sent. With one endpoint off
+    /// the capture and the other in the gap of [`monitor_gap_harness`], the
+    /// result names both; a drag between two on-monitor points gets no note
+    /// (#398).
+    fn run_drag_gap_child(mode: &str) {
+        let (harness, layout_log) = monitor_gap_harness("cul-drag-gap");
+        let run = harness.run("server::tests::pointer_dispatch_child", mode, |command| {
+            command.env("CUL_POINTER_TEST_LAYOUT_LOG", &layout_log);
+            if mode == "uinput-drag-gap" {
+                command
+                    .env("CU_DISABLE_ABS_POINTER", "0")
+                    .env("SWAYSOCK", harness.dir.join("sway.sock"));
+            } else {
+                command
+                    .env("WAYLAND_DISPLAY", "")
+                    .env("XDG_SESSION_TYPE", "x11");
+            }
+            if mode == "ydotool-drag-gap" {
+                command.env("COMPUTER_USE_LINUX_FORCE_YDOTOOL_POINTER", "1");
+            }
+        });
+        assert!(!run.captured, "{mode}: a note took a capture");
+        // One capture, one layout read; never xrandr on Wayland.
+        let read = if mode == "uinput-drag-gap" {
+            "swaymsg -t get_outputs -r\n"
+        } else {
+            "--listactivemonitors\n"
+        };
+        assert_eq!(
+            std::fs::read_to_string(&layout_log).unwrap_or_default(),
+            read,
+            "{mode}"
+        );
+        match mode {
+            "x11-drag-gap" => {
+                assert!(
+                    run.commands
+                        .starts_with("xdotool mousemove -- 5000 500\nxdotool mousedown 1\n"),
+                    "{}",
+                    run.commands
+                );
+                assert!(!run.commands.contains("ydotool"), "{}", run.commands);
+            }
+            "ydotool-drag-gap" => {
+                assert!(
+                    run.commands.starts_with(
+                        "ydotool mousemove --absolute -- 5000 500\nydotool click 0x40\n"
+                    ),
+                    "{}",
+                    run.commands
+                );
+                assert!(!run.commands.contains("xdotool"), "{}", run.commands);
+            }
+            _ => assert!(run.commands.is_empty(), "{}", run.commands),
+        }
+    }
+
+    #[test]
+    fn x11_drag_endpoints_get_off_screen_and_gap_notes() {
+        run_drag_gap_child("x11-drag-gap");
+    }
+
+    #[test]
+    fn ydotool_x11_drag_endpoints_get_off_screen_and_gap_notes() {
+        run_drag_gap_child("ydotool-drag-gap");
+    }
+
+    #[test]
+    fn uinput_drag_endpoints_get_off_screen_and_gap_notes() {
+        run_drag_gap_child("uinput-drag-gap");
+    }
+
+    #[tokio::test]
+    async fn pointer_dispatch_child() {
+        let Ok(mode) = std::env::var("CUL_POINTER_TEST_MODE") else {
+            return;
+        };
+        let backend = ComputerUseLinux::default();
+        match mode.as_str() {
+            "portal-start-failure" => {
+                let scroll: ScrollParams =
+                    serde_json::from_value(serde_json::json!({"direction":"down"})).unwrap();
+                let result = backend.dispatch_scroll(scroll).await.0 .0;
+                assert!(!result.ok, "{}", result.message);
+                let (ydotool_error, portal_error) = result
+                    .message
+                    .split_once(
+                        " The scroll fell back to ydotool because the remote desktop portal could not start: ",
+                    )
+                    .unwrap_or_else(|| panic!("{}", result.message));
+                assert!(
+                    ydotool_error.contains("no daemon socket"),
+                    "{}",
+                    result.message
+                );
+                assert!(!portal_error.trim().is_empty(), "{}", result.message);
+            }
+            "uinput-stale" => {
+                use crate::abs_pointer::{tests::RecordedEvents, AbsPointer};
+                let pointer = |width, height| {
+                    Some(AbsPointer::with_events(
+                        RecordedEvents::default(),
+                        width,
+                        height,
+                    ))
+                };
+                backend.cache_desktop_size(1920, 1080);
+                let click: ClickParams =
+                    serde_json::from_value(serde_json::json!({"x":2500,"y":500})).unwrap();
+                let scroll: ScrollParams = serde_json::from_value(
+                    serde_json::json!({"x":2500,"y":500,"direction":"down"}),
+                )
+                .unwrap();
+
+                let replace_failed = "was not sent: cached absolute-pointer geometry was stale for the 1920x1080 raw capture and the device could not be recreated";
+                // The message names the route the retry takes (#396); the
+                // last click below takes it.
+                let retry = "The stale device was removed. A retry sizes a new device to a fresh screenshot; if that fails, it is not sent, since ydotool cannot position the pointer accurately on Wayland.";
+                *backend.abs_pointer.lock().unwrap() = pointer(3840, 1080);
+                let result = backend.dispatch_click(click.clone()).await.0 .0;
+                assert!(!result.ok, "{}", result.message);
+                assert!(
+                    result.message.contains(replace_failed),
+                    "{}",
+                    result.message
+                );
+                assert!(result.message.ends_with(retry), "{}", result.message);
+                assert!(backend.abs_pointer.lock().unwrap().is_none());
+
+                *backend.abs_pointer.lock().unwrap() = pointer(3840, 1080);
+                let result = backend.dispatch_scroll(scroll).await.0 .0;
+                assert!(!result.ok, "{}", result.message);
+                assert!(
+                    result.message.contains(replace_failed),
+                    "{}",
+                    result.message
+                );
+                assert!(result.message.ends_with(retry), "{}", result.message);
+                assert!(backend.abs_pointer.lock().unwrap().is_none());
+
+                *backend.abs_pointer.lock().unwrap() = pointer(3840, 1080);
+                let drag = DragParams {
+                    start_x: 100,
+                    start_y: 100,
+                    end_x: 200,
+                    end_y: 200,
+                    ..Default::default()
+                };
+                let result = backend.dispatch_drag(drag).await.0;
+                assert!(!result.ok, "{}", result.message);
+                assert!(
+                    result.message.contains(replace_failed),
+                    "{}",
+                    result.message
+                );
+                assert!(result.message.ends_with(retry), "{}", result.message);
+                assert!(backend.abs_pointer.lock().unwrap().is_none());
+
+                // A KWin element click names the device, not the mapping.
+                *backend.abs_pointer.lock().unwrap() = pointer(3840, 1080);
+                let prepared = PreparedKwinElementClick {
+                    element_index: 4,
+                    point: KwinElementClickPoint {
+                        logical: (10, 10),
+                        capture: (10, 10),
+                    },
+                    capture_size: (1920, 1080),
+                };
+                let output = backend
+                    .kwin_abs_pointer_ready(prepared, &None)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    output.message,
+                    "click was not sent: KWin mapped element_index 4, but the uinput absolute pointer could not be used: cached absolute-pointer geometry was stale for the 1920x1080 raw capture and the device could not be recreated: unit tests do not create real uinput devices. No pointer event was emitted. The stale device was removed. A retry of element_index 4 sizes a new device to a fresh screenshot; if that fails, it is not sent, since ydotool cannot position the pointer accurately on Wayland."
+                );
+                assert!(backend.abs_pointer.lock().unwrap().is_none());
+
+                // Replacing a stale device needs no capture.
+                let capture_log = std::env::var("CUL_POINTER_TEST_CAPTURE_LOG").unwrap();
+                assert!(!Path::new(&capture_log).exists());
+
+                // With no device to replace, a failed capture still leaves
+                // the other routes; here the Wayland refusal.
+                let result = backend.dispatch_click(click.clone()).await.0 .0;
+                assert!(!result.ok, "{}", result.message);
+                assert!(
+                    result
+                        .message
+                        .contains("cannot position the pointer accurately on Wayland"),
+                    "{}",
+                    result.message
+                );
+
+                // A device that matches the capture clamps an off-capture
+                // point and says where it landed.
+                *backend.abs_pointer.lock().unwrap() = pointer(1920, 1080);
+                let result = backend.dispatch_click(click).await.0 .0;
+                assert!(result.ok, "{}", result.message);
+                assert!(
+                    result
+                        .message
+                        .contains("Requested coordinate 2500,500 was clamped to 1919,500"),
+                    "{}",
+                    result.message
+                );
+            }
+            "uinput-scroll-direction" => {
+                use crate::abs_pointer::{tests::RecordedEvents, AbsPointer};
+                use evdev::RelativeAxisCode;
+                let events = RecordedEvents::default();
+                backend.cache_desktop_size(1920, 1080);
+                *backend.abs_pointer.lock().unwrap() =
+                    Some(AbsPointer::with_events(events.clone(), 1920, 1080));
+                for direction in ["left", "right", "up", "down"] {
+                    let scroll: ScrollParams = serde_json::from_value(
+                        serde_json::json!({"x":500,"y":400,"direction":direction}),
+                    )
+                    .unwrap();
+                    let result = backend.dispatch_scroll(scroll).await.0 .0;
+                    assert!(result.ok, "{direction}: {}", result.message);
+                    assert_eq!(
+                        result.message,
+                        "Pointer positioned and wheel sent through the uinput absolute pointer."
+                    );
+                }
+                // The move comes first, then the wheel, from one device.
+                let abs = evdev::EventType::ABSOLUTE.0;
+                let rel = evdev::EventType::RELATIVE.0;
+                assert_eq!(
+                    events.all_events()[..4],
+                    [
+                        (abs, evdev::AbsoluteAxisCode::ABS_X.0, 500),
+                        (abs, evdev::AbsoluteAxisCode::ABS_Y.0, 400),
+                        (rel, RelativeAxisCode::REL_HWHEEL.0, -5),
+                        (rel, RelativeAxisCode::REL_WHEEL.0, 0),
+                    ]
+                );
+                // Each wheel call writes both axes; the unused one is 0.
+                let wheel: Vec<(u16, i32)> = events
+                    .wheel_events()
+                    .into_iter()
+                    .filter(|(_, value)| *value != 0)
+                    .collect();
+                assert_eq!(
+                    wheel,
+                    [
+                        (RelativeAxisCode::REL_HWHEEL.0, -5),
+                        (RelativeAxisCode::REL_HWHEEL.0, 5),
+                        (RelativeAxisCode::REL_WHEEL.0, 5),
+                        (RelativeAxisCode::REL_WHEEL.0, -5),
+                    ]
+                );
+            }
+            "stale-snapshot" => {
+                let node = AccessibilityNode {
+                    index: 0,
+                    parent_index: None,
+                    depth: 1,
+                    object_ref: ":1.10/org/a11y/atspi/accessible/7".to_string(),
+                    role: "entry".to_string(),
+                    name: Some("Name".to_string()),
+                    description: None,
+                    child_count: 0,
+                    bounds: Some(crate::atspi_tree::Bounds {
+                        x: 100,
+                        y: 100,
+                        width: 80,
+                        height: 20,
+                    }),
+                    states: vec!["enabled".to_string(), "editable".to_string()],
+                    actions: Vec::new(),
+                    value: None,
+                    text: None,
+                    supports_editable_text: true,
+                };
+                let first = backend.cache_snapshot(std::slice::from_ref(&node), None);
+                backend.cache_snapshot(std::slice::from_ref(&node), None);
+                let refused = |action: &str, ok: bool, message: &str| {
+                    assert!(!ok, "{action}: {message}");
+                    assert!(
+                        message.starts_with(&format!(
+                            "{action} was not sent: snapshot_id {first:?} is not the cached snapshot"
+                        )),
+                        "{message}"
+                    );
+                };
+                // The window target is refused before it is raised.
+                let click: ClickParams = serde_json::from_value(serde_json::json!({
+                    "element_index": 0, "snapshot_id": first, "window_id": 7
+                }))
+                .unwrap();
+                let result = backend.dispatch_click(click).await.0 .0;
+                refused("click", result.ok, &result.message);
+                let click: ClickParams = serde_json::from_value(serde_json::json!({
+                    "role": "entry", "snapshot_id": first
+                }))
+                .unwrap();
+                let result = backend.dispatch_click(click).await.0 .0;
+                refused("click", result.ok, &result.message);
+                let scroll: ScrollParams = serde_json::from_value(serde_json::json!({
+                    "element_index": 0, "snapshot_id": first, "direction": "down"
+                }))
+                .unwrap();
+                let result = backend.dispatch_scroll(scroll).await.0 .0;
+                refused("scroll", result.ok, &result.message);
+                let set_value: SetValueParams = serde_json::from_value(serde_json::json!({
+                    "element_index": 0, "snapshot_id": first, "value": "typed"
+                }))
+                .unwrap();
+                let (result, verified, _) = backend.dispatch_set_value(set_value).await;
+                refused("set_value", result.ok, &result.message);
+                assert_eq!(verified, None);
+                let action: ActionParams = serde_json::from_value(serde_json::json!({
+                    "element_index": 0, "snapshot_id": first
+                }))
+                .unwrap();
+                let result = backend.perform_element_action(&action, None).await.0 .0;
+                refused("perform_action", result.ok, &result.message);
+                // Scroll checks before raising its window too, and a lone x
+                // still takes the element's point.
+                let scroll: ScrollParams = serde_json::from_value(serde_json::json!({
+                    "element_index": 0, "snapshot_id": first, "direction": "down",
+                    "window_id": 7
+                }))
+                .unwrap();
+                let result = backend.dispatch_scroll(scroll).await.0 .0;
+                refused("scroll", result.ok, &result.message);
+                let scroll: ScrollParams = serde_json::from_value(serde_json::json!({
+                    "element_index": 0, "snapshot_id": first, "direction": "down", "x": 500
+                }))
+                .unwrap();
+                let result = backend.dispatch_scroll(scroll).await.0 .0;
+                refused("scroll", result.ok, &result.message);
+
+                // The current id, and a full point that wins over the index,
+                // pass the snapshot check and reach the input routes, which
+                // refuse here: this test session has no usable pointer.
+                let current = backend.cached_snapshot_id();
+                let passed = |action: &str, message: &str| {
+                    assert!(
+                        !message.starts_with(&format!("{action} was not sent: snapshot_id")),
+                        "{message}"
+                    );
+                };
+                for click in [
+                    serde_json::json!({"element_index": 0, "snapshot_id": current}),
+                    serde_json::json!({"element_index": 0, "snapshot_id": first, "x": 140, "y": 110}),
+                ] {
+                    let click: ClickParams = serde_json::from_value(click).unwrap();
+                    passed("click", &backend.dispatch_click(click).await.0 .0.message);
+                }
+                for scroll in [
+                    serde_json::json!({"element_index": 0, "snapshot_id": current, "direction": "down"}),
+                    serde_json::json!({"element_index": 0, "snapshot_id": first, "direction": "down", "x": 140, "y": 110}),
+                ] {
+                    let scroll: ScrollParams = serde_json::from_value(scroll).unwrap();
+                    passed(
+                        "scroll",
+                        &backend.dispatch_scroll(scroll).await.0 .0.message,
+                    );
+                }
+                let set_value: SetValueParams = serde_json::from_value(serde_json::json!({
+                    "element_index": 0, "snapshot_id": current, "value": "typed"
+                }))
+                .unwrap();
+                passed(
+                    "set_value",
+                    &backend.dispatch_set_value(set_value).await.0.message,
+                );
+            }
+            "x11-monitor-gap" | "uinput-monitor-gap" => {
+                use crate::abs_pointer::{tests::RecordedEvents, AbsPointer};
+                let uinput = mode == "uinput-monitor-gap";
+                let click = |x: i32, y: i32| -> ClickParams {
+                    serde_json::from_value(serde_json::json!({"x":x,"y":y})).unwrap()
+                };
+                backend.cache_desktop_size(4480, 1440);
+                if uinput {
+                    *backend.abs_pointer.lock().unwrap() = Some(AbsPointer::with_events(
+                        RecordedEvents::default(),
+                        4480,
+                        1440,
+                    ));
+                }
+                let gap = "WARNING: coordinate 3000,1200 is on no monitor of the captured desktop (4480x1440); the input landed at a monitor edge or on no visible pixel.";
+                let result = backend.dispatch_click(click(3000, 1200)).await.0 .0;
+                assert!(result.ok, "{}", result.message);
+                assert!(result.message.ends_with(gap), "{}", result.message);
+                for (x, y) in [(3000, 500), (100, 1300)] {
+                    let result = backend.dispatch_click(click(x, y)).await.0 .0;
+                    assert!(result.ok, "{}", result.message);
+                    assert!(!result.message.contains("WARNING"), "{}", result.message);
+                }
+                let scroll: ScrollParams = serde_json::from_value(
+                    serde_json::json!({"x":3000,"y":1200,"direction":"down"}),
+                )
+                .unwrap();
+                let result = backend.dispatch_scroll(scroll).await.0 .0;
+                assert!(result.ok, "{}", result.message);
+                assert!(result.message.ends_with(gap), "{}", result.message);
+
+                let result = backend.dispatch_click(click(5000, 1300)).await.0 .0;
+                assert!(result.ok, "{}", result.message);
+                let off_capture = if uinput {
+                    // The device clamps the point into the gap.
+                    "Requested coordinate 5000,1300 was clamped to 4479,1300 by the uinput absolute pointer. WARNING: coordinate 4479,1300 is on no monitor of the captured desktop (4480x1440); the input landed at a monitor edge or on no visible pixel."
+                } else {
+                    // The X server clamps the point into the gap.
+                    "WARNING: coordinate 5000,1300 is outside the captured desktop (4480x1440); the X server keeps the pointer on the screen, but the nearest point there, 4479,1300, is on no monitor, so the input landed at a monitor edge or on no visible pixel."
+                };
+                assert!(result.message.ends_with(off_capture), "{}", result.message);
+
+                if !uinput {
+                    // A failed dispatch sent nothing, so it gets no warning.
+                    let result = backend.dispatch_click(click(5001, 1301)).await.0 .0;
+                    assert!(!result.ok, "{}", result.message);
+                    assert!(!result.message.contains("WARNING"), "{}", result.message);
+                }
+
+                // A new capture reads the layout again.
+                backend.cache_desktop_size(4480, 1440);
+                let result = backend.dispatch_click(click(3000, 1200)).await.0 .0;
+                assert!(result.message.ends_with(gap), "{}", result.message);
+
+                // Where a retry goes after a failed device replacement.
+                let route = if uinput {
+                    "it is not sent, since ydotool cannot position the pointer accurately on Wayland"
+                } else {
+                    "it goes through ydotool"
+                };
+                assert_eq!(backend.pointer_retry_route().await, route);
+                if uinput {
+                    std::env::set_var("COMPUTER_USE_LINUX_FORCE_PORTAL_POINTER", "1");
+                    assert_eq!(
+                        backend.pointer_retry_route().await,
+                        "it goes through the remote desktop portal"
+                    );
+                }
+            }
+            "x11-drag-gap" | "ydotool-drag-gap" | "uinput-drag-gap" => {
+                use crate::abs_pointer::{tests::RecordedEvents, AbsPointer};
+                let uinput = mode == "uinput-drag-gap";
+                let drag = |start: (i32, i32), end: (i32, i32)| DragParams {
+                    start_x: start.0,
+                    start_y: start.1,
+                    end_x: end.0,
+                    end_y: end.1,
+                    ..Default::default()
+                };
+                backend.cache_desktop_size(4480, 1440);
+                if uinput {
+                    *backend.abs_pointer.lock().unwrap() = Some(AbsPointer::with_events(
+                        RecordedEvents::default(),
+                        4480,
+                        1440,
+                    ));
+                }
+                let gap = |name: &str| {
+                    format!("WARNING: {name} coordinate 3000,1200 is on no monitor of the captured desktop (4480x1440); the input landed at a monitor edge or on no visible pixel.")
+                };
+
+                // Off the capture, onto the right monitor, then into the gap.
+                let result = backend
+                    .dispatch_drag(drag((5000, 500), (3000, 1200)))
+                    .await
+                    .0;
+                assert!(result.ok, "{}", result.message);
+                let start = if uinput {
+                    "Requested start coordinate 5000,500 was clamped to 4479,500 by the uinput absolute pointer."
+                } else {
+                    "WARNING: start coordinate 5000,500 is outside the captured desktop (4480x1440); the X server keeps the pointer on the screen, so the input landed at an edge instead."
+                };
+                assert!(
+                    result.message.ends_with(&format!("{start} {}", gap("end"))),
+                    "{}",
+                    result.message
+                );
+
+                // From the gap, then off the capture, which lands in the gap.
+                let result = backend
+                    .dispatch_drag(drag((3000, 1200), (5000, 1300)))
+                    .await
+                    .0;
+                assert!(result.ok, "{}", result.message);
+                let end = if uinput {
+                    "Requested end coordinate 5000,1300 was clamped to 4479,1300 by the uinput absolute pointer. WARNING: end coordinate 4479,1300 is on no monitor of the captured desktop (4480x1440); the input landed at a monitor edge or on no visible pixel."
+                } else {
+                    "WARNING: end coordinate 5000,1300 is outside the captured desktop (4480x1440); the X server keeps the pointer on the screen, but the nearest point there, 4479,1300, is on no monitor, so the input landed at a monitor edge or on no visible pixel."
+                };
+                assert!(
+                    result.message.ends_with(&format!("{} {end}", gap("start"))),
+                    "{}",
+                    result.message
+                );
+
+                // The path crosses the gap, but both endpoints are on a
+                // monitor.
+                let result = backend
+                    .dispatch_drag(drag((2000, 1400), (4400, 1000)))
+                    .await
+                    .0;
+                assert!(result.ok, "{}", result.message);
+                assert!(!result.message.contains("WARNING"), "{}", result.message);
+                assert!(!result.message.contains("clamped"), "{}", result.message);
+
+                if mode == "x11-drag-gap" {
+                    // A failed drag gets no note.
+                    let result = backend
+                        .dispatch_drag(drag((5001, 1301), (3000, 1200)))
+                        .await
+                        .0;
+                    assert!(!result.ok, "{}", result.message);
+                    assert!(!result.message.contains("WARNING"), "{}", result.message);
+                }
+            }
+            other => panic!("unknown mode {other}"),
         }
     }
 
@@ -10954,9 +15812,16 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         let backend = ComputerUseLinux::default();
         if mode != "wayland-uncached" {
             backend.cache_desktop_size(9376, 1600);
-            assert!(backend.off_screen_note_for_point(9376, 700).await.is_some());
+            assert!(backend
+                .off_screen_note_for_point(9376, 700, PointerRoute::X11)
+                .await
+                .is_some());
         }
-        assert!(backend.off_screen_note_for_point(5536, 700).await.is_none());
+        // No layout source answers here, so only the capture rectangle counts.
+        assert!(backend
+            .off_screen_note_for_point(5536, 700, PointerRoute::X11)
+            .await
+            .is_none());
         let click: ClickParams =
             serde_json::from_value(serde_json::json!({"x":5536,"y":700})).unwrap();
         let scroll: ScrollParams =
@@ -10970,8 +15835,8 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
             ..Default::default()
         };
         let results = [
-            backend.dispatch_click(click).await.0,
-            backend.dispatch_scroll(scroll).await.0,
+            backend.dispatch_click(click).await.0 .0,
+            backend.dispatch_scroll(scroll).await.0 .0,
             backend.dispatch_drag(drag).await.0,
         ];
         for result in results {
@@ -10989,7 +15854,7 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         }
         let scroll: ScrollParams =
             serde_json::from_value(serde_json::json!({"direction":"down"})).unwrap();
-        let result = backend.dispatch_scroll(scroll).await.0;
+        let result = backend.dispatch_scroll(scroll).await.0 .0;
         assert_eq!(result.ok, mode != "wayland-portal", "{}", result.message);
     }
 
@@ -11120,14 +15985,17 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
 
     #[tokio::test]
     async fn avatar_cursor_signal_uses_the_private_unix_stream_protocol() {
-        let root = std::env::temp_dir().join(format!(
-            "cua-cursor-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
+        let root = crate::test_sockets::socket_fixture(
+            &format!(
+                "cua-cursor-{}-{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ),
+            "cursor.sock",
+        );
         std::fs::create_dir_all(&root).unwrap();
         let socket = root.join("cursor.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -11426,6 +16294,7 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
             backend: "linux-atspi".to_string(),
             screenshot: screenshot.map(ScreenshotSummary::from),
             screenshot_error: None,
+            snapshot_id: None,
             accessibility_tree: TreeNodes::default(),
             accessibility_tree_spill: None,
             accessibility_tree_raw_count: 0,
@@ -11452,6 +16321,8 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
 
     #[test]
     fn app_state_result_emits_screenshot_as_image_block_not_inline_base64() {
+        // Issue #145: the base64 payload must ride a structured image block so
+        // hosts count it as vision tokens instead of a 100KB text blob.
         let raw = RawScreenshotCapture {
             mime_type: "image/png".to_string(),
             bytes: solid_png(64, 32),
@@ -11819,6 +16690,7 @@ esac
         for key in [
             "DESKTOP_SESSION",
             "HYPRLAND_INSTANCE_SIGNATURE",
+            "UMBRIEL_SOCKET",
             "XAUTHORITY",
             "XDG_SESSION_DESKTOP",
             "XDG_CURRENT_DESKTOP",
@@ -12055,6 +16927,25 @@ esac
     }
 
     #[test]
+    fn incompatible_ydotool_socket_does_not_suppress_portal_fallback() {
+        let incompatible_ydotool = ydotool_backend_available_from(true, false);
+        let compatible_ydotool = ydotool_backend_available_from(true, true);
+
+        assert!(should_prefer_portal_backend_by_default(
+            true,
+            incompatible_ydotool
+        ));
+        assert!(!should_prefer_portal_backend_by_default(
+            true,
+            compatible_ydotool
+        ));
+        assert!(!should_prefer_portal_backend_by_default(
+            false,
+            incompatible_ydotool
+        ));
+    }
+
+    #[test]
     fn xdotool_keyboard_override_policy_matches_documented_precedence() {
         assert!(prefer_xdotool_keyboard(false, true, true, true, true));
         assert!(!prefer_xdotool_keyboard(true, true, true, true, true));
@@ -12064,16 +16955,12 @@ esac
     }
 
     #[test]
-    fn native_x11_pointer_policy_requires_explicit_x11_without_wayland_display() {
-        assert!(native_x11_xdotool_pointer_session(Some("x11"), None));
-        assert!(!native_x11_xdotool_pointer_session(
-            Some("wayland"),
-            Some("wayland-0")
-        ));
-        assert!(!native_x11_xdotool_pointer_session(
-            Some("x11"),
-            Some("wayland-0")
-        ));
+    fn wayland_prefers_wtype_unless_ydotool_is_forced() {
+        assert!(prefer_wtype_keyboard(false, true, true, true));
+        assert!(!prefer_wtype_keyboard(true, true, true, true));
+        assert!(!prefer_wtype_keyboard(false, false, true, true));
+        assert!(!prefer_wtype_keyboard(false, true, false, true));
+        assert!(!prefer_wtype_keyboard(false, true, true, false));
     }
 
     #[test]
@@ -12300,22 +17187,59 @@ esac
     #[test]
     fn absolute_pointer_note_reports_the_emitted_coordinate() {
         assert_eq!(
-            abs_pointer_clamp_note(crate::abs_pointer::PointerLanding {
-                requested: (1920, 1080),
-                emitted: (1919, 1079),
-            }),
+            abs_pointer_clamp_note(
+                "coordinate",
+                crate::abs_pointer::PointerLanding {
+                    requested: (1920, 1080),
+                    emitted: (1919, 1079),
+                }
+            ),
             Some(
                 "Requested coordinate 1920,1080 was clamped to 1919,1079 by the uinput absolute pointer."
                     .to_string()
             )
         );
         assert_eq!(
-            abs_pointer_clamp_note(crate::abs_pointer::PointerLanding {
-                requested: (640, 480),
-                emitted: (640, 480),
-            }),
+            abs_pointer_clamp_note(
+                "coordinate",
+                crate::abs_pointer::PointerLanding {
+                    requested: (640, 480),
+                    emitted: (640, 480),
+                }
+            ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn failed_absolute_pointer_action_drops_the_device() {
+        use crate::abs_pointer::{tests::RecordedEvents, AbsPointer, PointerButton};
+
+        // Call 1 is the press. The device may now hold the button, so the
+        // next action must build a fresh one instead of reusing it.
+        let pointer = Arc::new(Mutex::new(Some(AbsPointer::with_events(
+            RecordedEvents::failing_on(&[1]),
+            100,
+            100,
+        ))));
+        let result = run_abs_pointer(Arc::clone(&pointer), |pointer| {
+            pointer.click(10, 10, PointerButton::Left, 1)
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(pointer.lock().unwrap().is_none());
+
+        let pointer = Arc::new(Mutex::new(Some(AbsPointer::with_events(
+            RecordedEvents::default(),
+            100,
+            100,
+        ))));
+        let result = run_abs_pointer(Arc::clone(&pointer), |pointer| {
+            pointer.click(10, 10, PointerButton::Left, 1)
+        })
+        .await;
+        assert!(result.is_ok());
+        assert!(pointer.lock().unwrap().is_some());
     }
 
     #[test]
@@ -12527,38 +17451,62 @@ esac
         );
     }
 
-    #[test]
-    fn select_accessibility_object_ref_prefers_exact_pid_match() {
-        let apps = vec![
-            AccessibleAppSummary {
-                object_ref: ":1.31/org/a11y/atspi/accessible/root".to_string(),
-                name: Some("electron".to_string()),
-                pid: Some(2774076),
-                role: "application".to_string(),
-                child_count: 1,
-                bounds: None,
-            },
-            AccessibleAppSummary {
-                object_ref: ":1.64/org/a11y/atspi/accessible/root".to_string(),
-                name: Some("cu_atspi_gtk_test.py".to_string()),
-                pid: Some(2914326),
-                role: "application".to_string(),
-                child_count: 1,
-                bounds: None,
-            },
-        ];
+    #[tokio::test]
+    async fn pid_targets_leave_root_selection_to_traversal_and_keep_explicit_filters() {
+        let backend = ComputerUseLinux::default();
+        let window = window_info(
+            42,
+            Some("Qt app"),
+            Some("org.example.qt-app"),
+            Some("qt-app"),
+            Some(123),
+        );
+        for fields in [
+            serde_json::json!({ "pid": 123 }),
+            serde_json::json!({ "window_id": 42 }),
+            serde_json::json!({ "app_id": "org.example.qt-app" }),
+            serde_json::json!({
+                "window_id": 42,
+                "app_name_or_bundle_identifier": ":1.41/root",
+            }),
+        ] {
+            let params: GetAppStateParams = serde_json::from_value(fields).unwrap();
+            let expected = params.app_name_or_bundle_identifier.clone();
+            let filter = backend
+                .resolve_accessibility_app_filter_with(&params, Some(&window), true, || async {
+                    panic!("PID-scoped traversal discovers every application root")
+                })
+                .await;
+            assert_eq!(filter, expected);
+            assert_eq!(
+                accessibility_snapshot_target_pid(filter.as_deref(), Some(123)),
+                Some(123)
+            );
+        }
 
-        let object_ref = select_accessibility_object_ref(
-            &apps,
-            2914326,
-            &[
-                "CU ATSPI GTK Test".to_string(),
-                "cu_atspi_gtk_test.py".to_string(),
-            ],
-        )
-        .unwrap();
+        let params =
+            serde_json::from_value(serde_json::json!({ "window_id": 42, "pid": 456 })).unwrap();
+        let mut pidless = window;
+        pidless.pid = None;
+        let filter = backend
+            .resolve_accessibility_app_filter_with(&params, Some(&pidless), true, || async {
+                panic!("a pidless window keeps its own name filter")
+            })
+            .await;
+        assert_eq!(filter.as_deref(), Some("Qt app"));
 
-        assert_eq!(object_ref, ":1.64/org/a11y/atspi/accessible/root");
+        pidless.title = None;
+        pidless.app_id = None;
+        pidless.wm_class = None;
+        let filter = backend
+            .resolve_accessibility_app_filter_with(&params, Some(&pidless), true, || async {
+                panic!("an unidentified window cannot select another application")
+            })
+            .await;
+        assert_eq!(
+            filter.as_deref(),
+            Some(UNMATCHABLE_ACCESSIBILITY_APP_FILTER)
+        );
     }
 
     #[test]
@@ -13041,12 +17989,37 @@ esac
         );
     }
 
-    #[test]
-    fn ambiguous_kde_clipboard_set_never_allows_input_replay() {
-        let error = KdeClipboardPasteError::ambiguous_clipboard_set("timed out".to_string());
+    #[tokio::test]
+    async fn failed_kde_clipboard_write_restores_the_old_contents_and_is_not_replayed() {
+        for restore_works in [true, false] {
+            let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = std::sync::Arc::clone(&writes);
+            let error = replace_kde_clipboard("secret text", "old contents", move |value| {
+                recorded.lock().unwrap().push(value.clone());
+                async move {
+                    if value == "secret text" || !restore_works {
+                        Err("klipper call timed out".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await
+            .unwrap_err();
 
-        assert!(!error.can_fallback_to_ydotool);
-        assert!(!error.clear_portal_keyboard_session);
+            // The write may have landed although it failed, so the user's
+            // clipboard is put back, and the text is not typed another way.
+            assert_eq!(*writes.lock().unwrap(), ["secret text", "old contents"]);
+            assert!(!error.can_fallback_to_ydotool);
+            assert!(!error.clear_portal_keyboard_session);
+            assert!(error.message.contains("not replayed"), "{}", error.message);
+            assert_eq!(
+                error.message.contains("previous contents were restored"),
+                restore_works,
+                "{}",
+                error.message
+            );
+        }
     }
 
     #[test]
@@ -13740,7 +18713,8 @@ esac
                     ..Default::default()
                 })
                 .await
-                .0;
+                .0
+                 .0;
             assert!(!output.ok);
             assert!(
                 output.message.contains("require a KWin Wayland"),
@@ -13811,17 +18785,80 @@ esac
                 ok: true,
                 implemented: true,
                 action: "click".to_string(),
-                message: String::new(),
+                message: "Action sent through the test pointer.".to_string(),
                 received: None,
             },
             Some(prepared),
-            "the test pointer",
         );
         assert!(output.ok);
         assert!(output.message.contains("capture 417,528"));
         assert!(output.message.contains("portal logical 278,352"));
         assert!(output.message.contains("Dispatch only"));
         assert!(output.message.contains("UI activation was not verified"));
+    }
+
+    /// The KWin mapping text must not replace the notes each backend route
+    /// already appended (#389), and names no backend of its own (#396).
+    #[test]
+    fn kwin_element_click_mapping_keeps_backend_notes() {
+        let prepared = PreparedKwinElementClick {
+            element_index: 2,
+            point: KwinElementClickPoint {
+                logical: (2560, 1440),
+                capture: (3840, 2160),
+            },
+            capture_size: (3840, 2160),
+        };
+        // uinput route: the edge-clamp note.
+        let uinput = kwin_element_click_dispatch_output(
+            abs_pointer_result(
+                "click",
+                Ok(crate::abs_pointer::PointerLanding {
+                    requested: (3840, 2160),
+                    emitted: (3839, 2159),
+                }),
+                None,
+            ),
+            Some(prepared),
+        );
+        assert!(
+            uinput
+                .message
+                .contains("Requested coordinate 3840,2160 was clamped to 3839,2159"),
+            "{}",
+            uinput.message
+        );
+        assert!(
+            uinput.message.contains("capture 3840,2160"),
+            "{}",
+            uinput.message
+        );
+        // The backend message already names the backend; the mapping does
+        // not name it again (#396).
+        assert!(
+            uinput.message.starts_with(
+                "Action sent through the uinput absolute pointer. Requested coordinate 3840,2160 was clamped to 3839,2159 by the uinput absolute pointer. KWin element coordinate mapping: capture 3840,2160;"
+            ),
+            "{}",
+            uinput.message
+        );
+
+        // Portal route: the mapping follows the backend message and does
+        // not name the backend again.
+        let portal = kwin_element_click_dispatch_output(
+            ActionOutput {
+                ok: true,
+                implemented: true,
+                action: "click".to_string(),
+                message: "Action sent through the remote desktop portal.".to_string(),
+                received: None,
+            },
+            Some(prepared),
+        );
+        assert_eq!(
+            portal.message,
+            "Action sent through the remote desktop portal. KWin element coordinate mapping: capture 3840,2160; portal logical 2560,1440. Dispatch only: UI activation was not verified."
+        );
     }
 
     #[test]
@@ -13834,7 +18871,11 @@ esac
             Some(&kwin_window(42)),
         );
         let output = backend
-            .kwin_element_click_failure(2, "stale absolute-pointer geometry", None)
+            .kwin_element_click_failure(
+                2,
+                "mapped element point is outside every active KWin output",
+                None,
+            )
             .0;
         assert!(!output.ok);
         assert!(output.message.contains("click was not sent"));
@@ -13843,19 +18884,513 @@ esac
         assert!(output.message.contains("screenshot x/y"));
     }
 
+    /// A KWin element click whose mapping worked but whose uinput device
+    /// could not be replaced names the device and the retry route, not a
+    /// mapping failure (#396).
+    #[test]
+    fn kwin_pointer_replacement_failure_names_the_device() {
+        let failure = AbsPointerFailure {
+            detail: "cached absolute-pointer geometry was stale for the 3840x2160 raw capture and the device could not be recreated: uinput unavailable".to_string(),
+            device_dropped: true,
+        };
+        let output = kwin_abs_pointer_not_sent(
+            2,
+            &failure,
+            "it goes through the remote desktop portal",
+            None,
+        );
+        assert!(!output.ok);
+        assert_eq!(
+            output.message,
+            "click was not sent: KWin mapped element_index 2, but the uinput absolute pointer could not be used: cached absolute-pointer geometry was stale for the 3840x2160 raw capture and the device could not be recreated: uinput unavailable. No pointer event was emitted. The stale device was removed. A retry of element_index 2 sizes a new device to a fresh screenshot; if that fails, it goes through the remote desktop portal."
+        );
+
+        // A poisoned lock dropped no device, so there is no retry to name.
+        let output = kwin_abs_pointer_not_sent(
+            2,
+            &AbsPointerFailure::lock_poisoned(),
+            "it goes through the remote desktop portal",
+            None,
+        );
+        assert!(
+            output
+                .message
+                .ends_with("absolute pointer lock was poisoned. No pointer event was emitted."),
+            "{}",
+            output.message
+        );
+    }
+
+    /// The note checks capture pixels against the monitors scaled onto the
+    /// capture, and words what each route did (#391).
     #[tokio::test]
-    async fn kwin_stale_pointer_recreation_failure_is_fail_closed() {
+    async fn monitor_gap_note_follows_the_route() {
+        let backend = ComputerUseLinux::default();
+        let known = |backend: &ComputerUseLinux, monitors: Vec<(i32, i32, i32, i32)>| {
+            backend.capture_layout.lock().unwrap().monitors = CaptureMonitors::Logical(monitors);
+        };
+        // A 2x capture of a logical 2240x720 layout with a gap under the
+        // right monitor.
+        backend.cache_desktop_size(4480, 1440);
+        known(&backend, vec![(0, 0, 1280, 720), (1280, 0, 960, 540)]);
+        for route in [
+            PointerRoute::X11,
+            PointerRoute::Uinput,
+            PointerRoute::Portal,
+        ] {
+            for (x, y) in [(100, 1300), (3000, 500), (4479, 1079)] {
+                assert_eq!(backend.off_screen_note_for_point(x, y, route).await, None);
+            }
+        }
+        assert_eq!(
+            backend
+                .off_screen_note_for_point(3000, 1200, PointerRoute::Portal)
+                .await
+                .as_deref(),
+            Some("WARNING: coordinate 3000,1200 is on no monitor of the captured desktop (4480x1440).")
+        );
+        assert_eq!(
+            backend
+                .off_screen_note_for_point(2560, 1080, PointerRoute::X11)
+                .await
+                .as_deref(),
+            Some("WARNING: coordinate 2560,1080 is on no monitor of the captured desktop (4480x1440); the input landed at a monitor edge or on no visible pixel.")
+        );
+        // Off the capture, X11 clamps to the screen first.
+        assert_eq!(
+            backend
+                .off_screen_note_for_point(5000, 500, PointerRoute::X11)
+                .await
+                .as_deref(),
+            Some("WARNING: coordinate 5000,500 is outside the captured desktop (4480x1440); the X server keeps the pointer on the screen, so the input landed at an edge instead.")
+        );
+        assert_eq!(
+            backend
+                .off_screen_note_for_point(5000, 1300, PointerRoute::X11)
+                .await
+                .as_deref(),
+            Some("WARNING: coordinate 5000,1300 is outside the captured desktop (4480x1440); the X server keeps the pointer on the screen, but the nearest point there, 4479,1300, is on no monitor, so the input landed at a monitor edge or on no visible pixel.")
+        );
+        // Off the capture, the uinput clamp note speaks for itself.
+        assert_eq!(
+            backend
+                .off_screen_note_for_point(-1, 10, PointerRoute::Uinput)
+                .await,
+            None
+        );
+        assert_eq!(
+            backend
+                .off_screen_note_for_point(-1, 10, PointerRoute::Portal)
+                .await
+                .as_deref(),
+            Some("WARNING: coordinate -1,10 is outside the captured desktop (4480x1440).")
+        );
+
+        // A layout that does not scale evenly onto the capture is ignored.
+        known(&backend, vec![(0, 0, 1280, 720), (1280, 0, 1280, 540)]);
+        assert_eq!(
+            backend
+                .off_screen_note_for_point(3000, 1200, PointerRoute::X11)
+                .await,
+            None
+        );
+        // So is an unknown one, and a new capture drops the old layout.
+        backend.capture_layout.lock().unwrap().monitors = CaptureMonitors::Unknown;
+        assert_eq!(
+            backend
+                .off_screen_note_for_point(3000, 1200, PointerRoute::X11)
+                .await,
+            None
+        );
+        known(&backend, vec![(0, 0, 1280, 720), (1280, 0, 960, 540)]);
+        backend.cache_desktop_size(4480, 1440);
+        assert_eq!(
+            backend.capture_layout.lock().unwrap().monitors,
+            CaptureMonitors::Unread
+        );
+    }
+
+    /// The portal sends no drag with an endpoint off its monitors, so its
+    /// notes name each endpoint that stopped it and claim no landing (#398).
+    #[tokio::test]
+    async fn portal_drag_notes_name_each_endpoint() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_desktop_size(4480, 1440);
+        backend.capture_layout.lock().unwrap().monitors =
+            CaptureMonitors::Logical(vec![(0, 0, 1280, 720), (1280, 0, 960, 540)]);
+        assert_eq!(
+            backend
+                .drag_off_screen_notes((3000, 1200), (5000, 500), PointerRoute::Portal)
+                .await,
+            [
+                "WARNING: start coordinate 3000,1200 is on no monitor of the captured desktop (4480x1440).",
+                "WARNING: end coordinate 5000,500 is outside the captured desktop (4480x1440).",
+            ]
+        );
+        assert_eq!(
+            backend
+                .drag_off_screen_notes((100, 1300), (-1, 10), PointerRoute::Portal)
+                .await,
+            ["WARNING: end coordinate -1,10 is outside the captured desktop (4480x1440)."]
+        );
+        // The path from 2000,1400 to 4400,1000 crosses the gap; the portal
+        // moves that motion onto a monitor, so only endpoints count.
+        assert!(backend
+            .drag_off_screen_notes((2000, 1400), (4400, 1000), PointerRoute::Portal)
+            .await
+            .is_empty());
+    }
+
+    /// An X11 capture is the whole root window, which can hold framebuffer
+    /// area no monitor shows, so RandR rectangles are used as they are.
+    #[tokio::test]
+    async fn x11_monitor_gap_note_uses_root_pixels() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_desktop_size(4480, 3600);
+        backend.capture_layout.lock().unwrap().monitors =
+            CaptureMonitors::Root(vec![(0, 0, 1280, 720), (1280, 720, 960, 1080)]);
+        for (x, y) in [(100, 100), (1500, 1600), (2239, 1799)] {
+            assert_eq!(
+                backend
+                    .off_screen_note_for_point(x, y, PointerRoute::X11)
+                    .await,
+                None,
+                "{x},{y}"
+            );
+        }
+        for (x, y) in [(100, 1000), (2240, 1000), (4000, 3000)] {
+            assert!(
+                backend
+                    .off_screen_note_for_point(x, y, PointerRoute::X11)
+                    .await
+                    .is_some_and(|note| note.contains("is on no monitor")),
+                "{x},{y}"
+            );
+        }
+        assert_eq!(root_monitor_rects(&[]), None);
+        assert_eq!(root_monitor_rects(&[(0, 0, 0, 720)]), None);
+    }
+
+    #[test]
+    fn monitor_rects_scale_onto_the_capture() {
+        // Negative origins and a 1.25 scale; edges round outward.
+        assert_eq!(
+            monitor_rects_in_capture(&[(-1536, 0, 1536, 864), (0, 0, 1024, 575)], (3200, 1080)),
+            Some(vec![(0, 0, 1920, 1080), (1920, 0, 3200, 719)])
+        );
+        assert_eq!(monitor_rects_in_capture(&[], (1920, 1080)), None);
+        assert_eq!(
+            monitor_rects_in_capture(&[(0, 0, 0, 1080)], (1920, 1080)),
+            None
+        );
+        assert_eq!(
+            monitor_rects_in_capture(&[(0, 0, 1920, 1080)], (1920, 1200)),
+            None
+        );
+        let rects = monitor_rects_in_capture(&[(0, 0, 1920, 1080)], (1920, 1080)).unwrap();
+        assert!(point_on_capture_monitor(&rects, 1919, 1079));
+        assert!(!point_on_capture_monitor(&rects, 1920, 1079));
+    }
+
+    #[test]
+    fn monitor_crop_rect_numbers_monitors_by_position() {
+        // Three 1920x1080 monitors listed out of order (issue #473).
+        let span = [
+            (3840, 0, 5760, 1080),
+            (0, 0, 1920, 1080),
+            (1920, 0, 3840, 1080),
+        ];
+        assert_eq!(
+            monitor_crop_rect(&span, 0, (5760, 1080)),
+            Ok((0, 0, 1920, 1080))
+        );
+        assert_eq!(
+            monitor_crop_rect(&span, 1, (5760, 1080)),
+            Ok((1920, 0, 1920, 1080))
+        );
+        assert_eq!(
+            monitor_crop_rect(&span, 2, (5760, 1080)),
+            Ok((3840, 0, 1920, 1080))
+        );
+        let error = monitor_crop_rect(&span, 3, (5760, 1080)).unwrap_err();
+        assert!(error.contains("has 3 (0 to 2)"), "{error}");
+
+        // A row that is not top-aligned is still numbered left to right: a
+        // middle monitor 1 px lower, and a 1080p panel bottom-aligned left of
+        // a 1440p display.
+        let offset = [
+            (0, 0, 1920, 1080),
+            (1920, 1, 3840, 1081),
+            (3840, 0, 5760, 1080),
+        ];
+        assert_eq!(
+            monitor_crop_rect(&offset, 1, (5760, 1081)),
+            Ok((1920, 1, 1920, 1080))
+        );
+        let mixed = [(0, 360, 1920, 1440), (1920, 0, 4480, 1440)];
+        assert_eq!(
+            monitor_crop_rect(&mixed, 0, (4480, 1440)),
+            Ok((0, 360, 1920, 1080))
+        );
+
+        // A 2x2 grid of 2560x1440 monitors at 105%: outward rounding gives
+        // the top row a bottom edge 1 px below the bottom row's top, and the
+        // rows must stay apart.
+        let grid = monitor_rects_in_capture(
+            &[
+                (0, 0, 2438, 1371),
+                (2438, 0, 2438, 1371),
+                (0, 1371, 2438, 1371),
+                (2438, 1371, 2438, 1371),
+            ],
+            (5120, 2880),
+        )
+        .unwrap();
+        assert!(
+            grid.iter().any(|&(_, top, _, _)| top == 1439)
+                && grid.iter().any(|&(_, _, _, bottom)| bottom == 1440),
+            "{grid:?}"
+        );
+        assert_eq!(
+            monitor_crop_rect(&grid, 1, (5120, 2880)),
+            Ok((2560, 0, 2560, 1440))
+        );
+        assert_eq!(
+            monitor_crop_rect(&grid, 2, (5120, 2880)).map(|rect| (rect.0, rect.1)),
+            Ok((0, 1439))
+        );
+
+        // Stacked monitors go top to bottom; an edge rounded past the
+        // capture is clipped to it.
+        let stacked = [(0, 1080, 1920, 2161), (0, 0, 1920, 1080)];
+        assert_eq!(
+            monitor_crop_rect(&stacked, 1, (1920, 2160)),
+            Ok((0, 1080, 1920, 1080))
+        );
+        // A monitor wholly outside the capture is refused.
+        assert!(monitor_crop_rect(
+            &[(0, 0, 1920, 1080), (4000, 0, 5000, 1080)],
+            1,
+            (1920, 1080)
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn monitor_screenshot_refuses_a_window_target_before_capture() {
         let backend = ComputerUseLinux::default();
         let error = backend
-            .create_abs_pointer_for_kwin_capture_with(2560, 1440, true, |_, _| {
-                anyhow::bail!("uinput unavailable")
+            .capture_screenshot(ScreenshotParams {
+                monitor: Some(0),
+                title: Some("Firefox".to_string()),
+                ..ScreenshotParams::default()
             })
             .await
             .unwrap_err();
+        assert!(format!("{error:#}").contains("not both"), "{error:#}");
+    }
 
-        assert!(error.contains("geometry was stale"), "{error}");
-        assert!(error.contains("could not be recreated"), "{error}");
+    #[tokio::test]
+    async fn stale_pointer_recreation_failure_is_fail_closed() {
+        let backend = ComputerUseLinux::default();
+        let error = backend
+            .create_abs_pointer_with(2560, 1440, true, |_, _| anyhow::bail!("uinput unavailable"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .detail
+                .contains("geometry was stale for the 2560x1440"),
+            "{error:?}"
+        );
+        assert!(error.detail.contains("could not be recreated"), "{error:?}");
+        assert!(error.device_dropped);
         assert!(backend.abs_pointer.lock().unwrap().is_none());
+
+        // With no stale device, a failed creation leaves the other routes.
+        let ready = backend
+            .create_abs_pointer_with(2560, 1440, false, |_, _| {
+                anyhow::bail!("uinput unavailable")
+            })
+            .await;
+        assert_eq!(ready, Ok(false));
+        assert!(backend.abs_pointer.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_monitor_index_is_refused_on_a_capture_of_one_output_of_several() {
+        use crate::abs_pointer::{CaptureFit, CapturePlacement};
+        assert_eq!(
+            partial_capture_monitor_refusal(&CaptureFit::WholeLayout),
+            None
+        );
+        let placed = CaptureFit::Placed(CapturePlacement {
+            layout_width: 2880,
+            layout_height: 3600,
+            offset_x: 0,
+            offset_y: 0,
+        });
+        assert!(partial_capture_monitor_refusal(&placed)
+            .unwrap()
+            .contains("one output of several"));
+        let unsupported = CaptureFit::Unsupported("2880x1800 matches no output".to_string());
+        assert!(partial_capture_monitor_refusal(&unsupported)
+            .unwrap()
+            .contains("matches no output"));
+    }
+
+    #[tokio::test]
+    async fn first_pointer_is_sized_from_the_cached_capture_without_a_new_one() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_desktop_size(2880, 3601);
+        let created = Arc::new(Mutex::new(None));
+        let seen = created.clone();
+
+        let ready = backend
+            .ensure_abs_pointer_with(
+                true,
+                || async { panic!("a cached capture size must not be replaced by a new capture") },
+                move |width, height| {
+                    *seen.lock().unwrap() = Some((width, height));
+                    anyhow::bail!("uinput unavailable")
+                },
+            )
+            .await;
+
+        assert_eq!(ready, Ok(false));
+        assert_eq!(*created.lock().unwrap(), Some((2880, 3601)));
+        assert_eq!(*backend.desktop_size.lock().unwrap(), Some((2880, 3601)));
+    }
+
+    #[tokio::test]
+    async fn first_pointer_without_a_cached_capture_takes_one() {
+        let backend = ComputerUseLinux::default();
+        let created = Arc::new(Mutex::new(None));
+        let seen = created.clone();
+
+        let ready = backend
+            .ensure_abs_pointer_with(
+                true,
+                || async { Some((2880, 1800)) },
+                move |width, height| {
+                    *seen.lock().unwrap() = Some((width, height));
+                    anyhow::bail!("uinput unavailable")
+                },
+            )
+            .await;
+
+        assert_eq!(ready, Ok(false));
+        assert_eq!(*created.lock().unwrap(), Some((2880, 1800)));
+        assert_eq!(*backend.desktop_size.lock().unwrap(), Some((2880, 1800)));
+
+        // Outside Umbriel a first device still takes its own capture.
+        let backend = ComputerUseLinux::default();
+        backend.cache_desktop_size(1920, 1080);
+        let created = Arc::new(Mutex::new(None));
+        let seen = created.clone();
+        let _ = backend
+            .ensure_abs_pointer_with(
+                false,
+                || async { Some((3840, 1080)) },
+                move |width, height| {
+                    *seen.lock().unwrap() = Some((width, height));
+                    anyhow::bail!("uinput unavailable")
+                },
+            )
+            .await;
+        assert_eq!(*created.lock().unwrap(), Some((3840, 1080)));
+
+        // A failed capture creates no device and leaves the other routes.
+        let backend = ComputerUseLinux::default();
+        let ready = backend
+            .ensure_abs_pointer_with(
+                true,
+                || async { None },
+                |_, _| panic!("no device without a capture size"),
+            )
+            .await;
+        assert_eq!(ready, Ok(false));
+    }
+
+    fn umbriel_window_with_bounds(x: i32, y: i32) -> crate::windowing::WindowInfo {
+        let mut window = window_info(7, Some("Files"), None, None, None);
+        window.backend = crate::windowing::backends::umbriel::UMBRIEL_BACKEND.to_string();
+        window.bounds = Some(WindowBounds {
+            x: Some(x),
+            y: Some(y),
+            width: 800,
+            height: 600,
+        });
+        window
+    }
+
+    #[tokio::test]
+    async fn first_umbriel_window_relative_action_maps_against_the_capture_it_primes() {
+        let backend = ComputerUseLinux::default();
+        let captures = Arc::new(Mutex::new(0));
+        let count = captures.clone();
+
+        // Nothing is cached, so the mapping takes the capture itself, and
+        // the window is listed again for that capture's size.
+        let window = window_for_primed_capture(
+            backend.capture_space_rect_with(|| async move {
+                *count.lock().unwrap() += 1;
+                Some((2880, 3601))
+            }),
+            |width, height| async move {
+                assert_eq!((width, height), (2880, 3601));
+                Ok(umbriel_window_with_bounds(100, 1900))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*captures.lock().unwrap(), 1);
+        assert_eq!(window.bounds.unwrap().y, Some(1900));
+        assert_eq!(*backend.desktop_size.lock().unwrap(), Some((2880, 3601)));
+
+        // The pointer that follows is sized from that same capture.
+        let created = Arc::new(Mutex::new(None));
+        let seen = created.clone();
+        let _ = backend
+            .ensure_abs_pointer_with(
+                true,
+                || async { panic!("the pointer must use the capture the point was mapped in") },
+                move |width, height| {
+                    *seen.lock().unwrap() = Some((width, height));
+                    anyhow::bail!("uinput unavailable")
+                },
+            )
+            .await;
+        assert_eq!(*created.lock().unwrap(), Some((2880, 3601)));
+    }
+
+    #[tokio::test]
+    async fn first_umbriel_window_relative_action_is_refused_when_the_capture_fails() {
+        let backend = ComputerUseLinux::default();
+        let error = window_for_primed_capture(
+            backend.capture_space_rect_with(|| async { None }),
+            |_, _| async { panic!("bounds must not be read without a capture") },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("Could not determine screenshot dimensions"),
+            "{error}"
+        );
+        assert!(backend.desktop_size.lock().unwrap().is_none());
+
+        // Bounds that cannot be read for the capture refuse the call too.
+        let error = window_for_primed_capture(
+            backend.capture_space_rect_with(|| async { Some((2880, 1800)) }),
+            |_, _| async { anyhow::bail!("Umbriel no longer lists window_id 7") },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("Could not read target-window bounds for this capture"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -14007,6 +19542,19 @@ esac
     }
 
     #[test]
+    fn native_x11_pointer_policy_requires_explicit_x11_without_wayland_display() {
+        assert!(native_x11_xdotool_pointer_session(Some("x11"), None));
+        assert!(!native_x11_xdotool_pointer_session(
+            Some("wayland"),
+            Some("wayland-0")
+        ));
+        assert!(!native_x11_xdotool_pointer_session(
+            Some("x11"),
+            Some("wayland-0")
+        ));
+    }
+
+    #[test]
     fn xdotool_pointer_command_is_single_no_sync_move_and_click() {
         assert_eq!(
             xdotool_pointer_click_args(1550, 930, 3, Some("right")),
@@ -14049,6 +19597,32 @@ esac
         for button in ["side", "extra", "forward", "back"] {
             assert_eq!(xdotool_pointer_click_args(10, 20, 1, Some(button)), None);
         }
+    }
+
+    #[tokio::test]
+    async fn pointer_xdotool_spawn_failure_uses_ydotool_fallback() {
+        let result = run_xdotool_pointer_or_fallback(
+            Path::new("/definitely/missing/xdotool"),
+            &[],
+            || async { Ok::<_, String>(Vec::new()) },
+        )
+        .await
+        .expect("spawn failure should use fallback");
+
+        assert_eq!(result.backend, KeyboardCommandBackend::Ydotool);
+    }
+
+    #[tokio::test]
+    async fn pointer_xdotool_nonzero_exit_does_not_use_ydotool_fallback() {
+        let result = run_xdotool_pointer_or_fallback(
+            Path::new("/bin/sh"),
+            &["-c".to_string(), "exit 9".to_string()],
+            || async { Err::<Vec<Output>, _>("fallback called".to_string()) },
+        )
+        .await;
+
+        let error = result.expect_err("launched nonzero xdotool must be terminal");
+        assert!(!error.contains("fallback called"));
     }
 
     #[test]
@@ -14155,6 +19729,16 @@ esac
         );
     }
 
+    /// Left is a negative `REL_HWHEEL`, as on the portal route and X11
+    /// button 6. Left used to be positive, a scroll right.
+    #[test]
+    fn wheel_deltas_use_kernel_signs() {
+        assert_eq!(wheel_deltas(ScrollDirection::Up, 5), (0, 5));
+        assert_eq!(wheel_deltas(ScrollDirection::Down, 5), (0, -5));
+        assert_eq!(wheel_deltas(ScrollDirection::Left, 5), (-5, 0));
+        assert_eq!(wheel_deltas(ScrollDirection::Right, 5), (5, 0));
+    }
+
     #[test]
     fn wheel_mousemove_uses_coordinate_separator_for_negative_values() {
         assert_eq!(
@@ -14184,29 +19768,11 @@ esac
     }
 
     #[test]
-    fn legacy_ydotool_socket_does_not_suppress_portal_fallback() {
-        let legacy_ydotool_available = ydotool_backend_available_from(true, false);
-        let current_ydotool_available = ydotool_backend_available_from(true, true);
-
-        assert!(should_prefer_portal_backend_by_default(
-            true,
-            legacy_ydotool_available
-        ));
-        assert!(!should_prefer_portal_backend_by_default(
-            true,
-            current_ydotool_available
-        ));
-        assert!(!should_prefer_portal_backend_by_default(
-            false,
-            legacy_ydotool_available
-        ));
-    }
-
-    #[test]
     fn key_chord_splits_modifiers_and_key() {
         assert_eq!(key_chord("Ctrl+Shift+P"), Some((vec![29, 42], 25)));
         assert_eq!(key_chord("Ctrl+S"), Some((vec![29], 31)));
         assert_eq!(key_chord("Enter"), Some((vec![], 28)));
+        // A bare modifier is a chord with no held modifiers.
         assert_eq!(key_chord("Super"), Some((vec![], 125)));
         assert_eq!(key_chord("NotAKey"), None);
     }
@@ -14360,7 +19926,17 @@ esac
     }
 
     #[test]
+    fn xdotool_delay_prefers_codex_env_and_accepts_standalone_alias() {
+        assert_eq!(xdotool_type_delay_ms_value(Some("7"), Some("9")), 7);
+        assert_eq!(xdotool_type_delay_ms_value(None, Some("9")), 9);
+        assert_eq!(xdotool_type_delay_ms_value(Some("bad"), Some("9")), 12);
+        assert_eq!(xdotool_type_delay_ms_value(None, None), 12);
+    }
+
+    #[test]
     fn xdotool_type_keeps_a_per_character_delay_so_xtest_events_stay_ordered() {
+        // Issue #147: `--delay 0` delivers characters out of order on some X
+        // servers. The default must stay non-zero.
         const { assert!(XDOTOOL_TYPE_DELAY_MS > 0) };
         let text = "x".repeat(10_000);
         let args = xdotool_type_args_with_delay(&text, XDOTOOL_TYPE_DELAY_MS);
@@ -14396,53 +19972,83 @@ esac
         );
     }
 
-    #[test]
-    fn xdotool_delay_prefers_codex_env_and_accepts_standalone_alias() {
-        assert_eq!(xdotool_type_delay_ms_value(Some("7"), Some("9")), 7);
-        assert_eq!(xdotool_type_delay_ms_value(None, Some("9")), 9);
-        assert_eq!(xdotool_type_delay_ms_value(Some("bad"), Some("9")), 12);
-        assert_eq!(xdotool_type_delay_ms_value(None, None), 12);
+    #[tokio::test]
+    async fn launched_xdotool_failure_does_not_replay_through_ydotool() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-linux-xdotool-fallback-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).expect("create command test directory");
+        let ydotool = dir.join("ydotool");
+        let xdotool_marker = dir.join("xdotool-ran");
+        let ydotool_marker = dir.join("ydotool-ran");
+        std::fs::write(
+            &ydotool,
+            format!("#!/bin/sh\ntouch '{}'\n", ydotool_marker.display()),
+        )
+        .expect("write fake ydotool");
+        std::fs::set_permissions(&ydotool, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake ydotool executable");
+        let xdotool_args = vec![
+            "-c".to_string(),
+            format!("touch '{}'; exit 9", xdotool_marker.display()),
+        ];
+
+        let result = run_xdotool_or_fallback(Path::new("/bin/sh"), &xdotool_args, || async {
+            TokioCommand::new(&ydotool)
+                .output()
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(xdotool_marker.exists(), "fake xdotool did not execute");
+        assert!(
+            !ydotool_marker.exists(),
+            "ydotool replayed input after xdotool started"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn wayland_prefers_wtype_unless_ydotool_is_forced() {
-        assert!(prefer_wtype_keyboard(false, false, false, true, true, true));
-        assert!(!prefer_wtype_keyboard(true, false, false, true, true, true));
-        assert!(!prefer_wtype_keyboard(false, true, false, true, true, true));
-        assert!(!prefer_wtype_keyboard(false, false, true, true, true, true));
-        assert!(!prefer_wtype_keyboard(
-            false, false, false, false, true, true
-        ));
-        assert!(!prefer_wtype_keyboard(
-            false, false, false, true, false, true
-        ));
-        assert!(!prefer_wtype_keyboard(
-            false, false, false, true, true, false
-        ));
+    #[tokio::test]
+    async fn unavailable_xdotool_uses_ydotool_fallback() {
+        let result = run_xdotool_or_fallback(
+            Path::new("/definitely/missing/xdotool"),
+            &xdotool_type_args_with_delay("text", XDOTOOL_TYPE_DELAY_MS),
+            || async {
+                TokioCommand::new("sh")
+                    .args(["-c", "exit 0"])
+                    .output()
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+        .expect("spawn failure should use fallback");
+
+        assert_eq!(result.backend, KeyboardCommandBackend::Ydotool);
+        assert!(result.output.status.success());
     }
 
     #[tokio::test]
     async fn wtype_passes_long_unicode_as_one_literal_argument() {
         let dir = std::env::temp_dir().join(format!(
-            "codex-computer-use-linux-wtype-unicode-{}-{:?}",
+            "computer-use-linux-wtype-unicode-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
         ));
         std::fs::create_dir_all(&dir).expect("create command test directory");
         let wtype = dir.join("wtype");
-        let wtype_source = dir.join("wtype.source");
         let captured = dir.join("captured");
-        std::fs::write(
-            &wtype_source,
-            format!(
+        publish_fake_executable(
+            &wtype,
+            &format!(
                 "#!/bin/sh\n[ \"$#\" -eq 2 ] && [ \"$1\" = -- ] || exit 42\nprintf '%s' \"$2\" > '{}'\n",
                 captured.display()
             ),
-        )
-        .expect("write fake wtype");
-        std::fs::set_permissions(&wtype_source, std::fs::Permissions::from_mode(0o700))
-            .expect("make fake wtype executable");
-        std::fs::rename(&wtype_source, &wtype).expect("publish fake wtype atomically");
+        );
         let text =
             "--Türkçe PostgreSQL (W, g, m, v, f, ş, ü) / 0123456789 - ; 'İstanbul'\n".repeat(50);
 
@@ -14757,6 +20363,9 @@ esac
             "COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD",
             "COMPUTER_USE_LINUX_FORCE_XDOTOOL_KEYBOARD",
             "COMPUTER_USE_LINUX_FORCE_PORTAL_KEYBOARD",
+            "CODEX_COMPUTER_USE_FORCE_YDOTOOL_KEYBOARD",
+            "CODEX_COMPUTER_USE_FORCE_XDOTOOL_KEYBOARD",
+            "CODEX_COMPUTER_USE_FORCE_PORTAL_KEYBOARD",
         ] {
             command.env_remove(key);
         }
@@ -14836,10 +20445,34 @@ esac
         assert!(validate_wtype_text("").is_ok());
     }
 
+    /// Write an executable script to `path` through a sibling file and a
+    /// rename, so no writable descriptor to `path` exists when it runs. A
+    /// child forked by another test thread while the script was open for
+    /// writing would otherwise make its exec fail with ETXTBSY.
+    fn publish_fake_executable(path: &Path, script: &str) {
+        let source = path.with_extension("source");
+        std::fs::write(&source, script).expect("write fake executable");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake executable runnable");
+        std::fs::rename(&source, path).expect("publish fake executable");
+    }
+
+    async fn fallback_ran_instead_of_wtype(wtype: &Path) -> KeyboardCommandBackend {
+        run_wtype_type_text_or_fallback(wtype, "text", WtypeTextMode::Argument, false, || async {
+            TokioCommand::new("true")
+                .output()
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .expect("a wtype that cannot start should use the fallback")
+        .backend
+    }
+
     #[tokio::test]
     async fn non_executable_wtype_uses_ydotool_fallback() {
         let dir = std::env::temp_dir().join(format!(
-            "codex-computer-use-linux-wtype-nonexec-{}-{:?}",
+            "computer-use-linux-wtype-nonexec-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
         ));
@@ -14847,72 +20480,66 @@ esac
         let wtype = dir.join("wtype");
         std::fs::write(&wtype, "#!/bin/sh\nexit 0\n").expect("write fake wtype");
 
-        let result = run_wtype_type_text_or_fallback(
-            &wtype,
-            "text",
-            WtypeTextMode::Argument,
-            false,
-            || async {
-                TokioCommand::new("true")
-                    .output()
-                    .await
-                    .map_err(|error| error.to_string())
-            },
-        )
-        .await
-        .expect("non-executable wtype should use fallback");
-
-        assert_eq!(result.backend, KeyboardCommandBackend::Ydotool);
+        assert_eq!(
+            fallback_ran_instead_of_wtype(&wtype).await,
+            KeyboardCommandBackend::Ydotool
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn missing_wtype_interpreter_uses_ydotool_fallback() {
         let dir = std::env::temp_dir().join(format!(
-            "codex-computer-use-linux-wtype-interpreter-{}-{:?}",
+            "computer-use-linux-wtype-interpreter-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
         ));
         std::fs::create_dir_all(&dir).expect("create command test directory");
         let wtype = dir.join("wtype");
-        std::fs::write(&wtype, "#!/definitely/missing/interpreter\n").expect("write fake wtype");
+        publish_fake_executable(&wtype, "#!/definitely/missing/interpreter\n");
+
+        assert_eq!(
+            fallback_ran_instead_of_wtype(&wtype).await,
+            KeyboardCommandBackend::Ydotool
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_program_on_path_counts_only_when_it_is_executable() {
+        // No `:` in the name, so the directory can sit in a PATH value.
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-linux-wtype-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create command test directory");
+        let wtype = dir.join("wtype");
+        std::fs::write(&wtype, "#!/bin/sh\nexit 0\n").expect("write fake wtype");
+        let path = std::env::join_paths([std::path::Path::new("/nonexistent"), dir.as_path()])
+            .expect("join PATH");
+        assert!(!executable_in(&path, "wtype"));
         std::fs::set_permissions(&wtype, std::fs::Permissions::from_mode(0o700))
             .expect("make fake wtype executable");
-
-        let result = run_wtype_type_text_or_fallback(
-            &wtype,
-            "text",
-            WtypeTextMode::Argument,
-            false,
-            || async {
-                TokioCommand::new("true")
-                    .output()
-                    .await
-                    .map_err(|error| error.to_string())
-            },
-        )
-        .await
-        .expect("missing interpreter should use fallback");
-
-        assert_eq!(result.backend, KeyboardCommandBackend::Ydotool);
+        assert!(executable_in(&path, "wtype"));
+        assert!(!executable_in(&path, "xdotool"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn launched_wtype_failure_does_not_replay_through_ydotool() {
         let dir = std::env::temp_dir().join(format!(
-            "codex-computer-use-linux-wtype-fallback-{}-{:?}",
+            "computer-use-linux-wtype-fallback-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
         ));
         std::fs::create_dir_all(&dir).expect("create command test directory");
         let wtype = dir.join("wtype");
-        let wtype_source = dir.join("wtype.source");
         let fallback_marker = dir.join("ydotool-ran");
-        std::fs::write(&wtype_source, "#!/bin/sh\nexit 9\n").expect("write fake wtype");
-        std::fs::set_permissions(&wtype_source, std::fs::Permissions::from_mode(0o700))
-            .expect("make fake wtype executable");
-        std::fs::rename(&wtype_source, &wtype).expect("publish fake wtype atomically");
+        publish_fake_executable(&wtype, "#!/bin/sh\nexit 9\n");
 
         let result = run_wtype_type_text_or_fallback(
             &wtype,
@@ -14938,92 +20565,6 @@ esac
     }
 
     #[tokio::test]
-    async fn launched_xdotool_failure_does_not_replay_through_ydotool() {
-        let dir = std::env::temp_dir().join(format!(
-            "codex-xdotool-fallback-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-        ));
-        std::fs::create_dir_all(&dir).expect("create command test directory");
-        let ydotool = dir.join("ydotool");
-        let xdotool_marker = dir.join("xdotool-ran");
-        let ydotool_marker = dir.join("ydotool-ran");
-        std::fs::write(
-            &ydotool,
-            format!("#!/bin/sh\ntouch '{}'\n", ydotool_marker.display()),
-        )
-        .expect("write fake ydotool");
-        std::fs::set_permissions(&ydotool, std::fs::Permissions::from_mode(0o700))
-            .expect("make fake ydotool executable");
-        let xdotool_args = vec![
-            "-c".to_string(),
-            format!("touch '{}'; exit 9", xdotool_marker.display()),
-        ];
-
-        let result = run_xdotool_or_fallback(Path::new("/bin/sh"), &xdotool_args, || async {
-            TokioCommand::new(&ydotool)
-                .output()
-                .await
-                .map_err(|error| error.to_string())
-        })
-        .await;
-
-        assert!(result.is_err());
-        assert!(xdotool_marker.exists(), "fake xdotool did not execute");
-        assert!(
-            !ydotool_marker.exists(),
-            "ydotool replayed input after xdotool started"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn unavailable_xdotool_uses_ydotool_fallback() {
-        let result = run_xdotool_or_fallback(
-            Path::new("/definitely/missing/xdotool"),
-            &xdotool_type_args_with_delay("text", XDOTOOL_TYPE_DELAY_MS),
-            || async {
-                TokioCommand::new("sh")
-                    .args(["-c", "exit 0"])
-                    .output()
-                    .await
-                    .map_err(|error| error.to_string())
-            },
-        )
-        .await
-        .expect("spawn failure should use fallback");
-
-        assert_eq!(result.backend, KeyboardCommandBackend::Ydotool);
-        assert!(result.output.status.success());
-    }
-
-    #[tokio::test]
-    async fn pointer_xdotool_spawn_failure_uses_ydotool_fallback() {
-        let result = run_xdotool_pointer_or_fallback(
-            Path::new("/definitely/missing/xdotool"),
-            &[],
-            || async { Ok::<_, String>(Vec::new()) },
-        )
-        .await
-        .expect("spawn failure should use fallback");
-
-        assert_eq!(result.backend, KeyboardCommandBackend::Ydotool);
-    }
-
-    #[tokio::test]
-    async fn pointer_xdotool_nonzero_exit_does_not_use_ydotool_fallback() {
-        let result = run_xdotool_pointer_or_fallback(
-            Path::new("/bin/sh"),
-            &["-c".to_string(), "exit 9".to_string()],
-            || async { Err::<Vec<Output>, _>("fallback called".to_string()) },
-        )
-        .await;
-
-        let error = result.expect_err("launched nonzero xdotool must be terminal");
-        assert!(!error.contains("fallback called"));
-    }
-
-    #[tokio::test]
     async fn cancelling_xdotool_wait_kills_the_child() {
         let dir = std::env::temp_dir().join(format!(
             "computer-use-linux-xdotool-cancel-{}-{:?}",
@@ -15046,7 +20587,7 @@ esac
 
         let task = tokio::spawn(async move { run_xdotool(&xdotool, &[]).await });
         let mut pid = None;
-        for _ in 0..50 {
+        for _ in 0..200 {
             if let Ok(value) = std::fs::read_to_string(&pid_path) {
                 pid = value.parse::<u32>().ok();
                 if pid.is_some() {
@@ -15133,6 +20674,7 @@ esac
             .await
         });
 
+        // Cancel the caller after the paste, before the clipboard restore.
         pasted_rx.await.expect("paste did not finish");
         waiter.abort();
         let _ = waiter.await;
@@ -15151,6 +20693,8 @@ esac
         assert!(clipboard_lock.try_lock().is_ok());
     }
 
+    /// The xdotool path must accept exactly the keys the evdev grammar accepts,
+    /// so switching backends can never silently widen or narrow the surface.
     #[test]
     fn xdotool_key_spec_rejects_everything_key_chord_rejects() {
         for key in ["NotAKey", "", "ctrl+", "ctrl+NotAKey", "f13", "hyper+a"] {
@@ -15682,6 +21226,820 @@ esac
 }
 
 #[cfg(test)]
+mod app_state_pid_scope_tests {
+    use super::*;
+    use crate::test_sockets::PrivateBus;
+    use std::os::unix::fs::PermissionsExt;
+    use zbus::zvariant::OwnedObjectPath;
+
+    const ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
+
+    struct FixtureAccessible {
+        name: String,
+        role: &'static str,
+        children: Vec<(String, OwnedObjectPath)>,
+        has_action: bool,
+        application: Option<(String, OwnedObjectPath)>,
+    }
+
+    #[zbus::interface(name = "org.a11y.atspi.Accessible")]
+    impl FixtureAccessible {
+        #[zbus(property)]
+        fn child_count(&self) -> i32 {
+            self.children.len() as i32
+        }
+
+        #[zbus(property)]
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn get_role_name(&self) -> &str {
+            self.role
+        }
+
+        fn get_application(&self) -> ((String, OwnedObjectPath),) {
+            (self
+                .application
+                .clone()
+                .unwrap_or_else(|| (String::new(), "/org/a11y/atspi/null".try_into().unwrap())),)
+        }
+
+        fn get_interfaces(&self) -> Vec<&str> {
+            let mut interfaces = vec!["org.a11y.atspi.Accessible"];
+            if self.has_action {
+                interfaces.push("org.a11y.atspi.Action");
+            }
+            interfaces
+        }
+
+        fn get_child_at_index(
+            &self,
+            index: i32,
+        ) -> zbus::fdo::Result<((String, OwnedObjectPath),)> {
+            self.children
+                .get(index as usize)
+                .cloned()
+                .map(|child| (child,))
+                .ok_or_else(|| zbus::fdo::Error::InvalidArgs("invalid child index".into()))
+        }
+    }
+
+    struct FixtureAction(Box<dyn Fn() + Send + Sync>);
+
+    #[zbus::interface(name = "org.a11y.atspi.Action")]
+    impl FixtureAction {
+        #[zbus(property, name = "NActions")]
+        fn nactions(&self) -> i32 {
+            1
+        }
+
+        fn get_name(&self, _index: i32) -> &str {
+            "press"
+        }
+
+        fn get_description(&self, _index: i32) -> &str {
+            ""
+        }
+
+        fn get_key_binding(&self, _index: i32) -> &str {
+            ""
+        }
+
+        fn do_action(&self, index: i32) -> bool {
+            if index != 0 {
+                return false;
+            }
+            (self.0)();
+            true
+        }
+    }
+
+    struct FixtureBus(String);
+
+    #[zbus::interface(name = "org.a11y.Bus")]
+    impl FixtureBus {
+        fn get_address(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn app_state_keeps_pid_scope_when_window_lookup_fails() {
+        let bus = PrivateBus::start("cul-app-state-pid");
+        let mut peers = Vec::new();
+        for child_count in [0, 1] {
+            let peer = zbus::connection::Builder::address(bus.address())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let name = peer.unique_name().unwrap().to_string();
+            peer.object_server()
+                .at(
+                    ROOT_PATH,
+                    FixtureAccessible {
+                        name: format!("Target root {child_count}"),
+                        role: "application",
+                        children: (0..child_count)
+                            .map(|_| (name.clone(), "/button".try_into().unwrap()))
+                            .collect(),
+                        has_action: false,
+                        application: None,
+                    },
+                )
+                .await
+                .unwrap();
+            peer.object_server()
+                .at(
+                    "/button",
+                    FixtureAccessible {
+                        name: "Target button".to_string(),
+                        role: "push button",
+                        children: Vec::new(),
+                        has_action: false,
+                        application: None,
+                    },
+                )
+                .await
+                .unwrap();
+            peers.push(peer);
+        }
+        let dir = bus.dir();
+        for (program, script) in [
+            ("systemctl", "#!/bin/sh\nexit 1\n"),
+            ("xprop", "#!/bin/sh\nexit 1\n"),
+            (
+                "busctl",
+                r#"#!/bin/sh
+case "$*" in
+  *"org.a11y.Bus /org/a11y/bus org.a11y.Bus GetAddress") printf 's "%s"\n' "$DBUS_SESSION_BUS_ADDRESS" ;;
+  *"org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled") printf 'b true\n' ;;
+  *) exit 1 ;;
+esac
+"#,
+            ),
+            (
+                "wmctrl",
+                r#"#!/bin/sh
+[ -f "$CUL_PID_FIXTURE_WINDOWS" ] || exit 1
+read -r mode fixture_pid < "$CUL_PID_FIXTURE_WINDOWS"
+case "$mode" in
+  action)
+    printf '0x00000001 0 %s 0 0 100 100 other.Other host Window 1\n0x00000003 0 %s 0 0 100 100 other.Other host Window 3\n' "$fixture_pid" "$fixture_pid"
+    exit 0
+    ;;
+  pidless) pid=0 ;;
+  proxied)
+    printf '0x00000009 0 999999 0 0 100 100 other.Other host Other app\n'
+    exit 0
+    ;;
+  *) pid="$CUL_PID_FIXTURE_PID" ;;
+esac
+printf '0x00000007 0 %s 0 0 100 100 first.First host Target 7\n0x00000008 0 %s 0 0 100 100 second.Second host Target 8\n' "$pid" "$pid"
+"#,
+            ),
+        ] {
+            let path = dir.join(program);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "server::app_state_pid_scope_tests::app_state_pid_scope_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", dir)
+            .env("HOME", dir)
+            .env("XDG_RUNTIME_DIR", dir)
+            .env("DBUS_SESSION_BUS_ADDRESS", bus.address())
+            .env("DISPLAY", ":9876")
+            .env("WAYLAND_DISPLAY", "")
+            .env("XDG_SESSION_TYPE", "x11")
+            .env("CUL_PID_FIXTURE_PID", std::process::id().to_string())
+            .env("CUL_PID_FIXTURE_WINDOWS", dir.join("windows"))
+            .env(
+                "CUL_PID_FIXTURE_ROOTS",
+                peers
+                    .iter()
+                    .map(|peer| peer.unique_name().unwrap().as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        for key in [
+            "DESKTOP_SESSION",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+            "NIRI_SOCKET",
+            "UMBRIEL_SOCKET",
+            "XAUTHORITY",
+            "YDOTOOL_SOCKET",
+            "XDG_SESSION_DESKTOP",
+            "XDG_CURRENT_DESKTOP",
+        ] {
+            command.env(key, "app-state-pid-fixture");
+        }
+        // Keep the parent's D-Bus peers serving while the isolated process
+        // runs app_state against roots owned by both processes.
+        let output = tokio::task::spawn_blocking(move || {
+            crate::command_runner::output_blocking_with_timeout(
+                &mut command,
+                "app_state PID scope child",
+                Duration::from_secs(30),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated environment subprocess; invoked by app_state_keeps_pid_scope_when_window_lookup_fails"]
+    async fn app_state_pid_scope_child() {
+        let target_pid: u32 = env::var("CUL_PID_FIXTURE_PID").unwrap().parse().unwrap();
+        let address = env::var("DBUS_SESSION_BUS_ADDRESS").unwrap();
+        let other = zbus::connection::Builder::address(address.as_str())
+            .unwrap()
+            .serve_at(
+                ROOT_PATH,
+                FixtureAccessible {
+                    name: "Other app".to_string(),
+                    role: "application",
+                    children: Vec::new(),
+                    has_action: false,
+                    application: None,
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let roots = env::var("CUL_PID_FIXTURE_ROOTS").unwrap();
+        let children = roots
+            .split(',')
+            .chain(std::iter::once(other.unique_name().unwrap().as_str()))
+            .map(|name| (name.to_string(), ROOT_PATH.try_into().unwrap()))
+            .collect();
+        let _registry = zbus::connection::Builder::address(address.as_str())
+            .unwrap()
+            .name("org.a11y.Bus")
+            .unwrap()
+            .name("org.a11y.atspi.Registry")
+            .unwrap()
+            .serve_at("/org/a11y/bus", FixtureBus(address.clone()))
+            .unwrap()
+            .serve_at(
+                ROOT_PATH,
+                FixtureAccessible {
+                    name: "Desktop".to_string(),
+                    role: "desktop frame",
+                    children,
+                    has_action: false,
+                    application: None,
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let (server, diagnostics_probes) =
+            super::tests::server_with_labelled_diagnostics(|| true, || false);
+        let server = Arc::new(server);
+        for windows_available in [false, true] {
+            if windows_available {
+                std::fs::write(env::var("CUL_PID_FIXTURE_WINDOWS").unwrap(), "").unwrap();
+            }
+            for pid in [target_pid, u32::MAX] {
+                let params = serde_json::json!({"pid": pid, "include_screenshot": false});
+                let parsed = serde_json::from_value(params.clone()).unwrap();
+                let (window, error, _, enumerated, _) =
+                    server.resolve_window_context(&parsed).await;
+                assert!(window.is_none());
+                assert!(error.is_some());
+                assert_eq!(enumerated, windows_available);
+
+                let state = super::tests::app_state_value(&server, params).await;
+                assert!(state["accessibility_error"].is_null(), "{state}");
+                assert_eq!(state["tree_scoped"], true, "{state}");
+                let nodes = state["accessibility_tree"].as_array().unwrap();
+                let message = state["message"].as_str().unwrap();
+                if pid == target_pid {
+                    let names = nodes
+                        .iter()
+                        .map(|node| node["name"].as_str().unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(names, ["Target root 0", "Target root 1", "Target button"]);
+                    assert_eq!(server.last_snapshot.lock().unwrap().pid, Some(target_pid));
+                    assert!(!message.contains("No AT-SPI application root matched"));
+                } else {
+                    assert!(nodes.is_empty(), "a missing PID widened the tree: {state}");
+                    assert_eq!(server.last_snapshot.lock().unwrap().pid, None);
+                    assert!(message.contains(&pid.to_string()), "{message}");
+                    assert!(message.contains("list_apps"), "{message}");
+                    assert!(
+                        message.contains("app_name_or_bundle_identifier"),
+                        "{message}"
+                    );
+                    assert!(
+                        !message.contains("tree extraction are working"),
+                        "{message}"
+                    );
+                }
+            }
+        }
+
+        let capture = PostActionCaptureParams {
+            include_tree: Some(true),
+            ..Default::default()
+        };
+        let missing_target = WindowTarget {
+            pid: Some(u32::MAX),
+            ..Default::default()
+        };
+        let (observation, _, notes) = server
+            .capture_post_action_observation(
+                &capture,
+                Some(&missing_target),
+                None,
+                TargetRaised::No,
+                PostActionScope::default(),
+            )
+            .await;
+        assert!(
+            observation.accessibility_error.is_none(),
+            "{observation:?}; {notes:?}"
+        );
+        assert_eq!(observation.accessibility_tree_raw_count, Some(0));
+        assert_eq!(observation.tree_scoped, Some(true));
+        assert!(notes.iter().any(|note| note.contains(&u32::MAX.to_string())
+            && note.contains("list_apps")
+            && note.contains("app_name_or_bundle_identifier")));
+
+        // A listed window whose pid owns no AT-SPI root, as for a Flatpak app
+        // behind xdg-dbus-proxy, finds its root by the window title. The tree
+        // records no pid, so element calls take the per-node owner check.
+        let windows_path = env::var("CUL_PID_FIXTURE_WINDOWS").unwrap();
+        std::fs::write(&windows_path, "proxied").unwrap();
+        let proxied = super::tests::app_state_value(
+            &server,
+            serde_json::json!({"window_id": 9, "include_screenshot": false}),
+        )
+        .await;
+        assert!(proxied["accessibility_error"].is_null(), "{proxied}");
+        let names = proxied["accessibility_tree"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Other app"], "{proxied}");
+        assert_eq!(server.last_snapshot.lock().unwrap().pid, None);
+        assert!(!proxied["message"]
+            .as_str()
+            .unwrap()
+            .contains("No AT-SPI application root matched"));
+
+        let proxied_window = WindowTarget {
+            window_id: Some(9),
+            ..Default::default()
+        };
+        let (observation, _, notes) = server
+            .capture_post_action_observation(
+                &capture,
+                Some(&proxied_window),
+                None,
+                TargetRaised::No,
+                PostActionScope::default(),
+            )
+            .await;
+        assert_eq!(
+            observation.accessibility_tree_raw_count,
+            Some(1),
+            "{observation:?}; {notes:?}"
+        );
+        assert_eq!(server.last_snapshot.lock().unwrap().pid, None);
+
+        // An element acted on in that window is bound to its bus owner, the
+        // proxy's pid here, not the pid the compositor lists for window 9.
+        let proxied_element = ElementObservationTarget {
+            owner: WindowTarget {
+                pid: Some(std::process::id()),
+                window_id: Some(9),
+                ..Default::default()
+            },
+            tree_window: None,
+        };
+        let (observation, _, notes) = server
+            .capture_post_action_observation(
+                &capture,
+                Some(&proxied_element.owner),
+                None,
+                TargetRaised::No,
+                PostActionScope::bound_to(&proxied_element),
+            )
+            .await;
+        assert_eq!(
+            observation.accessibility_tree_raw_count,
+            Some(1),
+            "{observation:?}; {notes:?}"
+        );
+
+        // An owner pid with no root keeps the strict pid scope: no title fallback.
+        let bound_owner = ElementObservationTarget {
+            owner: WindowTarget {
+                pid: Some(999_999),
+                window_id: Some(9),
+                ..Default::default()
+            },
+            tree_window: None,
+        };
+        let (observation, _, notes) = server
+            .capture_post_action_observation(
+                &capture,
+                Some(&bound_owner.owner),
+                None,
+                TargetRaised::No,
+                PostActionScope::bound_to(&bound_owner),
+            )
+            .await;
+        assert_eq!(
+            observation.accessibility_tree_raw_count,
+            Some(0),
+            "{observation:?}; {notes:?}"
+        );
+        assert!(notes.iter().any(|note| note.contains("999999")));
+        std::fs::write(&windows_path, "").unwrap();
+
+        let missing_window = super::tests::app_state_value(
+            &server,
+            serde_json::json!({
+                "window_id": 999,
+                "pid": std::process::id(),
+                "include_screenshot": false,
+            }),
+        )
+        .await;
+        assert!(
+            missing_window["window_error"].is_string(),
+            "{missing_window}"
+        );
+        assert!(missing_window["accessibility_tree"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        assert_ne!(target_pid, std::process::id());
+        other
+            .object_server()
+            .at(
+                "/embedded_button",
+                FixtureAccessible {
+                    name: "Embedded WebKit button".to_string(),
+                    role: "push button",
+                    children: Vec::new(),
+                    has_action: true,
+                    application: Some((
+                        roots.split(',').nth(1).unwrap().to_string(),
+                        ROOT_PATH.try_into().unwrap(),
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        other
+            .object_server()
+            .at("/embedded_button", FixtureAction(Box::new(|| {})))
+            .await
+            .unwrap();
+        server.clear_snapshot();
+        let params: ActionParams = serde_json::from_value(serde_json::json!({
+            "element_identifier": format!("{}/embedded_button", other.unique_name().unwrap()),
+            "include_tree": true,
+        }))
+        .unwrap();
+        server.diagnostics.report(false).await;
+        let probes = diagnostics_probes.load(std::sync::atomic::Ordering::SeqCst);
+        let observed = server
+            .perform_action(Parameters(params))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(observed["ok"], true, "{observed}");
+        assert!(observed["accessibility_error"].is_null(), "{observed}");
+        let names = observed["accessibility_tree"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Target root 0", "Target root 1", "Target button"]);
+        assert_eq!(server.last_snapshot.lock().unwrap().pid, Some(target_pid));
+        server.diagnostics.report(false).await;
+        assert_eq!(
+            diagnostics_probes.load(std::sync::atomic::Ordering::SeqCst),
+            probes,
+            "an app-wide element observation needs no unique compositor window"
+        );
+
+        let target_button = format!("{}/button", roots.split(',').nth(1).unwrap());
+        for fields in [
+            serde_json::json!({"window_title": "Target 8"}),
+            serde_json::json!({"app_id": "second"}),
+            serde_json::json!({"wm_class": "Second"}),
+        ] {
+            let requested: ElementActionTarget = serde_json::from_value(fields).unwrap();
+            let bound = server
+                .element_observation_target(&requested, &target_button, None)
+                .await
+                .unwrap();
+            assert_eq!(bound.owner.pid, Some(target_pid));
+            assert_eq!(bound.owner.window_id, Some(8));
+            assert_eq!(
+                resolve_window_target(&list_windows().await.unwrap(), &bound.owner)
+                    .unwrap()
+                    .window_id,
+                8
+            );
+            assert!(server
+                .element_observation_target(
+                    &requested,
+                    &format!("{}{ROOT_PATH}", other.unique_name().unwrap()),
+                    None,
+                )
+                .await
+                .is_err());
+        }
+
+        let windows_path = env::var("CUL_PID_FIXTURE_WINDOWS").unwrap();
+        std::fs::write(&windows_path, "pidless").unwrap();
+        let observed = super::tests::app_state_value(
+            &server,
+            serde_json::json!({
+                "window_id": 8,
+                "pid": std::process::id(),
+                "app_name_or_bundle_identifier": format!("{}{ROOT_PATH}", roots.split(',').nth(1).unwrap()),
+                "include_screenshot": false,
+            }),
+        )
+        .await;
+        assert!(observed["accessibility_error"].is_null(), "{observed}");
+        assert_eq!(
+            server.snapshot_window(),
+            Some((8, registry::X11_BACKEND.to_string()))
+        );
+        assert!(server.last_snapshot.lock().unwrap().window_scope.is_none());
+        let requested: ElementActionTarget =
+            serde_json::from_value(serde_json::json!({"window_title": "Target 8"})).unwrap();
+        let index = observed["accessibility_tree"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["name"] == "Target button")
+            .unwrap()["index"]
+            .as_u64()
+            .unwrap() as u32;
+        server
+            .check_element_action_target(
+                &requested,
+                Some(index),
+                None,
+                &ElementSelector::default(),
+                ElementResolvePurpose::Action,
+            )
+            .await
+            .unwrap();
+        let bound = server
+            .element_observation_target(&requested, &target_button, None)
+            .await
+            .unwrap();
+        assert_eq!(bound.owner.pid, Some(target_pid));
+        assert_eq!(bound.owner.window_id, Some(8));
+
+        // A raw identifier may pass the pidless target check without an
+        // observed window; sharing the process is not proof of that window.
+        let uncached_ref = format!("{}{ROOT_PATH}", roots.split(',').next().unwrap());
+        server
+            .check_element_action_target(
+                &requested,
+                None,
+                Some(&uncached_ref),
+                &ElementSelector::default(),
+                ElementResolvePurpose::Action,
+            )
+            .await
+            .unwrap();
+        let bound = server
+            .element_observation_target(&requested, &uncached_ref, None)
+            .await
+            .unwrap();
+        assert_eq!(bound.owner.pid, Some(target_pid));
+        assert_eq!(bound.owner.window_id, None);
+        std::fs::write(&windows_path, "").unwrap();
+
+        // Replace the snapshot during real dispatch, before its observation.
+        let name = other.unique_name().unwrap().to_string();
+        for path in ["/window_1", "/window_3"] {
+            other
+                .object_server()
+                .at(
+                    path,
+                    FixtureAccessible {
+                        name: if path == "/window_1" {
+                            "Window 1"
+                        } else {
+                            "Window 3"
+                        }
+                        .to_string(),
+                        role: "frame",
+                        children: Vec::new(),
+                        has_action: path == "/window_1",
+                        application: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        other
+            .object_server()
+            .at(
+                "/popup",
+                FixtureAccessible {
+                    name: "Popup action".to_string(),
+                    role: "menu item",
+                    children: Vec::new(),
+                    has_action: true,
+                    application: None,
+                },
+            )
+            .await
+            .unwrap();
+        other
+            .object_server()
+            .interface::<_, FixtureAccessible>(ROOT_PATH)
+            .await
+            .unwrap()
+            .get_mut()
+            .await
+            .children = ["/window_1", "/window_3", "/popup"]
+            .into_iter()
+            .map(|path| (name.clone(), path.try_into().unwrap()))
+            .collect();
+        let replaced = super::tests::app_state_value(
+            &server,
+            serde_json::json!({
+                "pid": std::process::id(),
+                "title": "Window 3",
+                "include_screenshot": false,
+            }),
+        )
+        .await;
+        assert!(replaced["accessibility_error"].is_null(), "{replaced}");
+        assert_eq!(
+            server.last_snapshot.lock().unwrap().window_scope.as_deref(),
+            Some("Window 3")
+        );
+        assert!(!replaced["accessibility_tree"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["name"] == "Window 1"));
+        let narrowed_nodes = server.last_snapshot.lock().unwrap().nodes.clone();
+        let action_server = Arc::clone(&server);
+        let action_windows_path = windows_path.clone();
+        let replace_snapshot = move || {
+            action_server.store_snapshot(
+                &narrowed_nodes,
+                Some(std::process::id()),
+                None,
+                None,
+                TreeShape {
+                    detail: NodeDetail::Compact,
+                    window_scope: Some("Window 3".to_string()),
+                },
+            );
+            std::fs::write(&action_windows_path, "").unwrap();
+        };
+        for path in ["/window_1", "/popup"] {
+            other
+                .object_server()
+                .at(path, FixtureAction(Box::new(replace_snapshot.clone())))
+                .await
+                .unwrap();
+        }
+        // A title target must be bound before DoAction removes its window
+        // from enumeration; neither call may inherit the replacement's scope.
+        for window_targeted in [false, true] {
+            std::fs::write(&windows_path, format!("action {}", std::process::id())).unwrap();
+            let observed = super::tests::app_state_value(
+                &server,
+                serde_json::json!({
+                    "pid": std::process::id(),
+                    "include_screenshot": false,
+                }),
+            )
+            .await;
+            assert!(observed["accessibility_error"].is_null(), "{observed}");
+            let params: ActionParams = serde_json::from_value(serde_json::json!({
+                "element_identifier": format!("{name}/window_1"),
+                "window_title": window_targeted.then_some("Window 1"),
+                "include_tree": true,
+            }))
+            .unwrap();
+            let result = server.perform_action(Parameters(params)).await.unwrap();
+            let result = result.structured_content.unwrap();
+            assert_eq!(result["ok"], true, "{result}");
+            assert!(result["accessibility_error"].is_null(), "{result}");
+            assert_eq!(result["tree_scoped"], true, "{result}");
+            let names = result["accessibility_tree"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|node| node["name"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            let expected = if window_targeted {
+                vec!["Other app", "Window 1", "Popup action"]
+            } else {
+                vec!["Other app", "Window 1", "Window 3", "Popup action"]
+            };
+            assert_eq!(names, expected);
+            assert_eq!(std::fs::read_to_string(&windows_path).unwrap(), "");
+        }
+
+        // A sibling popup keeps the observed tree's scope without claiming
+        // that its own window is the observed main frame.
+        std::fs::write(&windows_path, format!("action {}", std::process::id())).unwrap();
+        let observed = super::tests::app_state_value(
+            &server,
+            serde_json::json!({"window_id": 1, "include_screenshot": false}),
+        )
+        .await;
+        assert!(observed["accessibility_error"].is_null(), "{observed}");
+        let popup = observed["accessibility_tree"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["name"] == "Popup action")
+            .unwrap();
+        let bound = server
+            .element_observation_target(
+                &ElementActionTarget::default(),
+                &format!("{name}/popup"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bound.owner.window_id, None);
+        assert_eq!(
+            bound
+                .tree_window
+                .as_ref()
+                .map(|window| window.scope.as_str()),
+            Some("Window 1")
+        );
+        let params: ActionParams = serde_json::from_value(serde_json::json!({
+            "element_index": popup["index"],
+            "snapshot_id": observed["snapshot_id"],
+            "include_tree": true,
+        }))
+        .unwrap();
+        let result = server
+            .perform_action(Parameters(params))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert!(result["accessibility_error"].is_null(), "{result}");
+        let names = result["accessibility_tree"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Other app", "Window 1", "Popup action"]);
+        assert_eq!(
+            server.last_snapshot.lock().unwrap().window_scope.as_deref(),
+            Some("Window 1")
+        );
+        assert_eq!(
+            server.snapshot_window(),
+            Some((1, registry::X11_BACKEND.to_string()))
+        );
+    }
+}
+
+#[cfg(test)]
 mod accessibility_tree_note_tests {
     use super::{truncated_accessibility_tree_note, unscoped_accessibility_tree_warning};
 
@@ -15985,7 +22343,7 @@ mod action_recovery_tests {
             Some(1234),
             Some(recovery_scope(serde_json::json!({"pid": 1234}))),
         );
-        let Json(recovered) = backend
+        let (Json(recovered), _) = backend
             .perform_element_action_with(
                 &semantic_params(),
                 Some("click"),
@@ -16012,7 +22370,7 @@ mod action_recovery_tests {
         assert!(recovered.ok, "{}", recovered.message);
 
         let stale_dispatches = Arc::new(Mutex::new(Vec::new()));
-        let Json(indexed) = backend
+        let (Json(indexed), _) = backend
             .perform_element_action_with(
                 &ActionParams {
                     element_index: Some(0),
@@ -16054,7 +22412,7 @@ mod action_recovery_tests {
             );
             let refreshes = Arc::new(AtomicUsize::new(0));
             let dispatches = Arc::new(AtomicUsize::new(0));
-            let Json(output) = backend
+            let (Json(output), _) = backend
                 .perform_element_action_with(
                     &semantic_params(),
                     Some("click"),
@@ -16113,7 +22471,7 @@ mod action_recovery_tests {
                 )
                 .await;
             let dispatches = Arc::new(AtomicUsize::new(0));
-            let Json(output) = backend
+            let (Json(output), _) = backend
                 .perform_element_action_with(
                     &semantic_params(),
                     Some("click"),
@@ -16164,7 +22522,7 @@ mod action_recovery_tests {
             )
             .await;
         let refreshes = Arc::new(AtomicUsize::new(0));
-        let Json(output) = backend
+        let (Json(output), _) = backend
             .perform_element_action_with(
                 &semantic_params(),
                 Some("click"),
@@ -16218,7 +22576,7 @@ mod action_recovery_tests {
                 )
                 .await;
             let dispatches = Arc::new(AtomicUsize::new(0));
-            let Json(output) = backend
+            let (Json(output), _) = backend
                 .perform_element_action_with(
                     &semantic_params(),
                     Some("click"),
@@ -16292,7 +22650,7 @@ mod action_recovery_tests {
         let invoked_refs = Arc::new(Mutex::new(Vec::new()));
         let params = semantic_params();
 
-        let Json(output) = backend
+        let (Json(output), _) = backend
             .perform_element_action_with(
                 &params,
                 Some("0"),
@@ -16401,7 +22759,7 @@ mod action_recovery_tests {
                 window_id,
                 ..old_window.clone()
             });
-            let Json(output) = backend
+            let (Json(output), _) = backend
                 .perform_element_action_with(
                     &semantic_params(),
                     Some("click"),
@@ -16454,7 +22812,7 @@ mod action_recovery_tests {
                 Some(&recovery_window(42, 1234)),
             );
             let queries = Arc::new(AtomicUsize::new(0));
-            let Json(output) = backend
+            let (Json(output), _) = backend
                 .perform_element_action_with(
                     &semantic_params(),
                     Some("click"),
@@ -16509,7 +22867,7 @@ mod action_recovery_tests {
         let dispatches = Arc::new(AtomicUsize::new(0));
         let params = semantic_params();
 
-        let Json(output) = backend
+        let (Json(output), _) = backend
             .perform_element_action_with(
                 &params,
                 Some("0"),
@@ -16564,7 +22922,7 @@ mod action_recovery_tests {
         let invoked_refs = Arc::new(Mutex::new(Vec::new()));
         let params = semantic_params();
 
-        let Json(output) = backend
+        let (Json(output), _) = backend
             .perform_element_action_with(
                 &params,
                 Some("0"),
@@ -16614,7 +22972,7 @@ mod action_recovery_tests {
         let invoked_refs = Arc::new(Mutex::new(Vec::new()));
         let params = semantic_params();
 
-        let Json(output) = backend
+        let (Json(output), _) = backend
             .perform_element_action_with(
                 &params,
                 Some("0"),
@@ -16658,7 +23016,8 @@ mod action_recovery_tests {
         let backend = ComputerUseLinux::default();
         let mut scope = recovery_scope(serde_json::json!({
             "app_name_or_bundle_identifier": "Editor",
-            "window_id": 42
+            "window_id": 42,
+            "pid": 8765
         }));
         scope.target_pid = Some(1234);
         backend.cache_snapshot_with_window(
@@ -16670,7 +23029,7 @@ mod action_recovery_tests {
         let params = semantic_params();
         let first_refs = Arc::new(Mutex::new(Vec::new()));
 
-        let Json(output) = backend
+        let (Json(output), _) = backend
             .perform_element_action_with(
                 &params,
                 Some("0"),
@@ -16711,7 +23070,7 @@ mod action_recovery_tests {
             assert!(snapshot.recovery_scope.is_none());
         }
 
-        let Json(without_observation) = backend
+        let (Json(without_observation), _) = backend
             .perform_element_action_with(
                 &params,
                 Some("click"),
@@ -16736,7 +23095,7 @@ mod action_recovery_tests {
             .await;
 
         let second_refs = Arc::new(Mutex::new(Vec::new()));
-        let Json(output) = backend
+        let (Json(output), _) = backend
             .perform_element_action_with(
                 &params,
                 Some("0"),
@@ -16787,7 +23146,7 @@ mod action_recovery_tests {
         let queries = Arc::new(AtomicUsize::new(0));
         let params = semantic_params();
 
-        let Json(output) = backend
+        let (Json(output), _) = backend
             .perform_element_action_with(
                 &params,
                 Some("0"),
@@ -16842,7 +23201,7 @@ mod action_recovery_tests {
             let refreshes = Arc::new(AtomicUsize::new(0));
             let invoked_refs = Arc::new(Mutex::new(Vec::new()));
 
-            let Json(output) = backend
+            let (Json(output), _) = backend
                 .perform_element_action_with(
                     &params,
                     Some("0"),
@@ -16889,7 +23248,7 @@ mod action_recovery_tests {
         let refreshes = Arc::new(AtomicUsize::new(0));
         let params = semantic_params();
 
-        let Json(output) = backend
+        let (Json(output), _) = backend
             .perform_element_action_with(
                 &params,
                 Some("0"),
@@ -16936,7 +23295,7 @@ mod action_recovery_tests {
         let refreshes = Arc::new(AtomicUsize::new(0));
         let params = semantic_params();
 
-        let Json(output) = backend
+        let (Json(output), _) = backend
             .perform_element_action_with(
                 &params,
                 Some("0"),
@@ -16983,7 +23342,7 @@ mod action_recovery_tests {
         let refreshes = Arc::new(AtomicUsize::new(0));
         let params = semantic_params();
 
-        let Json(output) = backend
+        let (Json(output), _) = backend
             .perform_element_action_with(
                 &params,
                 Some("0"),
@@ -17219,7 +23578,7 @@ mod node_target_scope_tests {
         params: ActionParams,
     ) -> (ActionOutput, Vec<String>) {
         let dispatched = Arc::new(Mutex::new(Vec::new()));
-        let Json(output) = backend
+        let (Json(output), _) = backend
             .perform_element_action_with(
                 &params,
                 Some("click"),
@@ -17308,9 +23667,347 @@ mod node_target_scope_tests {
     }
 
     #[tokio::test]
+    async fn element_observation_stays_with_the_dispatched_object_owner() {
+        let backend = ComputerUseLinux::default();
+        let object_ref = ":1.9/org/a11y/atspi/accessible/42";
+        let mut node = cached_node(2, object_ref);
+        node.parent_index = Some(1);
+        node.depth = 2;
+        let mut frame = cached_node(1, ":1.9/window_20");
+        frame.role = "frame".to_string();
+        frame.name = Some("Window 20".to_string());
+        frame.child_count = 1;
+        let mut window = pidless_window(20);
+        window.pid = Some(APP_B);
+        backend.store_snapshot(
+            &[frame, node],
+            Some(APP_B),
+            None,
+            Some(&window),
+            TreeShape {
+                detail: NodeDetail::Compact,
+                window_scope: Some("Window 20".to_string()),
+            },
+        );
+
+        let target = backend
+            .element_observation_target_with(
+                &ElementActionTarget::default(),
+                object_ref,
+                None,
+                || async { panic!("the observed element already has an owner") },
+            )
+            .await
+            .unwrap();
+        assert_eq!(target.pid, Some(APP_B));
+        assert_eq!(target.window_id, Some(20));
+
+        backend.cache_snapshot(&[cached_node(3, ":1.22/chrome")], Some(APP_A));
+        let target = backend
+            .element_observation_target_with(
+                &ElementActionTarget::default(),
+                object_ref,
+                None,
+                || async { Ok(Some(APP_B)) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(target.pid, Some(APP_B));
+        assert_eq!(target.window_id, None);
+
+        let explicit = backend
+            .element_observation_target_with(&pid_target(APP_B), object_ref, None, || async {
+                panic!("the explicitly checked target must be preserved")
+            })
+            .await
+            .unwrap();
+        assert_eq!(explicit.pid, Some(APP_B));
+    }
+
+    #[tokio::test]
+    async fn element_observation_preserves_a_verified_pidless_window() {
+        let backend = ComputerUseLinux::default();
+        let object_ref = ":1.9/org/a11y/atspi/accessible/42";
+        let mut node = cached_node(2, object_ref);
+        node.parent_index = Some(1);
+        node.depth = 2;
+        let mut frame = cached_node(1, ":1.9/window_20");
+        frame.role = "frame".to_string();
+        frame.name = Some("Window 20".to_string());
+        frame.child_count = 1;
+        backend.store_snapshot(
+            &[frame, node],
+            None,
+            None,
+            Some(&pidless_window(20)),
+            TreeShape {
+                detail: NodeDetail::Compact,
+                window_scope: Some("Window 20".to_string()),
+            },
+        );
+        let target = backend
+            .element_observation_target_with(
+                &ElementActionTarget::default(),
+                object_ref,
+                None,
+                || async { Ok(Some(APP_B)) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(target.pid, Some(APP_B));
+        assert_eq!(target.window_id, Some(20));
+
+        let explicit = ElementActionTarget {
+            window_id: Some(20),
+            ..Default::default()
+        };
+        let target = backend
+            .element_observation_target_with(&explicit, object_ref, None, || async {
+                Ok(Some(APP_B))
+            })
+            .await
+            .unwrap();
+        assert_eq!(target.pid, Some(APP_B));
+        assert_eq!(target.window_id, Some(20));
+    }
+
+    #[tokio::test]
+    async fn element_observation_does_not_keep_a_pid_overridden_by_window_id() {
+        let object_ref = ":1.9/org/a11y/atspi/accessible/42";
+        let mut window_a = pidless_window(10);
+        window_a.pid = Some(APP_A);
+        let mut window_b = pidless_window(20);
+        window_b.pid = Some(APP_B);
+        let requested = ElementActionTarget {
+            window_id: Some(window_a.window_id),
+            pid: Some(APP_B),
+            ..Default::default()
+        };
+        let requested_window = requested.window_target().unwrap();
+        assert_eq!(
+            resolve_window_target(&[window_a.clone(), window_b.clone()], &requested_window)
+                .unwrap()
+                .pid,
+            Some(APP_A)
+        );
+
+        for cached_pid in [None, Some(APP_A)] {
+            let backend = ComputerUseLinux::default();
+            backend.cache_snapshot(&[cached_node(2, object_ref)], cached_pid);
+            let target = backend
+                .element_observation_target_with(&requested, object_ref, None, || async {
+                    assert!(cached_pid.is_none(), "reuse the observed object owner");
+                    Ok(Some(APP_A))
+                })
+                .await
+                .unwrap();
+            assert_eq!(target.window_id, Some(window_a.window_id));
+            // Once the action closes A's window, the tree falls back to this
+            // pid because the window can no longer be resolved.
+            assert!(resolve_window_target(std::slice::from_ref(&window_b), &target).is_err());
+            assert_eq!(target.pid, Some(APP_A));
+        }
+    }
+
+    #[tokio::test]
+    async fn app_wide_element_observation_does_not_inherit_a_sibling_window() {
+        let backend = ComputerUseLinux::default();
+        let object_ref = ":1.9/org/a11y/atspi/accessible/window_20_button";
+        let mut window_10 = pidless_window(10);
+        window_10.pid = Some(APP_B);
+        let mut window_20 = pidless_window(20);
+        window_20.pid = Some(APP_B);
+        backend.cache_snapshot_with_window(
+            &[cached_node(2, object_ref)],
+            Some(APP_B),
+            None,
+            Some(&window_10),
+        );
+
+        let target = backend
+            .element_observation_target_with(
+                &ElementActionTarget::default(),
+                object_ref,
+                None,
+                || async { panic!("the app-wide snapshot establishes the process owner") },
+            )
+            .await
+            .unwrap();
+        assert_eq!(target.pid, Some(APP_B));
+        assert_eq!(target.window_id, None);
+        assert!(resolve_window_target(&[window_10, window_20], &target).is_err());
+        assert_eq!(
+            post_action_window_title(Some(&target), None, target.pid, None),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_keeps_the_tree_scope_without_reusing_the_old_element_window() {
+        let previous = ElementObservationTarget {
+            owner: WindowTarget {
+                pid: Some(APP_B),
+                window_id: Some(20),
+                ..Default::default()
+            },
+            tree_window: Some(CachedTreeWindow {
+                scope: "Window 20".to_string(),
+                pid: Some(APP_B),
+                window: Some((20, KWIN_BACKEND.to_string())),
+            }),
+        };
+        for pid in [APP_B, APP_A] {
+            let mut recovered = ElementObservationTarget {
+                owner: WindowTarget {
+                    pid: Some(pid),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            recovered.inherit_tree_window(&previous);
+            assert_eq!(recovered.owner.window_id, None);
+            assert_eq!(recovered.tree_window.is_some(), pid == APP_B);
+            if let Some(tree) = recovered.tree_window {
+                assert_eq!(tree.scope, "Window 20");
+                assert_eq!(tree.window, Some((20, KWIN_BACKEND.to_string())));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn element_observation_does_not_bind_retained_dialogs_to_the_narrowed_window() {
+        let main_ref = ":1.9/main_button";
+        let dialog_ref = ":1.10/dialog_button";
+        for separate_root in [false, true] {
+            let backend = ComputerUseLinux::default();
+            let mut root = cached_node(0, ":1.9/root");
+            root.role = "application".to_string();
+            root.depth = 0;
+            let mut frame = cached_node(1, ":1.9/window_10");
+            frame.role = "frame".to_string();
+            frame.name = Some("Window 10".to_string());
+            frame.parent_index = Some(0);
+            let mut main_button = cached_node(2, main_ref);
+            main_button.depth = 2;
+            main_button.parent_index = Some(1);
+            let mut dialog_root = cached_node(3, ":1.10/root");
+            dialog_root.role = "application".to_string();
+            dialog_root.depth = 0;
+            let mut dialog = cached_node(4, ":1.10/dialog");
+            dialog.role = "file chooser".to_string();
+            dialog.name = Some("File dialog".to_string());
+            dialog.parent_index = Some(if separate_root { 3 } else { 0 });
+            let mut dialog_button = cached_node(5, dialog_ref);
+            dialog_button.depth = 2;
+            dialog_button.parent_index = Some(4);
+            let mut nodes = vec![root, frame, main_button];
+            if separate_root {
+                nodes.push(dialog_root);
+            }
+            nodes.extend([dialog, dialog_button]);
+            let mut window = pidless_window(10);
+            window.pid = Some(APP_B);
+            backend.store_snapshot(
+                &nodes,
+                Some(APP_B),
+                None,
+                Some(&window),
+                TreeShape {
+                    detail: NodeDetail::Compact,
+                    window_scope: Some("Window 10".to_string()),
+                },
+            );
+
+            for (requested, object_ref, expected_window) in [
+                (ElementActionTarget::default(), main_ref, Some(10)),
+                (ElementActionTarget::default(), dialog_ref, None),
+                (pid_target(APP_B), dialog_ref, None),
+            ] {
+                let target = backend
+                    .element_observation_target(&requested, object_ref, None)
+                    .await
+                    .unwrap();
+                assert_eq!(target.owner.pid, Some(APP_B));
+                assert_eq!(target.owner.window_id, expected_window);
+                let tree_window = target.tree_window.unwrap();
+                assert_eq!(tree_window.scope, "Window 10");
+                assert_eq!(tree_window.pid, Some(APP_B));
+                assert_eq!(tree_window.window, Some((10, window.backend.clone())));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn element_observation_without_an_owner_reports_failure_without_foreground_fallback() {
+        let backend = backend_after_snapshots_of_a_then_b();
+        let error = backend
+            .element_observation_target_with(
+                &ElementActionTarget::default(),
+                ":1.99/uncached",
+                None,
+                || async { Ok(None) },
+            )
+            .await
+            .unwrap_err();
+        let capture: PostActionCaptureParams = serde_json::from_value(serde_json::json!({
+            "include_tree": true,
+        }))
+        .unwrap();
+        let (observation, screenshot, notes) = backend
+            .capture_element_observation(&capture, None, Err(&error))
+            .await;
+        // No foreground tree: the empty tree fields of any failed read, and
+        // the replaced snapshot is gone.
+        assert!(observation.accessibility_tree.unwrap().is_empty());
+        assert_eq!(observation.accessibility_tree_raw_count, Some(0));
+        assert_eq!(observation.tree_scoped, Some(false));
+        assert!(observation.accessibility_error.is_some());
+        assert!(observation.screenshot_error.is_none());
+        assert!(screenshot.is_none());
+        assert!(notes[0].contains("no verified app or window owner"));
+        assert!(backend.cached_snapshot_id().is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_owner_binding_reads_only_a_named_snapshot() {
+        let http = ComputerUseLinux {
+            require_snapshot_ids: true,
+            ..Default::default()
+        };
+        let object_ref = ":1.9/org/a11y/atspi/accessible/42";
+        http.cache_snapshot(&[cached_node(2, object_ref)], Some(APP_B));
+        // Another client's snapshot holds the object: its owner comes from
+        // the bus, not from that client's tree.
+        for named in [None, Some("other")] {
+            let owner = http
+                .element_observation_target_with(
+                    &ElementActionTarget::default(),
+                    object_ref,
+                    named,
+                    || async { Ok(Some(APP_A)) },
+                )
+                .await
+                .unwrap();
+            assert_eq!(owner.pid, Some(APP_A));
+        }
+        // The call named the snapshot, so its observed owner holds.
+        let id = http.cached_snapshot_id();
+        let owner = http
+            .element_observation_target_with(
+                &ElementActionTarget::default(),
+                object_ref,
+                Some(&id),
+                || async { panic!("the named snapshot establishes the owner") },
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner.pid, Some(APP_B));
+    }
+
+    #[tokio::test]
     async fn set_value_refuses_an_index_from_another_apps_snapshot() {
         let backend = backend_after_snapshots_of_a_then_b();
-        let (output, verified) = backend
+        let (output, verified, _) = backend
             .dispatch_set_value(SetValueParams {
                 element_index: Some(2),
                 value: "written for app A".to_string(),
@@ -17828,6 +24525,7 @@ mod post_action_capture_tests {
     fn action_tool_output_omits_observation_fields_when_not_requested() {
         let output = ActionToolOutput {
             action: action_result("click", Ok(Vec::new()), None),
+            background: None,
             observation: PostActionObservation::default(),
         };
         let value = serde_json::to_value(output).unwrap();
@@ -17878,6 +24576,7 @@ mod post_action_capture_tests {
                 "max_width",
                 "max_height",
                 "max_bytes",
+                "screenshot_file_path",
             ] {
                 assert!(
                     properties.contains_key(prop),
@@ -17942,6 +24641,23 @@ exit 1
         std::fs::set_permissions(&gnome_screenshot, std::fs::Permissions::from_mode(0o700))
             .unwrap();
 
+        let hyprctl = dir.join("hyprctl");
+        std::fs::write(
+            &hyprctl,
+            r#"#!/bin/sh
+[ -n "$CUL_POST_ACTION_WINDOW_PID" ] || exit 1
+case "$1" in
+  clients)
+    printf '[{"address":"0x1","title":"Background","pid":%s,"at":[0,0],"size":[16,12],"monitor":0,"focusHistoryID":1},{"address":"0x2","title":"Foreground","pid":%s,"at":[8,8],"size":[32,24],"monitor":0,"focusHistoryID":0}]\n' "$CUL_POST_ACTION_WINDOW_PID" "$CUL_POST_ACTION_WINDOW_PID"
+    ;;
+  monitors) echo '[{"id":0,"x":0,"y":0,"scale":1}]' ;;
+  *) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&hyprctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+
         // wmctrl answers only while CUL_WMCTRL_STATE names a file. It lists
         // window 7, applies a resize, and fails every listing after the one
         // that verified the resize.
@@ -17990,6 +24706,7 @@ echo "0x00000007 0 0 0 0 $size fixture.Fixture host Fixture"
         for key in [
             "DESKTOP_SESSION",
             "HYPRLAND_INSTANCE_SIGNATURE",
+            "UMBRIEL_SOCKET",
             "XAUTHORITY",
             "XDG_SESSION_DESKTOP",
             "XDG_CURRENT_DESKTOP",
@@ -18425,6 +25142,7 @@ echo "0x00000007 0 0 0 0 $size fixture.Fixture host Fixture"
         assert_eq!(structured["ok"], true);
         assert!(structured.get("screenshot").is_some());
         let message = structured["message"].as_str().unwrap();
+        // The layout warning survives the post-action capture.
         for expected in [
             "WARNING: X11 keyboard layout",
             "br/ABNT2",
@@ -18471,6 +25189,54 @@ echo "0x00000007 0 0 0 0 $size fixture.Fixture host Fixture"
             .unwrap()
             .contains("WARNING: X11 keyboard layout"));
 
+        // Screenshots keep their focused-window fallback when the tree owner
+        // has several windows or cannot be established on a pidless desktop.
+        let owner_error = "no verified app or window owner".to_string();
+        let tree_owner = ElementObservationTarget {
+            owner: WindowTarget {
+                pid: Some(12345),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let window_capture: PostActionCaptureParams = serde_json::from_value(
+            serde_json::json!({"screenshot_after": "window", "include_tree": true}),
+        )
+        .unwrap();
+        for pid in [Some(12345), None] {
+            std::env::set_var(
+                "CUL_POST_ACTION_WINDOW_PID",
+                pid.map_or_else(|| "null".to_string(), |pid| pid.to_string()),
+            );
+            let tree_target = if pid.is_some() {
+                Ok(&tree_owner)
+            } else {
+                Err(&owner_error)
+            };
+            let (observation, screenshot, _) = server
+                .capture_element_observation(&window_capture, None, tree_target)
+                .await;
+            assert!(observation.screenshot_error.is_none());
+            assert!(observation.accessibility_error.is_some());
+            let summary = observation.screenshot.unwrap();
+            assert_eq!(summary.window_title.as_deref(), Some("Foreground"));
+            assert_eq!((summary.width, summary.height), (32, 24));
+            assert_eq!(summary.cropped_to_window, Some(true));
+            assert!(screenshot.is_some());
+
+            let background = WindowTarget {
+                window_id: Some(1),
+                ..Default::default()
+            };
+            let (observation, screenshot, _) = server
+                .capture_element_observation(&window_capture, Some(&background), tree_target)
+                .await;
+            assert!(observation.screenshot_error.is_some());
+            assert!(observation.screenshot.is_none());
+            assert!(screenshot.is_none());
+        }
+        std::env::remove_var("CUL_POST_ACTION_WINDOW_PID");
+
         std::fs::write(&log_path, "").unwrap();
         let set_value_capture: PostActionCaptureParams = serde_json::from_value(
             serde_json::json!({"screenshot_after": "screen", "include_tree": true}),
@@ -18478,8 +25244,18 @@ echo "0x00000007 0 0 0 0 $size fixture.Fixture host Fixture"
         .unwrap();
         let (output, verified) =
             editable_text_action_result(EditableTextSetOutcome::MismatchAfterDeadline, None);
+        // A failed owner binding drops the replaced snapshot, as every
+        // failed post-action tree read does.
+        server.commit_snapshot(&[], Some(12345)).await;
+        assert!(!server.cached_snapshot_id().is_empty());
         let result = server
-            .finish_set_value_output(output, verified, &set_value_capture, None)
+            .finish_set_value_output(
+                output,
+                verified,
+                &set_value_capture,
+                None,
+                Err(&owner_error),
+            )
             .await
             .unwrap();
         assert_eq!(result.is_error, Some(true));
@@ -18488,7 +25264,11 @@ echo "0x00000007 0 0 0 0 $size fixture.Fixture host Fixture"
         assert_eq!(structured["ok"], false);
         assert_eq!(structured["verified"], false);
         assert_eq!(structured["screenshot"]["width"], 64);
+        assert!(structured.get("screenshot_error").is_none());
         assert!(structured["accessibility_error"].is_string());
+        assert_eq!(structured["accessibility_tree_raw_count"], 0);
+        assert_eq!(structured["tree_scoped"], false);
+        assert!(server.cached_snapshot_id().is_empty());
         assert_eq!(
             std::fs::read_to_string(&log_path).unwrap(),
             "gnome-screenshot\n"
@@ -18497,7 +25277,13 @@ echo "0x00000007 0 0 0 0 $size fixture.Fixture host Fixture"
         std::fs::write(&log_path, "").unwrap();
         let output = action_result("set_value", Err("pre-dispatch failure".to_string()), None);
         let result = server
-            .finish_set_value_output(output, None, &set_value_capture, None)
+            .finish_set_value_output(
+                output,
+                None,
+                &set_value_capture,
+                None,
+                Ok(&ElementObservationTarget::default()),
+            )
             .await
             .unwrap();
         assert_eq!(result.is_error, Some(true));
@@ -18507,6 +25293,614 @@ echo "0x00000007 0 0 0 0 $size fixture.Fixture host Fixture"
         assert!(structured.get("accessibility_tree").is_none());
         assert!(structured.get("accessibility_error").is_none());
         assert!(std::fs::read_to_string(&log_path).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod screenshot_file_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn solid_png(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(width, height, image::Rgba([32, 128, 192, 255]));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    fn refusal(tool: &str, arguments: serde_json::Value, remote: bool) -> Option<String> {
+        let serde_json::Value::Object(arguments) = arguments else {
+            panic!("arguments must be an object");
+        };
+        screenshot_file_refusal(tool, Some(&arguments), true, remote)
+    }
+
+    #[test]
+    fn file_output_parameters_are_in_every_screenshot_schema() {
+        let server = ComputerUseLinux::default();
+        let router = server.mcp_tool_router();
+        for name in [
+            "screenshot",
+            "get_app_state",
+            "click",
+            "type_text",
+            "press_key",
+            "scroll",
+            "drag",
+            "perform_action",
+            "set_value",
+            "activate_window",
+            "move_window",
+            "resize_window",
+        ] {
+            let tool = router
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
+            assert!(
+                tool.input_schema["properties"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("screenshot_file_path"),
+                "{name} lacks screenshot_file_path"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_refuses_unusable_screenshot_file_paths_before_the_tool_runs() {
+        let dir = std::env::temp_dir().join(format!(
+            "cul-shot-preflight-{}-{:016x}",
+            std::process::id(),
+            getrandom::u64().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let png = dir.join("shot.png");
+        let png = png.to_str().unwrap();
+
+        // Usable paths pass, and a call without the parameter is untouched.
+        assert_eq!(refusal("screenshot", serde_json::json!({}), true), None);
+        assert_eq!(
+            refusal(
+                "screenshot",
+                serde_json::json!({"screenshot_file_path": null}),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            refusal(
+                "screenshot",
+                serde_json::json!({"screenshot_file_path": png}),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            refusal(
+                "get_app_state",
+                serde_json::json!({"screenshot_file_path": png}),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            refusal(
+                "click",
+                serde_json::json!({"x": 1, "y": 1, "screenshot_after": "window", "screenshot_file_path": png}),
+                false
+            ),
+            None
+        );
+        // A tool without the parameter ignores it like any unknown argument.
+        let serde_json::Value::Object(arguments) =
+            serde_json::json!({"screenshot_file_path": "relative.png"})
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            screenshot_file_refusal("list_windows", Some(&arguments), false, true),
+            None
+        );
+
+        // Over HTTP every use is refused, even a valid path.
+        for (tool, arguments) in [
+            (
+                "screenshot",
+                serde_json::json!({"screenshot_file_path": png}),
+            ),
+            (
+                "get_app_state",
+                serde_json::json!({"screenshot_file_path": png}),
+            ),
+            (
+                "click",
+                serde_json::json!({"x": 1, "y": 1, "screenshot_after": true, "screenshot_file_path": png}),
+            ),
+        ] {
+            let message = refusal(tool, arguments, true).expect("refused over HTTP");
+            assert!(
+                message.starts_with(&format!("{tool} was not run: "))
+                    && message.contains("refused over HTTP (mcp --listen)"),
+                "{message}"
+            );
+        }
+
+        // Without a capture there is nothing to save.
+        assert!(refusal(
+            "get_app_state",
+            serde_json::json!({"include_screenshot": false, "screenshot_file_path": png}),
+            false
+        )
+        .unwrap()
+        .contains("needs include_screenshot=true"));
+        for screenshot_after in [serde_json::Value::Null, serde_json::json!(false)] {
+            assert!(refusal(
+                "click",
+                serde_json::json!({"x": 1, "y": 1, "screenshot_after": screenshot_after, "screenshot_file_path": png}),
+                false
+            )
+            .unwrap()
+            .contains("needs screenshot_after"));
+        }
+
+        // Bad paths, with the format the call selects.
+        let missing = dir.join("missing").join("shot.png");
+        for (arguments, expected) in [
+            (
+                serde_json::json!({"screenshot_file_path": "shot.png"}),
+                "must be an absolute path",
+            ),
+            (
+                serde_json::json!({"screenshot_file_path": missing}),
+                "does not exist",
+            ),
+            (
+                serde_json::json!({"screenshot_file_path": dir}),
+                "does not match format png",
+            ),
+            (
+                serde_json::json!({"screenshot_file_path": png, "format": "jpeg"}),
+                "does not match format jpeg",
+            ),
+        ] {
+            let message = refusal("screenshot", arguments.clone(), false)
+                .unwrap_or_else(|| panic!("{arguments} must be refused"));
+            assert!(message.contains(expected), "{arguments}: {message}");
+        }
+        // File output only creates: an existing entry is refused before the
+        // tool runs, on read-only and mutating tools alike.
+        let as_dir = dir.join("dir.png");
+        std::fs::create_dir(&as_dir).unwrap();
+        let existing = dir.join("existing.png");
+        std::fs::write(&existing, b"keep").unwrap();
+        for (tool, arguments) in [
+            (
+                "screenshot",
+                serde_json::json!({"screenshot_file_path": as_dir}),
+            ),
+            (
+                "get_app_state",
+                serde_json::json!({"screenshot_file_path": existing}),
+            ),
+            (
+                "click",
+                serde_json::json!({"x": 1, "y": 1, "screenshot_after": true, "screenshot_file_path": existing}),
+            ),
+        ] {
+            let message = refusal(tool, arguments, false).expect("an existing entry is refused");
+            assert!(message.contains("already exists"), "{message}");
+        }
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn screenshot_file_output_writes_files_and_returns_no_image_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "cul-shot-file-{}-{:016x}",
+            std::process::id(),
+            getrandom::u64().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let locked = self.0.join("locked");
+                let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+
+        let sample_png = dir.join("sample.png");
+        std::fs::write(&sample_png, solid_png(64, 48)).unwrap();
+        let xdotool = dir.join("xdotool");
+        std::fs::write(
+            &xdotool,
+            "#!/bin/sh\nprintf 'xdotool\\n' >> \"$CUL_SHOT_FILE_LOG\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&xdotool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let gnome_screenshot = dir.join("gnome-screenshot");
+        std::fs::write(
+            &gnome_screenshot,
+            r#"#!/bin/sh
+printf 'gnome-screenshot\n' >> "$CUL_SHOT_FILE_LOG"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-f" ] && [ "$#" -ge 2 ]; then
+    /bin/cp "$CUL_SHOT_FILE_PNG" "$2"
+    exit 0
+  fi
+  shift
+done
+exit 1
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gnome_screenshot, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "server::screenshot_file_tests::screenshot_file_output_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", &dir)
+            .env("HOME", &dir)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .env("DISPLAY", ":9876")
+            .env("WAYLAND_DISPLAY", "")
+            .env("XDG_SESSION_TYPE", "x11")
+            .env("CU_DISABLE_ABS_POINTER", "1")
+            .env("CODEX_COMPUTER_USE_SCREENSHOT_BACKEND", "gnome-screenshot")
+            .env("CUL_SHOT_FILE_CHILD", "1")
+            .env("CUL_SHOT_FILE_LOG", dir.join("events.log"))
+            .env("CUL_SHOT_FILE_PNG", &sample_png)
+            .env("CUL_SHOT_FILE_OUT", &out)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}/no-bus", dir.display()),
+            );
+        for key in [
+            "DESKTOP_SESSION",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+            "UMBRIEL_SOCKET",
+            "XAUTHORITY",
+            "XDG_SESSION_DESKTOP",
+            "XDG_CURRENT_DESKTOP",
+        ] {
+            command.env(key, "screenshot-file-test");
+        }
+        let output = crate::command_runner::output_blocking_with_timeout(
+            &mut command,
+            "screenshot file child",
+            Duration::from_secs(20),
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "screenshot file child must execute its assertions"
+        );
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn caption(result: &CallToolResult) -> serde_json::Value {
+        assert_eq!(result.content.len(), 1, "only the caption: {result:?}");
+        assert!(result.content[0].as_image().is_none());
+        serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap()
+    }
+
+    fn assert_no_image(result: &CallToolResult) {
+        assert!(
+            result
+                .content
+                .iter()
+                .all(|block| block.as_image().is_none()),
+            "no image content: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated environment subprocess; invoked by screenshot_file_output_writes_files_and_returns_no_image_content"]
+    async fn screenshot_file_output_child() {
+        use image::GenericImageView as _;
+        assert_eq!(std::env::var("CUL_SHOT_FILE_CHILD").as_deref(), Ok("1"));
+        let log = std::path::PathBuf::from(std::env::var("CUL_SHOT_FILE_LOG").unwrap());
+        let out = std::path::PathBuf::from(std::env::var("CUL_SHOT_FILE_OUT").unwrap());
+        let events = || std::fs::read_to_string(&log).unwrap_or_default();
+        let clear = || std::fs::write(&log, "").unwrap();
+        let (server, probes) = super::tests::server_with_labelled_diagnostics(|| false, || false);
+        let unprivileged = unsafe { libc::geteuid() } != 0;
+        let locked = out.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        // 1. The screenshot tool saves a png and returns only the caption.
+        let path = out.join("shot.png");
+        let result = server
+            .screenshot(Parameters(
+                serde_json::from_value(serde_json::json!({"screenshot_file_path": path})).unwrap(),
+            ))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let caption_value = caption(&result);
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(caption_value["file_path"], serde_json::json!(path));
+        assert_eq!(caption_value["bytes"], serde_json::json!(written.len()));
+        assert_eq!(caption_value["format"], serde_json::json!("png"));
+        assert_eq!(caption_value["width"], serde_json::json!(64));
+        assert_eq!(caption_value["height"], serde_json::json!(48));
+        assert_eq!(caption_value["coordinate_width"], serde_json::json!(64));
+        assert_eq!(caption_value["coordinate_height"], serde_json::json!(48));
+        assert_eq!(caption_value["scale"], serde_json::json!(1.0));
+        assert_eq!(
+            image::load_from_memory(&written).unwrap().dimensions(),
+            (64, 48)
+        );
+        assert_eq!(events(), "gnome-screenshot\n");
+        let written_png = written;
+
+        // A jpeg, scaled down.
+        let jpeg = out.join("shot.jpg");
+        let result = server
+            .screenshot(Parameters(
+                serde_json::from_value(serde_json::json!({
+                    "screenshot_file_path": jpeg,
+                    "format": "jpeg",
+                    "scale": 0.5
+                }))
+                .unwrap(),
+            ))
+            .await;
+        let caption_value = caption(&result);
+        let written = std::fs::read(&jpeg).unwrap();
+        assert!(written.starts_with(&[0xff, 0xd8]), "a jpeg file");
+        assert_eq!(caption_value["format"], serde_json::json!("jpeg"));
+        assert_eq!(caption_value["width"], serde_json::json!(32));
+        assert_eq!(caption_value["coordinate_width"], serde_json::json!(64));
+        assert_eq!(caption_value["scale"], serde_json::json!(0.5));
+        assert_eq!(caption_value["bytes"], serde_json::json!(written.len()));
+
+        // 2. Bad paths are refused before any capture.
+        clear();
+        let as_dir = out.join("dir.png");
+        std::fs::create_dir(&as_dir).unwrap();
+        for (arguments, expected) in [
+            (
+                serde_json::json!({"screenshot_file_path": "shot.png"}),
+                "must be an absolute path",
+            ),
+            (
+                serde_json::json!({"screenshot_file_path": out.join("missing").join("shot.png")}),
+                "does not exist",
+            ),
+            (
+                serde_json::json!({"screenshot_file_path": as_dir}),
+                "already exists",
+            ),
+            (
+                serde_json::json!({"screenshot_file_path": out.join("shot.jpeg")}),
+                "does not match format png",
+            ),
+            // File output never replaces a file, so an earlier capture stays.
+            (
+                serde_json::json!({"screenshot_file_path": path}),
+                "already exists",
+            ),
+            (
+                serde_json::json!({"screenshot_file_path": format!("{}/", out.join("slash.png").display())}),
+                "must end with the file name",
+            ),
+        ] {
+            let result = server
+                .screenshot(Parameters(
+                    serde_json::from_value(arguments.clone()).unwrap(),
+                ))
+                .await;
+            assert_eq!(result.is_error, Some(true), "{arguments}");
+            assert_no_image(&result);
+            let text = &result.content[0].as_text().unwrap().text;
+            assert!(text.contains(expected), "{arguments}: {text}");
+        }
+        assert_eq!(events(), "", "a refused path captures nothing");
+        assert!(!out.join("missing").exists());
+        assert_eq!(std::fs::read(&path).unwrap(), written_png);
+
+        // 3. Over HTTP the screenshot tool refuses file output.
+        let http = ComputerUseLinux {
+            http_transport: true,
+            ..Default::default()
+        };
+        let remote = out.join("remote.png");
+        let result = http
+            .screenshot(Parameters(
+                serde_json::from_value(serde_json::json!({"screenshot_file_path": remote}))
+                    .unwrap(),
+            ))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .contains("refused over HTTP"));
+        assert!(!remote.exists());
+        assert_eq!(events(), "");
+
+        // A failed write is the call's error, with no inline fallback.
+        if unprivileged {
+            let result = server
+                .screenshot(Parameters(
+                    serde_json::from_value(
+                        serde_json::json!({"screenshot_file_path": locked.join("shot.png")}),
+                    )
+                    .unwrap(),
+                ))
+                .await;
+            assert_eq!(result.is_error, Some(true));
+            assert_no_image(&result);
+            assert!(result.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("failed to write screenshot file"));
+        }
+
+        // 4. get_app_state saves its screenshot and names the file.
+        let state = out.join("state.png");
+        let params: GetAppStateParams =
+            serde_json::from_value(serde_json::json!({"screenshot_file_path": state})).unwrap();
+        let result = server.app_state(params).await.unwrap();
+        assert_no_image(&result);
+        let structured = result.structured_content.unwrap();
+        let written = std::fs::read(&state).unwrap();
+        assert_eq!(
+            structured["screenshot"]["file_path"],
+            serde_json::json!(state)
+        );
+        assert_eq!(
+            structured["screenshot"]["bytes"],
+            serde_json::json!(written.len())
+        );
+        assert_eq!(
+            structured["screenshot"]["coordinate_width"],
+            serde_json::json!(64)
+        );
+        assert_eq!(structured["screenshot"]["scale"], serde_json::json!(1.0));
+        assert!(structured
+            .get("screenshot_error")
+            .is_none_or(serde_json::Value::is_null));
+        assert!(structured["message"]
+            .as_str()
+            .unwrap()
+            .contains("The screenshot was saved to"));
+
+        // A failed write is reported in screenshot_error, without the image.
+        if unprivileged {
+            let params: GetAppStateParams = serde_json::from_value(
+                serde_json::json!({"screenshot_file_path": locked.join("state.png")}),
+            )
+            .unwrap();
+            let result = server.app_state(params).await.unwrap();
+            assert_no_image(&result);
+            let structured = result.structured_content.unwrap();
+            assert!(structured["screenshot"].is_null());
+            assert!(structured["screenshot_error"]
+                .as_str()
+                .unwrap()
+                .contains("failed to write screenshot file"));
+        }
+
+        // 5. A post-action screenshot is saved after the action.
+        clear();
+        let after = out.join("after.png");
+        let click: ClickParams = serde_json::from_value(serde_json::json!({
+            "x": 10,
+            "y": 10,
+            "screenshot_after": true,
+            "screenshot_file_path": after
+        }))
+        .unwrap();
+        let result = server.click(Parameters(click)).await.unwrap();
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_no_image(&result);
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["ok"], serde_json::json!(true));
+        assert_eq!(
+            structured["screenshot"]["file_path"],
+            serde_json::json!(after)
+        );
+        let after_bytes = std::fs::read(&after).unwrap();
+        assert_eq!(
+            structured["screenshot"]["bytes"],
+            serde_json::json!(after_bytes.len())
+        );
+        assert_eq!(
+            structured["screenshot"]["coordinate_height"],
+            serde_json::json!(48)
+        );
+        assert_eq!(events(), "xdotool\ngnome-screenshot\n");
+
+        // A failed post-action write keeps the action's ok and reports
+        // screenshot_error like any failed post-action capture. It says
+        // nothing about the desktop, so the cached diagnostics stay.
+        server.diagnostics.report(false).await;
+        let probes_before = probes.load(std::sync::atomic::Ordering::SeqCst);
+        if unprivileged {
+            let click: ClickParams = serde_json::from_value(serde_json::json!({
+                "x": 10,
+                "y": 10,
+                "screenshot_after": "screen",
+                "screenshot_file_path": locked.join("after.png")
+            }))
+            .unwrap();
+            let result = server.click(Parameters(click)).await.unwrap();
+            assert_ne!(result.is_error, Some(true));
+            assert_no_image(&result);
+            let structured = result.structured_content.unwrap();
+            assert_eq!(structured["ok"], serde_json::json!(true));
+            assert!(structured.get("screenshot").is_none());
+            assert!(structured["screenshot_error"]
+                .as_str()
+                .unwrap()
+                .contains("failed to write screenshot file"));
+            assert!(structured["message"]
+                .as_str()
+                .unwrap()
+                .contains("Post-action screenshot failed:"));
+        }
+
+        // A bad post-action path is reported without a capture, and an
+        // existing file is never replaced.
+        for (bad, expected) in [
+            (serde_json::json!("after.png"), "must be an absolute path"),
+            (serde_json::json!(after), "already exists"),
+        ] {
+            clear();
+            let click: ClickParams = serde_json::from_value(serde_json::json!({
+                "x": 10,
+                "y": 10,
+                "screenshot_after": true,
+                "screenshot_file_path": bad
+            }))
+            .unwrap();
+            let result = server.click(Parameters(click)).await.unwrap();
+            let structured = result.structured_content.unwrap();
+            assert_eq!(structured["ok"], serde_json::json!(true));
+            assert!(structured["screenshot_error"]
+                .as_str()
+                .unwrap()
+                .contains(expected));
+            assert_eq!(events(), "xdotool\n");
+        }
+        assert_eq!(std::fs::read(&after).unwrap(), after_bytes);
+        server.diagnostics.report(false).await;
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            probes_before,
+            "a file output failure keeps the cached diagnostics"
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
 
@@ -19035,5 +26429,606 @@ mod pixelflux_routing_tests {
             .status()
             .unwrap();
         assert!(status.success(), "{status}");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_handle_tests {
+    use super::*;
+
+    const FIRST_REF: &str = ":1.10/org/a11y/atspi/accessible/7";
+    const SECOND_REF: &str = ":1.20/org/a11y/atspi/accessible/7";
+    const IDENTIFIER_REF: &str = ":1.30/org/a11y/atspi/accessible/9";
+
+    fn node(object_ref: &str) -> AccessibilityNode {
+        AccessibilityNode {
+            index: 0,
+            parent_index: None,
+            depth: 1,
+            object_ref: object_ref.to_string(),
+            role: "push button".to_string(),
+            name: Some("Save".to_string()),
+            description: None,
+            child_count: 0,
+            bounds: None,
+            states: vec!["enabled".to_string()],
+            actions: vec![AccessibilityAction {
+                index: 0,
+                name: "click".to_string(),
+                description: String::new(),
+                keybinding: String::new(),
+            }],
+            value: None,
+            text: None,
+            supports_editable_text: false,
+        }
+    }
+
+    fn invocation() -> crate::atspi_tree::ActionInvocation {
+        crate::atspi_tree::ActionInvocation {
+            action_index: 0,
+            action_name: Some("click".to_string()),
+            ok: true,
+        }
+    }
+
+    #[test]
+    fn every_store_gets_a_new_id_and_servers_do_not_share_ids() {
+        let backend = ComputerUseLinux::default();
+        assert_eq!(backend.cached_snapshot_id(), "");
+        let first = backend.cache_snapshot(&[node(FIRST_REF)], None);
+        let second = backend.cache_snapshot(&[node(FIRST_REF)], None);
+        assert_ne!(first, second);
+        assert_eq!(backend.cached_snapshot_id(), second);
+        let (prefix, _) = first.split_once('-').unwrap();
+        assert!(second.starts_with(&format!("{prefix}-")), "{second}");
+        // A server started later, or another server, names its own snapshots.
+        let other = ComputerUseLinux::default().cache_snapshot(&[node(FIRST_REF)], None);
+        assert!(!other.starts_with(&format!("{prefix}-")), "{other}");
+    }
+
+    #[test]
+    fn snapshot_id_check() {
+        let check =
+            |requested: Option<&str>, current: &str| check_snapshot_id(requested, current, "ab");
+        assert_eq!(check(None, "ab-2"), Ok(()));
+        assert_eq!(check(Some("  "), "ab-2"), Ok(()));
+        assert_eq!(check(Some("ab-2"), "ab-2"), Ok(()));
+        assert_eq!(check(Some(" ab-2 "), "ab-2"), Ok(()));
+        assert_eq!(
+            check(Some("ab-1"), "ab-2"),
+            Err("snapshot_id \"ab-1\" is not the cached snapshot: a later get_app_state, include_tree or perform_action recovery replaced it, and its element indices could name other elements now. Call get_app_state and use the element_index values and snapshot_id it returns.".to_string())
+        );
+        let reason = |requested: &str, current: &str| {
+            let message = check(Some(requested), current).unwrap_err();
+            let (_, reason) = message.split_once("is not the cached snapshot: ").unwrap();
+            reason.split_once(", and its").unwrap().0.to_string()
+        };
+        assert_eq!(
+            reason("ab-1", ""),
+            "no tree is cached now, since the last tree read failed or perform_action recovery cleared it"
+        );
+        let foreign =
+            "this server did not issue it; it may come from a server process that has since exited";
+        assert_eq!(reason("cd-1", "ab-1"), foreign);
+        assert_eq!(reason("cd-1", ""), foreign);
+        assert_eq!(reason("ab1", "ab-1"), foreign);
+    }
+
+    #[test]
+    fn only_calls_that_resolve_a_cached_element_name_a_snapshot() {
+        let click =
+            |value: serde_json::Value| -> ClickParams { serde_json::from_value(value).unwrap() };
+        let scroll = |value: serde_json::Value| -> ScrollParams {
+            let mut value = value;
+            value["direction"] = "down".into();
+            serde_json::from_value(value).unwrap()
+        };
+        use serde_json::json;
+        assert!(click_resolves_cached_element(&click(
+            json!({"element_index": 1})
+        )));
+        assert!(click_resolves_cached_element(&click(
+            json!({"role": "button"})
+        )));
+        // A lone x falls back to the element, as the click target resolves it.
+        assert!(click_resolves_cached_element(&click(
+            json!({"element_index": 1, "x": 5})
+        )));
+        assert!(click_resolves_cached_element(&click(
+            json!({"element_index": 1, "x": 5, "y": 6, "coordinate_space": "atspi"})
+        )));
+        assert!(!click_resolves_cached_element(&click(
+            json!({"element_index": 1, "x": 5, "y": 6})
+        )));
+        assert!(!click_resolves_cached_element(&click(
+            json!({"x": 5, "y": 6})
+        )));
+        assert!(scroll_resolves_cached_element(&scroll(
+            json!({"element_index": 1})
+        )));
+        assert!(scroll_resolves_cached_element(&scroll(
+            json!({"element_index": 1, "x": 5})
+        )));
+        assert!(scroll_resolves_cached_element(&scroll(
+            json!({"element_index": 1, "y": 6})
+        )));
+        assert!(!scroll_resolves_cached_element(&scroll(
+            json!({"element_index": 1, "x": 5, "y": 6})
+        )));
+        assert!(!scroll_resolves_cached_element(&scroll(json!({"x": 5}))));
+    }
+
+    /// Two callers share one server and its one cached snapshot. After the
+    /// second caller's get_app_state, the first caller's index names a node
+    /// of the second tree; naming the first snapshot refuses it.
+    #[tokio::test]
+    async fn an_index_from_a_replaced_snapshot_is_refused() {
+        let backend = ComputerUseLinux::default();
+        let first = backend.cache_snapshot(&[node(FIRST_REF)], None);
+        let second = backend.cache_snapshot(&[node(SECOND_REF)], None);
+        let dispatched = Arc::new(Mutex::new(Vec::new()));
+        let run = |params: ActionParams| {
+            let dispatched = Arc::clone(&dispatched);
+            let backend = backend.clone();
+            async move {
+                backend
+                    .perform_element_action_with(
+                        &params,
+                        Some("click"),
+                        move |object_ref, _| {
+                            dispatched.lock().unwrap().push(object_ref);
+                            async { Ok(invocation()) }
+                        },
+                        |_| async { Err(anyhow::anyhow!("no recovery expected")) },
+                    )
+                    .await
+                    .0
+                     .0
+            }
+        };
+        let by_index = |snapshot_id: Option<&str>| ActionParams {
+            element_index: Some(0),
+            snapshot_id: snapshot_id.map(str::to_string),
+            ..Default::default()
+        };
+
+        let refused = run(by_index(Some(&first))).await;
+        assert!(!refused.ok);
+        assert!(
+            refused.message.starts_with(&format!(
+                "perform_action was not sent: snapshot_id {first:?} is not the cached snapshot: a later get_app_state"
+            )),
+            "{}",
+            refused.message
+        );
+        // A selector resolves in the cached tree too.
+        let by_selector = ActionParams {
+            role: Some("push button".to_string()),
+            snapshot_id: Some(first.clone()),
+            ..Default::default()
+        };
+        assert!(!run(by_selector).await.ok);
+        assert!(dispatched.lock().unwrap().is_empty());
+
+        assert!(run(by_index(Some(&second))).await.ok);
+        // Without snapshot_id the latest snapshot answers, as before.
+        assert!(run(by_index(None)).await.ok);
+        // An element_identifier names the object itself, not a snapshot node.
+        let by_identifier = ActionParams {
+            element_identifier: Some(IDENTIFIER_REF.to_string()),
+            snapshot_id: Some(first.clone()),
+            ..Default::default()
+        };
+        assert!(run(by_identifier).await.ok);
+        assert_eq!(
+            *dispatched.lock().unwrap(),
+            [SECOND_REF, SECOND_REF, IDENTIFIER_REF]
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_pages_name_their_snapshot_and_refuse_a_replaced_one() {
+        let backend = ComputerUseLinux::default();
+        let page = |snapshot_id: Option<&str>| {
+            let backend = backend.clone();
+            let snapshot_id = snapshot_id.map(str::to_string);
+            async move {
+                backend
+                    .get_tree_page(Parameters(GetTreePageParams {
+                        offset: None,
+                        snapshot_id,
+                    }))
+                    .await
+                    .0
+            }
+        };
+        assert_eq!(page(None).await.snapshot_id, None);
+
+        let first = backend.cache_snapshot(&[node(FIRST_REF)], None);
+        let second = backend.cache_snapshot(&[node(SECOND_REF)], None);
+        for requested in [None, Some(second.as_str())] {
+            let current = page(requested).await;
+            assert_eq!(current.snapshot_id.as_deref(), Some(second.as_str()));
+            assert_eq!(current.node_count, 1);
+            assert_eq!(current.nodes.len(), 1);
+        }
+        let stale = page(Some(&first)).await;
+        assert_eq!(stale.snapshot_id, None);
+        assert_eq!(stale.node_count, 0);
+        assert!(stale.nodes.is_empty());
+        assert_eq!(stale.next_offset, None);
+        assert!(
+            stale
+                .message
+                .starts_with(&format!("snapshot_id {first:?} is not the cached snapshot")),
+            "{}",
+            stale.message
+        );
+
+        // A cleared cache names no snapshot and refuses every id.
+        backend.clear_snapshot();
+        assert_eq!(backend.cached_snapshot_id(), "");
+        let cleared = page(None).await;
+        assert_eq!(cleared.snapshot_id, None);
+        assert_eq!(cleared.node_count, 0);
+        let refused = page(Some(&second)).await;
+        assert!(
+            refused.message.starts_with(&format!(
+                "snapshot_id {second:?} is not the cached snapshot: no tree is cached now"
+            )),
+            "{}",
+            refused.message
+        );
+    }
+
+    const HTTP_REQUIRED: &str = "click was not sent: snapshot_id is required over HTTP for element_index and selector calls, because another client's get_app_state can replace the cached tree. Pass the snapshot_id from your get_app_state result.";
+
+    /// The click checks of `http_clients_must_name_their_snapshot`, on any
+    /// server; returns each call's check result.
+    fn click_checks(backend: &ComputerUseLinux) -> (String, Vec<std::result::Result<(), String>>) {
+        let a = backend.clone();
+        let b = backend.clone();
+        let first = a.cache_snapshot(&[node(FIRST_REF)], None);
+        b.cache_snapshot(&[node(SECOND_REF)], None);
+        let check = |value: serde_json::Value| {
+            let params: ClickParams = serde_json::from_value(value).unwrap();
+            a.check_element_snapshot(
+                "click",
+                params.snapshot_id.as_deref(),
+                click_resolves_cached_element(&params),
+            )
+            .map(drop)
+        };
+        use serde_json::json;
+        let results = vec![
+            check(json!({"element_index": 0, "snapshot_id": first})),
+            check(json!({"element_index": 0})),
+            check(json!({"element_index": 0, "snapshot_id": "  "})),
+            check(json!({"element_identifier": IDENTIFIER_REF})),
+            check(json!({"x": 5, "y": 6})),
+        ];
+        (first, results)
+    }
+
+    #[test]
+    fn http_clients_must_name_their_snapshot() {
+        let backend = ComputerUseLinux {
+            require_snapshot_ids: true,
+            ..Default::default()
+        };
+        let (first, results) = click_checks(&backend);
+        assert!(results[0].as_ref().unwrap_err().starts_with(&format!(
+            "click was not sent: snapshot_id {first:?} is not the cached snapshot: a later get_app_state"
+        )));
+        assert_eq!(results[1], Err(HTTP_REQUIRED.to_string()));
+        assert_eq!(results[2], Err(HTTP_REQUIRED.to_string()));
+        assert_eq!(results[3], Ok(()));
+        assert_eq!(results[4], Ok(()));
+    }
+
+    #[test]
+    fn stdio_snapshot_id_stays_optional() {
+        let (_, results) = click_checks(&ComputerUseLinux::default());
+        assert!(results[0].is_err());
+        assert_eq!(results[1..], [Ok(()), Ok(()), Ok(()), Ok(())]);
+    }
+
+    #[tokio::test]
+    async fn http_tree_page_needs_a_snapshot_id() {
+        let backend = ComputerUseLinux {
+            require_snapshot_ids: true,
+            ..Default::default()
+        };
+        let id = backend.cache_snapshot(&[node(FIRST_REF)], None);
+        for missing in [None, Some("  ".to_string())] {
+            let page = backend
+                .get_tree_page(Parameters(GetTreePageParams {
+                    offset: None,
+                    snapshot_id: missing,
+                }))
+                .await
+                .0;
+            assert_eq!(page.node_count, 0);
+            assert!(page.nodes.is_empty());
+            assert_eq!(page.snapshot_id, None);
+            assert_eq!(
+                page.message,
+                HTTP_REQUIRED.replacen("click", "get_tree_page", 1)
+            );
+        }
+        let page = backend
+            .get_tree_page(Parameters(GetTreePageParams {
+                offset: None,
+                snapshot_id: Some(id.clone()),
+            }))
+            .await
+            .0;
+        assert_eq!(page.node_count, 1);
+        assert_eq!(page.snapshot_id, Some(id));
+    }
+
+    /// Client B's tree: its app is pid 42 and it was narrowed to "Window 20".
+    fn cache_client_b_tree(backend: &ComputerUseLinux) -> String {
+        let id = backend.cache_snapshot(&[node(FIRST_REF)], Some(42));
+        backend.last_snapshot.lock().unwrap().window_scope = Some("Window 20".to_string());
+        id
+    }
+
+    #[test]
+    fn http_post_action_tree_ignores_another_clients_scope() {
+        let http = ComputerUseLinux {
+            require_snapshot_ids: true,
+            ..Default::default()
+        };
+        let b_id = cache_client_b_tree(&http);
+        // Client A's action names no snapshot, or not B's: nothing comes from
+        // B's tree. Coordinate calls resolve no cached element, so they pass.
+        for named in [None, Some("  "), Some("other")] {
+            let scope = http.check_element_snapshot("click", named, false).unwrap();
+            assert_eq!(scope.pid, None);
+            assert!(scope.tree.is_none(), "{:?}", scope.tree);
+        }
+        // Client B named its own snapshot, so its scope carries over.
+        let scope = http
+            .check_element_snapshot("click", Some(&format!(" {b_id} ")), false)
+            .unwrap();
+        assert_eq!(scope.pid, Some(42));
+        assert_eq!(scope.tree.unwrap().scope, "Window 20");
+
+        // Stdio reads the cached scope at capture time, as before.
+        let stdio = ComputerUseLinux::default();
+        cache_client_b_tree(&stdio);
+        let scope = stdio.cached_post_action_context();
+        assert_eq!(scope.pid, Some(42));
+        let window = scope.tree.unwrap();
+        assert_eq!(window.scope, "Window 20");
+        assert_eq!(window.pid, Some(42));
+    }
+
+    #[test]
+    fn post_action_scope_for_capture_keeps_the_carried_scope_over_http() {
+        // Client B stores a newer tree for another app and window.
+        let cache_newer_tree = |backend: &ComputerUseLinux| {
+            backend.cache_snapshot(&[node(SECOND_REF)], Some(7));
+            backend.last_snapshot.lock().unwrap().window_scope = Some("Window 30".to_string());
+        };
+        let http = ComputerUseLinux {
+            require_snapshot_ids: true,
+            ..Default::default()
+        };
+        let a_id = cache_client_b_tree(&http);
+        // Client A's action takes its scope under the input lock.
+        let carried = http
+            .check_element_snapshot("click", Some(&a_id), true)
+            .unwrap();
+        cache_newer_tree(&http);
+        let scope = http.post_action_scope_for_capture(carried);
+        assert_eq!(scope.pid, Some(42));
+        assert_eq!(scope.tree.unwrap().scope, "Window 20");
+
+        // Stdio reads the cache at capture time, as on main.
+        let stdio = ComputerUseLinux::default();
+        let a_id = cache_client_b_tree(&stdio);
+        let carried = stdio
+            .check_element_snapshot("click", Some(&a_id), true)
+            .unwrap();
+        cache_newer_tree(&stdio);
+        let scope = stdio.post_action_scope_for_capture(carried);
+        assert_eq!(scope.pid, Some(7));
+        assert_eq!(scope.tree.unwrap().scope, "Window 30");
+    }
+
+    #[tokio::test]
+    async fn http_failed_read_keeps_the_cached_tree() {
+        let http = ComputerUseLinux {
+            require_snapshot_ids: true,
+            ..Default::default()
+        };
+        let id = http.cache_snapshot(&[node(FIRST_REF)], None);
+        http.commit_cleared_snapshot().await;
+        assert!(http
+            .check_element_snapshot("click", Some(&id), true)
+            .is_ok());
+
+        let stdio = ComputerUseLinux::default();
+        let id = stdio.cache_snapshot(&[node(FIRST_REF)], None);
+        stdio.commit_cleared_snapshot().await;
+        let refused = stdio
+            .check_element_snapshot("click", Some(&id), true)
+            .unwrap_err();
+        assert!(refused.contains("no tree is cached now"), "{refused}");
+    }
+}
+
+#[cfg(test)]
+mod type_text_atspi_fallback_tests {
+    use super::*;
+    use crate::atspi_tree::insert_fixture::{start_field_fixture, FieldFixture, FIXTURE_WINDOW};
+    use crate::keyboard_keymap::{MissingKeysymReason, MissingLayoutKeysym};
+
+    const REFUSAL: &str =
+        "Literal text was not sent: GNOME portal cannot verify U+002F in keyboard layout group 2.";
+    const MISSING: MissingLayoutKeysym = MissingLayoutKeysym {
+        ch: '/',
+        group: 2,
+        reason: MissingKeysymReason::Absent,
+    };
+
+    fn result(insert: Result<FocusedTextInsert>) -> std::result::Result<String, String> {
+        type_text_atspi_result(REFUSAL, MISSING, "/home/x", insert)
+    }
+
+    #[test]
+    fn a_verified_insert_names_the_route_and_skips_the_unverified_note() {
+        let message = result(Ok(FocusedTextInsert::Verified {
+            role: "text".to_string(),
+            replaced_selection: true,
+            caret_after_text: true,
+        }))
+        .unwrap();
+        // type_text adds "Field contents were not verified" unless this holds.
+        assert!(message.starts_with(TYPE_TEXT_ATSPI_ROUTE), "{message}");
+        assert!(message.contains("group 2 lacks U+002F"), "{message}");
+        assert!(message.contains("reads back the text"), "{message}");
+        assert!(message.contains("replaced the selection"), "{message}");
+        assert!(!message.contains("caret"), "{message}");
+    }
+
+    #[test]
+    fn no_editable_focus_and_password_fields_keep_the_refusal() {
+        let error = result(Ok(FocusedTextInsert::NotEditable(
+            "no element in the target app has keyboard focus".to_string(),
+        )))
+        .unwrap_err();
+        assert!(error.starts_with(REFUSAL), "{error}");
+        assert!(error.contains("no element in the target app has keyboard focus"));
+
+        let error = result(Ok(FocusedTextInsert::PasswordField)).unwrap_err();
+        assert!(error.starts_with(REFUSAL), "{error}");
+        assert!(error.contains("password field"), "{error}");
+        assert!(error.contains("set_value can fill it"), "{error}");
+
+        let error = result(Err(anyhow::anyhow!("failed to connect to AT-SPI bus"))).unwrap_err();
+        assert!(error.starts_with(REFUSAL), "{error}");
+    }
+
+    #[test]
+    fn a_readback_mismatch_fails_and_quotes_the_field() {
+        let error = result(Ok(FocusedTextInsert::Mismatch {
+            expected_count: 7,
+            read_count: 6,
+            read_text: "/home/".to_string(),
+            read_truncated: false,
+        }))
+        .unwrap_err();
+        // A failure must not carry the success marker.
+        assert!(error.starts_with(TYPE_TEXT_ATSPI_UNVERIFIED), "{error}");
+        assert!(!error.starts_with(TYPE_TEXT_ATSPI_ROUTE), "{error}");
+        assert!(error.contains("does not read it back"), "{error}");
+        assert!(error.contains("\"/home/x\""), "{error}");
+        assert!(error.contains("read \"/home/\""), "{error}");
+        assert!(error.contains("may have changed"), "{error}");
+
+        let error = result(Ok(FocusedTextInsert::EditFailed {
+            reason: "the app refused InsertText".to_string(),
+            may_have_changed: false,
+        }))
+        .unwrap_err();
+        assert!(error.starts_with(TYPE_TEXT_ATSPI_UNVERIFIED), "{error}");
+        assert!(error.contains("No text was changed"), "{error}");
+        for outcome in [
+            FocusedTextInsert::ReadbackFailed,
+            FocusedTextInsert::ReadbackTimedOut,
+        ] {
+            let error = result(Ok(outcome)).unwrap_err();
+            assert!(error.starts_with(TYPE_TEXT_ATSPI_UNVERIFIED), "{error}");
+        }
+
+        // An unreachable shift level is not worded as a missing character.
+        let unreachable = MissingLayoutKeysym {
+            reason: MissingKeysymReason::UnreachableLevel,
+            ..MISSING
+        };
+        let error = type_text_atspi_result(
+            REFUSAL,
+            unreachable,
+            "/home/x",
+            Ok(FocusedTextInsert::ReadbackFailed),
+        )
+        .unwrap_err();
+        assert!(error.contains("only at a shift level"), "{error}");
+        assert!(!error.contains("lacks"), "{error}");
+    }
+
+    #[test]
+    fn only_a_missing_keysym_takes_the_atspi_route() {
+        let missing = anyhow::Error::new(MISSING).context("keyboard keymap preflight failed");
+        assert_eq!(atspi_fallback_trigger(&missing), Some(MISSING));
+        for error in [
+            anyhow::anyhow!("WAYLAND_DISPLAY is missing; cannot verify the keyboard keymap"),
+            anyhow::anyhow!("keyboard keymap read timed out; no text was sent"),
+            anyhow::anyhow!("cannot verify the complete text against the keyboard keymap"),
+        ] {
+            assert_eq!(atspi_fallback_trigger(&error), None, "{error}");
+        }
+    }
+
+    /// The issue's case: with us + il groups the portal preflight refuses
+    /// `/home/x`, and the text goes into the focused entry and reads back.
+    #[tokio::test]
+    async fn a_two_group_keymap_refusal_types_through_atspi() {
+        let keymap = include_bytes!("../tests/fixtures/keyboard-us-il.xkb");
+        assert!(crate::keyboard_keymap::validate_text_with_keymap(keymap, "/").is_ok());
+        let error =
+            crate::keyboard_keymap::validate_text_with_keymap(keymap, "/home/x").unwrap_err();
+        let refusal = format!("Literal text was not sent: {error:#}");
+        let missing = atspi_fallback_trigger(&error).expect("a layout refusal");
+        assert_eq!(
+            missing,
+            MissingLayoutKeysym {
+                ch: 'h',
+                group: 2,
+                reason: MissingKeysymReason::Absent,
+            }
+        );
+
+        let running = start_field_fixture(FieldFixture {
+            role: atspi::Role::Entry,
+            role_name: "entry",
+            ..Default::default()
+        })
+        .await;
+        let insert = crate::atspi_tree::insert_text_at_focus_on(
+            &running.conn,
+            std::process::id(),
+            Some(FIXTURE_WINDOW),
+            "/home/x",
+        )
+        .await;
+        let message = type_text_atspi_result(&refusal, missing, "/home/x", insert).unwrap();
+        assert!(message.starts_with(TYPE_TEXT_ATSPI_ROUTE), "{message}");
+        assert!(message.contains("group 2 lacks U+0068"), "{message}");
+        assert_eq!(running.take_state(0).contents, "/home/x");
+    }
+
+    #[test]
+    fn control_characters_are_not_inserted() {
+        assert_eq!(key_press_character("/home/x y.txt"), None);
+        assert_eq!(key_press_character("שלום"), None);
+        for (text, code) in [
+            ("a\nb", "U+000A"),
+            ("a\tb", "U+0009"),
+            ("a\rb", "U+000D"),
+            ("a\u{8}", "U+0008"),
+            ("\u{1b}", "U+001B"),
+            ("\u{7f}", "U+007F"),
+        ] {
+            let key = key_press_character(text).unwrap();
+            let error = type_text_control_character_refusal(REFUSAL, key);
+            assert!(error.starts_with(REFUSAL), "{error}");
+            assert!(error.contains(code), "{error}");
+            assert!(error.contains("press_key"), "{error}");
+        }
     }
 }

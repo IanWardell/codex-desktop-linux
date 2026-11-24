@@ -245,7 +245,7 @@ jobs:
               linux-features/computer-use-linux/resume.test.js \
               linux-features/computer-use-linux/current-signed.test.js \
               linux-features/computer-use-linux/native-applications.test.js \
-              linux-features/account-switcher/test.js
+              linux-features/account-switcher/implementation.test.js
       - name: Require signed renderer dependency regression
         env:
           EXPECTED_SIGNED_VERSION: ${{ inputs.version }}

@@ -50,6 +50,7 @@ const {
 const { loadLinuxFeaturePatchDescriptors, stageEnabledLinuxFeatureInstall } = require("../../scripts/lib/linux-features.js");
 const { patchExtractedApp } = require("../../scripts/patches/runner.js");
 const { createPatchReport, enabledFeatureFailuresFromReport } = require("../../scripts/lib/patch-report.js");
+const { makeSocketTempDir } = require("../../scripts/lib/unix-socket-dir.test-helpers.js");
 
 function withFeatureConfig(enabled, fn) {
   const original = process.env.CODEX_LINUX_FEATURES_CONFIG;
@@ -187,7 +188,7 @@ test("preload bridge patch is idempotent and fails closed", () => {
     const buildDir = path.join(tempDir, ".vite", "build");
     fs.mkdirSync(buildDir, { recursive: true });
     const target = path.join(buildDir, "preload.js");
-    fs.writeFileSync(target, "let e=require(\"electron\");e.contextBridge.exposeInMainWorld(\"electronBridge\",{usesOwlAppShell:()=>E});");
+    fs.writeFileSync(target, 'let e=require("electron"),B={sendMessageFromView:async()=>{}};e.contextBridge.exposeInMainWorld("electronBridge",B);');
     assert.equal(applyPreloadPatch(tempDir).changed, 1);
     const patched = fs.readFileSync(target, "utf8");
     assert.match(patched, new RegExp(PRELOAD_MARKER));
@@ -198,7 +199,7 @@ test("preload bridge patch is idempotent and fails closed", () => {
     assert.match(patched, /setLinuxAccountSwitcherSettings/);
     assert.match(patched, /action:"set-settings"/);
     assert.equal(applyPreloadPatch(tempDir).changed, 0);
-    fs.writeFileSync(target, "let e=require(\"electron\");e.contextBridge.exposeInMainWorld(\"electronBridge\",{});e.contextBridge.exposeInMainWorld(\"electronBridge\",{});");
+    fs.writeFileSync(target, 'let e=require("electron"),B={sendMessageFromView:async()=>{}};e.contextBridge.exposeInMainWorld("electronBridge",B);e.contextBridge.exposeInMainWorld("electronBridge",B);');
     assert.equal(applyPreloadPatch(tempDir).changed, 0);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -211,7 +212,7 @@ test("duplicate preload anchors are reported as enabled-feature drift", () => {
     const buildDir = path.join(root, ".vite", "build");
     fs.mkdirSync(buildDir, { recursive: true });
     fs.writeFileSync(path.join(buildDir, "early-bootstrap.js"), "be=e=>V.isTrustedIpcSender(e.sender,e.senderFrame??null);");
-    fs.writeFileSync(path.join(buildDir, "preload.js"), "let e=require(\"electron\");e.contextBridge.exposeInMainWorld(\"electronBridge\",{});e.contextBridge.exposeInMainWorld(\"electronBridge\",{});");
+    fs.writeFileSync(path.join(buildDir, "preload.js"), 'let e=require("electron"),B={sendMessageFromView:async()=>{}};e.contextBridge.exposeInMainWorld("electronBridge",B);e.contextBridge.exposeInMainWorld("electronBridge",B);');
     const config = path.join(root, "features.json");
     fs.writeFileSync(config, JSON.stringify({ enabled: ["account-switcher"] }));
     const report = createPatchReport();
@@ -237,7 +238,7 @@ test("a missing preload anchor is reported as enabled-feature drift", () => {
     patchExtractedApp(root, { report, featuresConfigPath: config });
     const failure = enabledFeatureFailuresFromReport(report).find((entry) => entry.name.includes("preload-profile-bridge"));
     assert.equal(failure?.status, "skipped-optional");
-    assert.match(failure?.reason ?? "", /found 0/);
+    assert.match(failure?.reason ?? "", /found 2/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -844,7 +845,7 @@ setImmediate(async()=>{const rejected=[];for(const id of [".",".."])try{await ha
 });
 
 test("launcher removes stale Chromium singleton links despite an unrelated reused PID", () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "account-switcher-singletons-"));
+  const tempDir = makeSocketTempDir("account-switcher-singletons-", "stale-singleton.sock");
   try {
     const home = path.join(tempDir, "home");
     const configDir = path.join(home, ".config", "codex-desktop");

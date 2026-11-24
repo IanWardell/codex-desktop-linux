@@ -15,13 +15,20 @@ const PATCHED_APPSHOT_AVAILABILITY = new RegExp(
     `"linux"===\\1\\/\\*${APPSHOT_AVAILABILITY_MARKER}\\*\\/\\|\\|` +
     `"macOS"===\\1\\|\\|"windows"===\\1\\}`,
 );
+const CURRENT_SIMPLE_APPSHOT_AVAILABILITY = new RegExp(
+  `function (${IDENT})\\((${IDENT})\\)\\{return"macOS"===\\2\\|\\|"windows"===\\2\\}`,
+  "g",
+);
+const PATCHED_SIMPLE_APPSHOT_AVAILABILITY = new RegExp(
+  `function ${IDENT}\\((${IDENT})\\)\\{return"linux"===\\1\\/\\*${APPSHOT_AVAILABILITY_MARKER}\\*\\/\\|\\|"macOS"===\\1\\|\\|"windows"===\\1\\}`,
+);
 
 function warn(message, patchName) {
   console.warn(`WARN: ${message} - skipping ${patchName}`);
 }
 
 function applyLinuxAppshotAvailabilityPatch(currentSource) {
-  if (PATCHED_APPSHOT_AVAILABILITY.test(currentSource)) {
+  if (PATCHED_APPSHOT_AVAILABILITY.test(currentSource) || PATCHED_SIMPLE_APPSHOT_AVAILABILITY.test(currentSource)) {
     return currentSource;
   }
   const matches = [...currentSource.matchAll(CURRENT_APPSHOT_AVAILABILITY)];
@@ -32,6 +39,12 @@ function applyLinuxAppshotAvailabilityPatch(currentSource) {
         `${prefix}"linux"===${platformVar}/*${APPSHOT_AVAILABILITY_MARKER}*/||"macOS"===${platformVar}||"windows"===${platformVar}}`,
     );
   }
+  const simple = [...currentSource.matchAll(CURRENT_SIMPLE_APPSHOT_AVAILABILITY)];
+  if (simple.length === 1 && currentSource.includes("requirements?.allowAppshots!==!1")) {
+    const [match] = simple;
+    const replacement = match[0].replace("return", `return"linux"===${match[2]}/*${APPSHOT_AVAILABILITY_MARKER}*/||`);
+    return currentSource.slice(0, match.index) + replacement + currentSource.slice(match.index + match[0].length);
+  }
 
   warn("Could not find AppShots availability gate", "Linux AppShots availability patch");
   return currentSource;
@@ -40,7 +53,9 @@ function applyLinuxAppshotAvailabilityPatch(currentSource) {
 function matchesLinuxAppshotAvailabilityContract(source) {
   CURRENT_APPSHOT_AVAILABILITY.lastIndex = 0;
   return [...source.matchAll(CURRENT_APPSHOT_AVAILABILITY)].length === 1 ||
-    PATCHED_APPSHOT_AVAILABILITY.test(source);
+    PATCHED_APPSHOT_AVAILABILITY.test(source) ||
+    source.includes("requirements?.allowAppshots!==!1") &&
+      ([...source.matchAll(CURRENT_SIMPLE_APPSHOT_AVAILABILITY)].length === 1 || PATCHED_SIMPLE_APPSHOT_AVAILABILITY.test(source));
 }
 
 function linuxAppshotWaylandHelperSource() {
@@ -280,7 +295,7 @@ function codexLinuxAppshotSend(e,t,n,r){try{e.sendInlineMessageForView(t,{reques
 let codexLinuxAppshotCaptureQueue=Promise.resolve();
 function codexLinuxAppshotStartCapture({origin:e,requestId:t,bundleIdentifier:n,windowManager:r}){if(process.platform!==\`linux\`)return null;setTimeout(()=>{let i=()=>codexLinuxAppshotCapture({origin:e,requestId:t,bundleIdentifier:n,windowManager:r});codexLinuxAppshotCaptureQueue=codexLinuxAppshotCaptureQueue.then(i,i).catch(n=>{codexLinuxAppshotWarn(\`capture-failed\`,{requestId:t,message:n instanceof Error?n.message:String(n)}),codexLinuxAppshotSend(r,e,t,{type:\`failed\`,failureReason:\`linux_capture_failed\`})})},0);return{animationDuration:0,transitionSnapshotHeight:140,transitionSpringDampingFraction:1,transitionSpringResponse:0}}
 async function codexLinuxAppshotCapture({origin:e,requestId:t,bundleIdentifier:n,windowManager:r}){let i=await codexLinuxAppshotFocusedWindow(!0),a=i.focusedWindow,o=i.returnWindow,v=codexLinuxAppshotManagedCapture(i.backend)&&a!=null,s=v&&(i.backend===\`hyprland\`||a.focused!==!0),b=i.backend,c=null,l=null,u=null,d=!s;try{i=await codexLinuxAppshotPrepareWindowForCapture(i),a=i.focusedWindow,c=codexLinuxAppshotWindowForRenderer(a);if(c==null)throw Error(\`No selected Linux AppShot window\`);let[e,t]=await Promise.all([codexLinuxAppshotAccessibilityNodes(a,c.bundleIdentifier),codexLinuxAppshotScreenshot(a,i.windows)]);if(t==null||typeof t.dataURL!=\`string\`||t.dataURL.length===0)throw Error(\`Linux AppShot screenshot was empty\`);v&&await codexLinuxAppshotVerifyCapturedWindow(a,codexLinuxAppshotBoundsKey(a),b),l=codexLinuxAppshotAccessibilityText(a,e.nodes,e.error),u=t}finally{if(s){if(o==null||!await codexLinuxAppshotRestoreWindow(o,b)){codexLinuxAppshotWarn(\`appshot-restore-focus-failed\`,{windowId:o?.window_id});throw Error(\`Could not verify ChatGPT focus restoration\`)}d=!0}}if(!d)throw Error(\`ChatGPT focus restoration was not verified\`);codexLinuxAppshotSend(r,e,t,{type:\`metadata\`,app:{bundleIdentifier:c.bundleIdentifier,name:c.name,windowTitle:c.windowTitle,iconSmallDataURL:null}}),typeof l==\`string\`&&l.length>0&&codexLinuxAppshotSend(r,e,t,{type:\`axText\`,text:l}),codexLinuxAppshotSend(r,e,t,{type:\`screenshot\`,screenshotDataURL:u.dataURL}),codexLinuxAppshotSend(r,e,t,{type:\`completed\`,transitionSnapshotDataURL:u.dataURL})}
-async function codexLinuxAppshotAccessibilityNodes(e,t){let n=[],r=new Set,a=o=>{let s=codexLinuxAppshotFirstString(o);s!=null&&!r.has(s)&&(r.add(s),n.push(s))};a(t),a(e?.app_id),a(e?.wm_class),a(e?.title),a(\`electron\`);let o=null;for(let e of n){try{let t=await codexLinuxAppshotBackendJson([\`state\`,e],10000);if(Array.isArray(t)&&t.length>0)return{nodes:t,candidate:e,error:null}}catch(e){o=e}}return{nodes:[],candidate:null,error:o instanceof Error?o.message:String(o||\`\`)}}
+async function codexLinuxAppshotAccessibilityNodes(e,t){let n=[],r=new Set,a=o=>{let s=codexLinuxAppshotFirstString(o);s!=null&&!r.has(s)&&(r.add(s),n.push(s))};a(t),a(e?.app_id),a(e?.wm_class),a(e?.title),a(\`electron\`);let o=null;for(let e of n){try{let t=await codexLinuxAppshotBackendJson(e.startsWith(\`-\`)?[\`state\`,\`--\`,e]:[\`state\`,e],10000);if(Array.isArray(t)&&t.length>0)return{nodes:t,candidate:e,error:null}}catch(e){o=e}}return{nodes:[],candidate:null,error:o instanceof Error?o.message:String(o||\`\`)}}
 function codexLinuxAppshotAccessibilityText(e,t,n){let r=codexLinuxAppshotFirstString(e?.app_id,e?.wm_class,\`Linux app\`),i=codexLinuxAppshotFirstString(e?.title,\`\`),a=[\`Linux AppShot accessibility snapshot\`,\`Application: \${r}\`,\`Window: "\${i}"\`,\`\`,\`Elements:\`];if(!Array.isArray(t)||t.length===0){n&&a.push(\`- error text="\${String(n).slice(0,240)}"\`);return a.join(\`\\n\`)}for(let e of t.slice(0,120))a.push(codexLinuxAppshotNodeLine(e));return a.join(\`\\n\`)}
 function codexLinuxAppshotNodeLine(e){let t=Number.isFinite(e?.depth)?Math.max(0,Math.min(12,e.depth)):0,n=\`  \`.repeat(t),r=codexLinuxAppshotFirstString(e?.role,\`node\`),i=codexLinuxAppshotFirstString(e?.name),a=codexLinuxAppshotFirstString(e?.text),o=Array.isArray(e?.states)?e.states.filter(Boolean).slice(0,8).join(\`,\`):null,s=e?.bounds?\` bounds=\${Math.round(Number(e.bounds.width)||0)}x\${Math.round(Number(e.bounds.height)||0)}+\${Math.round(Number(e.bounds.x)||0)}+\${Math.round(Number(e.bounds.y)||0)}\`:\`\`;return\`\${n}- \${r}\${i?\` name="\${codexLinuxAppshotCleanText(i,120)}"\`:\`\`}\${a?\` text="\${codexLinuxAppshotCleanText(a,160)}"\`:\`\`}\${s}\${o?\` states=\${o}\`:\`\`}\`}
 function codexLinuxAppshotCleanText(e,t){return String(e).replace(/[\\r\\n\\t]+/g,\` \`).replace(/"/g,\`'\`).trim().slice(0,t)}

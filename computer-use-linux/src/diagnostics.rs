@@ -1,6 +1,6 @@
 use crate::windowing::registry::{
     self, COSMIC_WAYLAND_BACKEND, GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND,
-    HYPRLAND_BACKEND, I3_BACKEND, KWIN_BACKEND, LABWC_BACKEND, NIRI_BACKEND,
+    HYPRLAND_BACKEND, I3_BACKEND, KWIN_BACKEND, LABWC_BACKEND, NIRI_BACKEND, UMBRIEL_BACKEND,
     WLR_FOREIGN_TOPLEVEL_BACKEND, X11_BACKEND,
 };
 use crate::ydotool;
@@ -22,6 +22,7 @@ const DESKTOP_ENV_KEYS: &[&str] = &[
     "DISPLAY",
     "HYPRLAND_INSTANCE_SIGNATURE",
     "NIRI_SOCKET",
+    "UMBRIEL_SOCKET",
     "XAUTHORITY",
     "YDOTOOL_SOCKET",
     "XDG_SESSION_DESKTOP",
@@ -52,8 +53,8 @@ const FORCE_PORTAL_POINTER_ENV_KEYS: &[&str] = &[
 ];
 const PORTAL_DEVICE_KEYBOARD: u32 = 1;
 const PORTAL_DEVICE_POINTER: u32 = 2;
-const PORTAL_CURSOR_MODE_HIDDEN: u32 = 1;
 const PORTAL_SOURCE_MONITOR: u32 = 1;
+/// ScreenCast version that added `AvailableCursorModes` and `cursor_mode`.
 const SCREENCAST_CURSOR_MODE_VERSION: u32 = 2;
 const REMOTE_DESKTOP_KEYBOARD_METHODS: &[&str] = &[
     "CreateSession",
@@ -104,6 +105,21 @@ pub struct CapabilityMap {
     pub accessibility: Vec<String>,
     /// Display/session isolation contexts the host can provide.
     pub isolation: Vec<String>,
+    /// Routes for type_text and press_key with delivery "background", which
+    /// leave the user's keyboard focus alone: at_spi (named elements),
+    /// devtools (a browser tab, when CODEX_COMPUTER_USE_DEVTOOLS names a
+    /// port), for terminals kitty, wezterm, tmux, screen and tiocsti, and
+    /// hyprland when Hyprland background mode is on, and
+    /// seat (a whole window through the agent's own keyboard focus).
+    pub background_input: Vec<String>,
+    /// The agent seat on this desktop: its route (x11-master,
+    /// sway-transient-seat or hyprland-send-key-state) and pointer support,
+    /// or the reason it has none.
+    pub background_seat: serde_json::Value,
+    /// Background click, drag and scroll on GNOME Wayland: a virtual pen
+    /// (gnome-pen or kwin-pen) and touchscreen (gnome-touch or kwin-touch) that leave the user's mouse
+    /// pointer where it is, with their limits, or the reason there is none.
+    pub background_pointer: serde_json::Value,
     /// The backend the tool will use by default for each selectable layer.
     pub preferred: PreferredBackends,
 }
@@ -129,6 +145,9 @@ pub struct PlatformReport {
     pub xdg_runtime_dir: Option<String>,
     pub gnome_shell_version: Check,
     pub gnome_screenshot: Check,
+    /// The DMS shell's `dms screenshot all` route, tried first on Umbriel
+    /// sessions because their portal captures one output.
+    pub dms_screenshot: Check,
     /// Native X11 display for the root-window screenshot route. Fails on
     /// Wayland sessions, including XWayland, by design.
     pub x11_display: Check,
@@ -436,7 +455,12 @@ fn capability_map_with_portal_keyboard(
     // i3, labwc, wlr-foreign-toplevel and the generic X11/EWMH backend have
     // no dedicated WindowingReport field; read them from the probe map so the
     // capability list matches the registry order.
-    for backend in [I3_BACKEND, LABWC_BACKEND, WLR_FOREIGN_TOPLEVEL_BACKEND] {
+    for backend in [
+        UMBRIEL_BACKEND,
+        I3_BACKEND,
+        LABWC_BACKEND,
+        WLR_FOREIGN_TOPLEVEL_BACKEND,
+    ] {
         if windowing
             .backends
             .get(backend)
@@ -468,12 +492,18 @@ fn capability_map_with_portal_keyboard(
         window_control: window_backends.first().cloned(),
     };
 
+    let background_input =
+        crate::background_input::available_routes(!accessibility_backends.is_empty());
+
     CapabilityMap {
         input: input_backends,
         screenshot: screenshot_backends,
         window_control: window_backends,
         accessibility: accessibility_backends,
         isolation,
+        background_input,
+        background_seat: crate::agent_seat::doctor_summary(),
+        background_pointer: crate::virtual_pen::doctor_summary(),
         preferred,
     }
 }
@@ -838,6 +868,7 @@ fn platform_report() -> PlatformReport {
         xdg_runtime_dir: xdg_runtime_dir().map(|path| path.display().to_string()),
         gnome_shell_version: command_check("gnome-shell", &["--version"]),
         gnome_screenshot: command_check("gnome-screenshot", &["--version"]),
+        dms_screenshot: dms_screenshot_check(),
         x11_display: x11_display_check(),
     }
 }
@@ -954,7 +985,7 @@ fn windowing_report(platform: &PlatformReport) -> WindowingReport {
             "A window listing backend is available for list_windows, focused_window, and targeted input verification."
         }
     } else {
-        "Window listing is unavailable or denied. Computer Use can still use screenshots, AT-SPI, and global ydotool input, but targeted window input cannot be verified. On GNOME, run setup_window_targeting to install the optional GNOME Shell extension backend. On COSMIC, ensure the bundled COSMIC helper is present and can connect to the session. On KDE/Plasma, ensure KWin exposes org.kde.KWin scripting on the session bus. On Hyprland, ensure hyprctl is available in the session. On niri, export the session's NIRI_SOCKET or expose an unambiguous matching socket in XDG_RUNTIME_DIR; the niri binary is optional. On labwc, the Selkies IPC socket labwc.sock lists windows. On other wlroots compositors, zwlr_foreign_toplevel_manager_v1 lists windows."
+        "Window listing is unavailable or denied. Computer Use can still use screenshots, AT-SPI, and global ydotool input, but targeted window input cannot be verified. On GNOME, run setup_window_targeting to install the optional GNOME Shell extension backend. On COSMIC, ensure the bundled COSMIC helper is present and can connect to the session. On KDE/Plasma, ensure KWin exposes org.kde.KWin scripting on the session bus. On Hyprland, ensure hyprctl is available in the session. On niri, ensure the session exposes NIRI_SOCKET so the niri IPC socket is reachable. On labwc, the session socket labwc.sock lists windows. On other wlroots compositors, zwlr_foreign_toplevel_manager_v1 lists windows."
     }
     .to_string();
 
@@ -1045,6 +1076,9 @@ fn screenshot_backends(
     let mut backends = Vec::new();
     if input.pixelflux.ok {
         backends.push("pixelflux".to_string());
+    }
+    if platform.dms_screenshot.ok {
+        backends.push("dms".to_string());
     }
     if platform.gnome_shell_version.ok {
         backends.push("gnome_shell".to_string());
@@ -1329,11 +1363,13 @@ fn should_advertise_wtype(
     force_xdotool: bool,
     force_portal_keyboard: bool,
 ) -> bool {
+    // The server routes keyboard input to xdotool before wtype only when
+    // xdotool can run, and to the portal whenever it is forced.
     platform_is_wayland(platform)
         && wtype_compatible_wayland_desktop(platform.xdg_current_desktop.as_deref())
         && input.wtype.ok
         && !force_ydotool
-        && !force_xdotool
+        && !should_advertise_xdotool(platform, input, force_ydotool, force_xdotool)
         && !force_portal_keyboard
 }
 
@@ -1578,7 +1614,7 @@ fn remote_desktop_pointer_check_from(
             Ok(cursor_modes) => cursor_modes,
             Err(detail) => return Check::fail(detail),
         };
-        if cursor_modes & PORTAL_CURSOR_MODE_HIDDEN == 0 {
+        if cursor_modes & crate::remote_desktop::CURSOR_MODE_HIDDEN == 0 {
             return Check::fail(format!(
                 "ScreenCast AvailableCursorModes={cursor_modes} does not include hidden cursor mode"
             ));
@@ -1813,6 +1849,17 @@ fn gdbus_call_check(destination: &str, object_path: &str, method: &str, args: &[
     command_check_with_session_bus("gdbus", &command_args)
 }
 
+/// The `dms` route `capture_screenshot_raw` tries on an Umbriel session.
+fn dms_screenshot_check() -> Check {
+    if !crate::windowing::backends::umbriel::is_umbriel_session() {
+        Check::fail("not an Umbriel session")
+    } else if crate::screenshot::dms_on_path() {
+        Check::ok("dms is on PATH")
+    } else {
+        Check::fail("dms is not on PATH")
+    }
+}
+
 fn command_check(command: &str, args: &[&str]) -> Check {
     run_command(command, args, false)
 }
@@ -2009,6 +2056,7 @@ pub(crate) mod tests {
             xdg_runtime_dir: Some("/run/user/1000".to_string()),
             gnome_shell_version: Check::ok("GNOME Shell 46.0"),
             gnome_screenshot: Check::ok("gnome-screenshot 41.0"),
+            dms_screenshot: Check::fail("not an Umbriel session"),
             x11_display: Check::fail("not a native X11 session"),
         }
     }
@@ -2073,7 +2121,7 @@ pub(crate) mod tests {
             cosmic_helper: Check::fail("missing"),
             kwin: Check::fail("not a KWin session"),
             hyprland: Check::fail("not a Hyprland session"),
-            niri: Check::fail("not a Niri session"),
+            niri: Check::fail("not a niri session"),
             backends: BTreeMap::new(),
             can_list_windows,
             can_focus_apps: true,
@@ -3062,7 +3110,10 @@ pub(crate) mod tests {
 
     #[test]
     fn ydotool_socket_check_rejects_legacy_stream_socket() {
-        let dir = std::env::temp_dir().join(format!("cd-{}", std::process::id()));
+        let dir = crate::test_sockets::socket_fixture(
+            &format!("cul-diag-stream-{}", std::process::id()),
+            "ydotool.sock",
+        );
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp diagnostics dir");
         let socket = dir.join("ydotool.sock");
@@ -3078,7 +3129,10 @@ pub(crate) mod tests {
 
     #[test]
     fn ydotool_socket_check_accepts_datagram_socket() {
-        let dir = std::env::temp_dir().join(format!("cd-dgram-{}", std::process::id()));
+        let dir = crate::test_sockets::socket_fixture(
+            &format!("cul-diag-dgram-{}", std::process::id()),
+            "ydotool.sock",
+        );
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp diagnostics dir");
         let socket = dir.join("ydotool.sock");
@@ -3115,8 +3169,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn desktop_env_hydration_includes_niri_socket() {
-        assert!(DESKTOP_ENV_KEYS.contains(&"NIRI_SOCKET"));
+    fn desktop_env_hydration_imports_the_niri_socket() {
+        let current_env = HashMap::new();
+        let session_env = HashMap::from([(
+            "NIRI_SOCKET".to_string(),
+            "/run/user/1000/niri.wayland-1.42.sock".to_string(),
+        )]);
+
+        let updates = desktop_env_hydration_updates(&current_env, &session_env);
+
+        assert!(updates.iter().any(|(key, value)| {
+            *key == "NIRI_SOCKET" && value == "/run/user/1000/niri.wayland-1.42.sock"
+        }));
     }
 
     #[test]
@@ -3135,10 +3199,21 @@ pub(crate) mod tests {
             &platform, &input, true, false, false
         ));
         assert!(!should_advertise_wtype(
+            &platform, &input, false, false, true
+        ));
+
+        // Forcing xdotool hides wtype only when xdotool can run: installed,
+        // with DISPLAY set, as the server's keyboard routing requires.
+        assert!(should_advertise_wtype(
             &platform, &input, false, true, false
         ));
+        input.xdotool = Check::ok("xdotool");
         assert!(!should_advertise_wtype(
-            &platform, &input, false, false, true
+            &platform, &input, false, true, false
+        ));
+        platform.display = None;
+        assert!(should_advertise_wtype(
+            &platform, &input, false, true, false
         ));
     }
 
@@ -3200,10 +3275,7 @@ pub(crate) mod tests {
         let mut portals = portal_report(Check::fail("missing"));
         portals.screenshot = Check::ok(".Screenshot method sa{sv} o -");
         let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
-        let mut windowing = windowing_report(true, true);
-        // The embedded fixture enables the Codex extension screenshot route with
-        // window focus; switch it off so this test isolates the routes it names.
-        windowing.codex_gnome_shell_extension_screenshot = Check::fail("missing");
+        let windowing = windowing_report(true, true);
         let input = input_report(true);
 
         let readiness = readiness_report(&platform, &portals, &accessibility, &windowing, &input);

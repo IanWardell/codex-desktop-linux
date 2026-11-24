@@ -29,16 +29,18 @@ run_node_tests() {
     local -a node_test_args=(--test)
     local -a test_files=()
 
-    node scripts/ci/manage-labels.js --check
+    # The guard below calls this function on the left of ||, where errexit is
+    # off, so every step that can fail returns its status itself.
+    node scripts/ci/manage-labels.js --check || return
 
-    if node --help | grep -q -- "--test-force-exit"; then
-        # All assertions must finish, but a leaked worker handle must not hold CI open.
-        node_test_args+=(--test-force-exit)
-    fi
+    # No --test-force-exit: it can drop finished tests from the report and still
+    # exit 0 (nodejs/node#64833). Where timeout exists, the watchdog below ends
+    # a run that a leaked handle holds open; without it the run has no limit.
 
+    # Every *.test.js and every test.js; a git pathspec * also matches /.
     while IFS= read -r file; do
         test_files+=("$file")
-    done < <(git ls-files '*.test.js' 'linux-features/*/test.js')
+    done < <(git ls-files '*.test.js' '*/test.js')
 
     if [ "${#test_files[@]}" -eq 0 ]; then
         return 0
@@ -89,16 +91,42 @@ run_node_tests() {
     return "$status"
 }
 
+# Every test removes what it creates, also when it fails. The suite runs with a
+# fresh TMPDIR, and anything left there fails the run and is named. The
+# directory stays for inspection then; an empty one is removed.
+run_node_tests_in_fresh_tmpdir() {
+    local fresh
+    local leftovers
+    local name
+    local status=0
+
+    fresh="$(mktemp -d)"
+    TMPDIR="$fresh" run_node_tests || status=$?
+    leftovers="$(find "$fresh" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+    if [ -n "$leftovers" ]; then
+        echo "Node tests left these entries in $fresh; each test must remove what it creates:" >&2
+        while IFS= read -r name; do
+            printf '  %s\n' "$name" >&2
+        done <<<"$leftovers"
+        [ "$status" -ne 0 ] || status=1
+    elif ! rmdir -- "$fresh"; then
+        echo "Could not remove $fresh after the run; a test process may still be writing there:" >&2
+        find "$fresh" -mindepth 1 -maxdepth 1 -printf '  %f\n' >&2 || true
+        [ "$status" -ne 0 ] || status=1
+    fi
+    return "$status"
+}
+
 case "$MODE" in
     all)
         run_node_syntax_checks
-        run_node_tests
+        run_node_tests_in_fresh_tmpdir
         ;;
     syntax)
         run_node_syntax_checks
         ;;
     test|tests)
-        run_node_tests
+        run_node_tests_in_fresh_tmpdir
         ;;
     *)
         echo "Usage: $0 [all|syntax|tests]" >&2

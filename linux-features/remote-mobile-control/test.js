@@ -1117,17 +1117,13 @@ test("remote mobile control feature exposes opt-in main-bundle and webview patch
     }
     const byId = (id) => descriptors.find((descriptor) => descriptor.id === `feature:remote-mobile-control:${id}`);
     // Modules duplicated across chunks are patched in every copy.
-    for (const id of ["linux-remote-control-visibility", "linux-remote-control-enable-for-host-params", "linux-remote-control-copy"]) {
+    for (const id of ["linux-remote-control-visibility", "linux-remote-control-enable-for-host-params", "linux-remote-control-copy", "linux-remote-control-load-gate"]) {
       assert.equal(byId(id).assetMatch, undefined, id);
     }
     const hydration = byId("linux-remote-mobile-conversation-hydration");
     const hydrationOwner = syntheticCurrentConversationHydrationBundle();
     assert.equal(hydration.assetMatch(applyLinuxRemoteMobileConversationHydrationPatch(hydrationOwner)), true);
     assert.equal(hydration.assetMatch(hydrationOwner + hydrationOwner), false);
-    const loadGate = byId("linux-remote-control-load-gate");
-    const loadGateOwner = syntheticRemoteConnectionVisibilityBundle();
-    assert.equal(loadGate.assetMatch(applyLinuxRemoteControlLoadGatePatch(loadGateOwner)), true);
-    assert.equal(loadGate.assetMatch(loadGateOwner + loadGateOwner), false);
     const revoke = byId("linux-remote-control-client-revoke-setup-reset");
     const revokeOwner = syntheticCurrentRevokeSetupResetBundle();
     assert.equal(revoke.assetMatch(applyLinuxRemoteControlClientRevokeSetupResetPatch(revokeOwner)), true);
@@ -3812,9 +3808,14 @@ test(
         patchedAssets.set(name, result.value);
       }
     }
-    // The mobile setup flag the revoke reset clears is still a global-state key.
+    // The mobile setup flag the revoke reset clears is still a global-state
+    // key. Rspack may carry the same key registry in multiple chunks.
     const keys = findWebviewAssetsContaining(SIGNED_APP, ['CODEX_MOBILE_SETUP_COMPLETED:"codex-mobile-has-connected-device"']);
-    assert.equal(keys.length, 1);
+    assert.ok(keys.length > 0);
+    for (const name of keys) {
+      const source = fs.readFileSync(path.join(assetsDir, name), "utf8");
+      assert.equal(source.split('CODEX_MOBILE_SETUP_COMPLETED:"codex-mobile-has-connected-device"').length - 1, 1, name);
+    }
     for (const [name, patched] of patchedAssets) {
       execFileSyncForModuleCheck(patched, name);
     }

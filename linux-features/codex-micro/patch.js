@@ -29,20 +29,13 @@ const CODEX_MICRO_GATE_CONTRACTS = [
       && source.includes("appServices.codexMicro"),
   },
   {
-    description: "Codex Micro sidebar settings entry gate",
-    gateCount: 1,
-    routeCount: 2,
-    anchor: (source) =>
-      source.includes(`"${CODEX_MICRO_ROUTE}"`)
-      && source.includes("codexMicro"),
-  },
-  {
     description: "Codex Micro dictation gate",
     gateCount: 1,
     routeCount: 0,
     anchor: (source) =>
       source.includes("onDictationTranscriptInsert")
-      && source.includes("dictationSoundsEnabled"),
+      && source.includes("isDictationEnabled:")
+      && !source.includes('surface:"composer"'),
   },
   {
     description: "Codex Micro composer gate",

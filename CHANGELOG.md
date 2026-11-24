@@ -7,6 +7,236 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Synchronize the embedded Computer Use backend to standalone v0.7.59. The
+  crate and the `server.rs` literal are 0.7.59, the standalone version. KDE
+  Plasma Wayland (KWin 6.3 and later) gets the virtual pen and touchscreen for
+  `click`, `drag` and `scroll` with `delivery: "background"`, as routes
+  `kwin-pen` and `kwin-touch`: KWin maps the devices through
+  `org.kde.KWin.InputDevice`, the point is checked against KWin's stacking
+  order on the current desktop and activity, Show Desktop and full-screen
+  effects refuse the call, and the server removes what KWin wrote for these
+  devices into `kcminputrc` once they are gone. On GNOME 48 and later a
+  background right click no longer arrives as a middle click (and the other
+  way round): the server sets the stylus button actions for its own pen. A
+  background scroll right after a background click or drag now pans: the pen
+  leaves proximity at the end of each action instead of hovering for 8 seconds.
+- Synchronize the embedded Computer Use backend to standalone v0.7.58. The
+  crate and the `server.rs` literal are 0.7.58, the standalone version. On
+  GNOME Wayland, `click`, `drag` and `scroll` with `delivery: "background"`
+  and a window target go through a virtual pen and touchscreen, so the user's
+  mouse pointer stays where it is: left, right and middle clicks are a pen tap
+  and the upper and lower barrel buttons, a drag is a pen stroke inside one
+  window, and a scroll is a one-finger touch pan. The point must be on the
+  target window with no window above it, checked through the Codex GNOME Shell
+  extension; a locked screen or an open overview refuses the call. A tap or a
+  touch still focuses the window, apps without tablet support never see the
+  pen, and the pen hovers for 8 seconds. `drag` takes `delivery` and a window
+  target. Results name the route `gnome-pen` or `gnome-touch`, `doctor`
+  reports `capabilities.background_pointer`, and a successful pen or touch
+  action moves the avatar cursor. The devices are named
+  `codex-computer-use-linux virtual pen` and `... virtual touch`.
+- Synchronize the embedded Computer Use backend to standalone v0.7.57. The
+  crate and the `server.rs` literal are 0.7.57, the standalone version.
+  `type_text` and `press_key` take `delivery: "background"`, which reaches the
+  target without moving the user's keyboard focus: an element from
+  `get_app_state` through AT-SPI EditableText or its action, a browser tab over
+  DevTools when `CODEX_COMPUTER_USE_DEVTOOLS` (or the standalone
+  `COMPUTER_USE_LINUX_DEVTOOLS`) names a loopback port or a
+  `DevToolsActivePort` file, and a terminal by tty through kitty remote control,
+  `wezterm cli`, tmux, GNU screen, TIOCSTI or the pty master. Where the desktop
+  ships a second seat (an XInput 2 master on X11, an `ext-transient-seat-v1`
+  seat on sway 1.10 and later, `sendkeystate` on Hyprland), a whole window
+  takes keys through the agent's own seat, and `click` and `scroll` take
+  `delivery: "background"` for the agent pointer on sway and on X11 without a
+  window manager; a successful agent-seat click or scroll moves the avatar
+  cursor. The X11 agent master is named `codex-computer-use-linux agent <id>`.
+  The first background call in a session that no route can serve sends nothing
+  and explains why; repeating it goes through normal focused input. `doctor`
+  reports `capabilities.background_input` and `capabilities.background_seat`.
+  `press_key` accepts `KP_Enter`.
+- Synchronize the embedded Computer Use backend to standalone v0.7.56. The
+  crate and the `server.rs` literal are 0.7.56, the standalone version. On
+  Umbriel, screenshots capture every output with `dms screenshot all` when the
+  DMS shell is installed and fall back to the portal;
+  `CODEX_COMPUTER_USE_SCREENSHOT_BACKEND=dms` (or the standalone
+  `COMPUTER_USE_LINUX_SCREENSHOT_BACKEND`) selects the route. With an
+  all-output capture the Umbriel backend reports window bounds on multi-output
+  layouts, and the server reads them again for each capture before cropping.
+  `doctor` reports `platform.dms_screenshot`. `screenshot` with `monitor` is
+  refused on a capture of one output of several. The uinput pointer no longer
+  lands off target on multi-output Umbriel: when a capture is one output of
+  several, the device covers the whole layout and coordinates are offset by the
+  captured output's position, and the device is replaced when the layout
+  changes.
+- Synchronize the embedded Computer Use backend to standalone v0.7.55.
+  `screenshot` takes `monitor`, a 0-based index in reading order (monitors
+  whose vertical ranges overlap form a row; rows go top to bottom and each row
+  left to right), and captures that one monitor at its own resolution instead
+  of shrinking a multi-monitor span to fit `max_width`. The caption adds
+  `monitor`, `monitor_count`, `monitor_x` and `monitor_y`, the monitor's origin
+  in full-desktop coordinates. It is refused with a window target and when the
+  capture's monitor layout cannot be read.
+- Synchronize the embedded Computer Use backend to standalone v0.7.54. It adds
+  an Umbriel window backend: `list_windows`, `focused_window` and exact
+  `activate_window` through the `umbriel` CLI (`umbriel windows --json`,
+  `umbriel msg window-focus`), with pids, workspaces and, with one enabled
+  output, bounds in capture pixels. With several enabled outputs bounds are
+  left out, because the portal captures one output. It answers ahead of the
+  generic wlr-foreign-toplevel backend, and the backend reads `UMBRIEL_SOCKET`
+  from the session's environment when the launcher did not pass it.
+- Synchronize the embedded Computer Use backend to standalone v0.7.53. The
+  crate and the `server.rs` literal are 0.7.53, the standalone version. The
+  standalone release replaces `libxkbcommon` in the GNOME `type_text` keymap
+  preflight with the pure-Rust `kbvm` crate so its static musl builds can run
+  the check. The embedded copy keeps the `libxkbcommon` preflight: `kbvm`
+  needs Rust 1.95, the pinned nixpkgs builds with Rust 1.93, and the packaged
+  app always has the library. The musl release builds and their CI job have no
+  counterpart here. The HTTP listener integration test kills and reaps its
+  server when an assertion fails, as in the standalone release.
+- Synchronize the embedded Computer Use backend to standalone v0.7.52.
+  `screenshot`, `get_app_state` and the `screenshot_after` capture of every
+  mutating tool take `screenshot_file_path`, an absolute path where the image
+  is saved instead of returned as MCP image content. File output creates a
+  new file and never replaces one. A bad path is refused before any capture or
+  input. Over HTTP (`mcp --listen`) the parameter is refused. The in-app
+  adapter does not pass it, so the app still gets its images inline.
+- Synchronize the embedded Computer Use backend to standalone v0.7.51.
+  `codex-computer-use-linux mcp --listen ADDR:PORT` serves MCP over
+  streamable HTTP at `/mcp`. It needs a bearer token from
+  `CODEX_COMPUTER_USE_MCP_TOKEN_FILE` or `CODEX_COMPUTER_USE_MCP_TOKEN` (the
+  standalone `COMPUTER_USE_LINUX_MCP_TOKEN_FILE` and
+  `COMPUTER_USE_LINUX_MCP_TOKEN` names are aliases). It refuses requests with
+  an `Origin` header or a `Host` outside `--allowed-host`, and refuses to start
+  with `CODEX_COMPUTER_USE_ENABLE_SHELL=1`. Over HTTP, element calls by index
+  or selector, and `get_tree_page`, must pass `snapshot_id`. Without `--listen` the server is
+  unchanged and opens no socket. The app and its host bridge still start the
+  backend over stdio.
+- Synchronize the embedded Computer Use backend to standalone v0.7.48.
+  `get_app_state`, `include_tree` observations and `get_tree_page` return a
+  `snapshot_id`. `click`, `scroll`, `perform_action`, `set_value` and
+  `get_tree_page` take it, and a call that picks its element by
+  `element_index` or selector and names a replaced snapshot is refused before
+  any window is raised or input is sent. A coordinate scroll on Wayland sends
+  the wheel from the uinput absolute pointer that moved the pointer, so GNOME
+  no longer drops it for XWayland windows, and the route needs no ydotool
+  daemon. `left` and `right` scroll the way they say on the uinput and
+  ydotool routes. `scroll` checks the target app's ownership of an
+  `element_index` when the call passes only `x` or only `y`. The host bridge
+  pages a large tree with its `snapshot_id`, so a tree replaced while it is
+  paged comes back marked partial instead of mixing two trees.
+- Synchronize the embedded Computer Use backend to standalone v0.7.47.
+  `setup_window_targeting` and `setup-window-targeting` install the user copy
+  of the Codex GNOME Shell extension in `$XDG_DATA_HOME/gnome-shell/extensions`,
+  where GNOME Shell loads user extensions, and fall back to `~/.local/share`
+  only when `XDG_DATA_HOME` is unset or empty, as GLib does. When GNOME Shell
+  already loaded a user copy, setup updates the copy the Shell reports. Before,
+  setup always wrote under `~/.local/share`, so with `XDG_DATA_HOME` set
+  elsewhere the Shell never loaded that copy, and the new login setup asked for
+  did not help. The backend inherits the launcher's environment through the
+  host bridge, so `XDG_DATA_HOME` reaches it without a forwarding list. The
+  `setup-window-targeting` help names all five display-only metadata fields.
+  The crate's tests no longer leave D-Bus sockets in `/tmp`: each private bus
+  listens in its own fixture directory, which the test removes, and has no
+  service directories. A lint test fails on `unix:tmpdir`, the session config,
+  or a bus started without its own config.
+  `codex-computer-use-indicator` starts its error messages with its own name
+  instead of the standalone `computer-use-linux-indicator`. The remote desktop
+  persistence warnings use the `[codex-computer-use]` prefix, and the GNOME
+  window, monitor and outdated-extension errors name the Codex GNOME Shell
+  extension, as the other messages of this copy do.
+- Synchronize the embedded Computer Use backend to standalone v0.7.46.
+  `codex-computer-use-cosmic` and `codex-computer-use-indicator` check their
+  command line before they do anything, as `codex-computer-use-linux` does
+  since the v0.7.45 sync. Both print help on `-h` or `--help` and exit 0. The
+  indicator takes no arguments, and the COSMIC helper takes only its five
+  commands and `--window-id`. Anything else prints an error on stderr and
+  exits 2. The indicator used to start on `--help` or any flag: it took its
+  lock files in `XDG_RUNTIME_DIR` and connected to the compositor. The COSMIC
+  helper exited 1 on a bad line, and `probe --help` failed instead of printing
+  help. The backend starts both as before. `setup_window_targeting` and
+  `setup-window-targeting` no longer ask for a new login when only the Codex
+  GNOME Shell extension's display metadata changed (`name`, `description`,
+  `url`, `version-name`, `donations`), such as the `url` the v0.7.45 sync
+  added. While the extension is enabled, or its state cannot be read, a
+  changed `extension.js` or a change to any other `metadata.json` field, such
+  as `shell-version`, still sets `requires_shell_reload`. The
+  `press_key` description and the `type_text` sentence of the MCP instructions
+  name pixelflux, `setup --help` says when setup requests `IsEnabled`, and the
+  `terminal_command`, `pid`, click `x` and `y`, and `set_value` `value` docs
+  match the code.
+- Synchronize the embedded Computer Use backend to standalone v0.7.45, which
+  includes v0.7.44. `codex-computer-use-linux` validates the whole command
+  line before anything runs. Every command prints its own help on `-h` or
+  `--help` and exits 0 without touching the desktop. Before, `setup --help`
+  ran setup and `setup-window-targeting --help` installed the GNOME Shell
+  extension. An unknown command, flag or argument count exits 2, `--` ends
+  flags, and `abs-test` needs integer coordinates. The top-level usage lists
+  every command but that development probe. AppShots passes `--` before an
+  app lookup candidate that starts with `-`, such as a terminal titled
+  `-zsh`, which the strict parser would refuse as a flag. The crate's
+  `codex-chrome-extension-host` binary, which no package ships, follows the
+  same rule: `--help` prints its usage, and a flag or a second argument exits
+  2 before it binds its socket. The MCP instructions, tool descriptions and
+  parameter docs now say what the code does: the screenshot routes, including
+  the Codex GNOME Shell extension, and the pointer route order; that on
+  Wayland a pointer position never goes through ydotool; which results warn
+  about off-screen windows and points; that `move_window` and `resize_window`
+  work only through the Codex GNOME Shell extension or X11/EWMH, where a
+  resize sets the client area; and the order in which window-target fields
+  resolve. The crate declares `rust-version = "1.89"`, and the Codex GNOME
+  Shell extension metadata links this repository.
+- Synchronize the embedded Computer Use backend to standalone v0.7.43, which
+  includes v0.7.42. A click, scroll or drag coordinate between monitors now
+  gets a warning. Monitors of different heights or offset rows leave parts of
+  the screenshot that no monitor shows, and a point there used to pass as
+  on-screen. The server reads the monitor layout once per screenshot, from the
+  portal session, KWin or the compositor, and from RandR only on X11, so it
+  never starts Xwayland. Without a layout that fits the screenshot, only its
+  outer rectangle is checked, as before. Off-screen warnings say what the
+  route did with the point: the portal sends nothing, the X server keeps the
+  pointer on the screen, and the uinput device clamps it. A KWin element
+  click gets no off-screen or gap warning, since KWin mapped its point onto
+  an output; its portal route drops the off-screen warning v0.7.41 kept. A
+  drag gets these
+  warnings for each endpoint, a uinput drag says where an off-screen endpoint
+  was clamped to, and a portal drag error names each endpoint that stopped it.
+  When a stale uinput device cannot be replaced, the result names the route a
+  retry takes, and a KWin element click reports that device failure instead
+  of a mapping failure. Socket test fixtures, Rust and Python, stay under the
+  Unix path limit when `TMPDIR` is long.
+- Synchronize the embedded Computer Use backend to standalone v0.7.41. When a
+  later screenshot reports a different desktop size, the next click,
+  coordinate scroll or drag replaces the uinput absolute pointer with one
+  sized to that screenshot, as KWin element clicks already did. A device
+  sized for an earlier desktop scaled every point to the wrong place. With a
+  matching device, an off-screen coordinate is clamped to the desktop edge and
+  the click or scroll result says where it landed. If the replacement fails,
+  the action is not sent and the result says why. A KWin element click keeps
+  the note of its route, the uinput clamp note or the portal off-screen
+  warning, with the KWin mapping appended. An untargeted scroll whose portal could not start and
+  whose ydotool fallback then failed reports both errors.
+- Synchronize the embedded Computer Use backend to standalone v0.7.40.
+  v0.7.39 changed only the standalone npm wrapper and crates.io packaging, so
+  it brings no crate source change here. Standalone synced back the generic
+  fixes this copy carried first (uinput release safety, portal and KDE paste
+  cancellation, the wtype `PATH` check, per-query focus timeouts, the niri
+  output layout), and the copy now takes standalone's versions of them. What
+  changes here: focus verification runs one more query after the 1 s
+  transition allowance, each query bounded at 5 s, so queries that keep
+  reporting another window fail after about 1 s instead of 11 s. Portal
+  pointer input on niri reads niri's output layout through the niri backend,
+  which also finds the IPC socket when the `niri` binary is missing. A failed
+  uinput move before a scroll drops the device, as a failed click or drag
+  already did. `doctor` hides `wtype` under `*_FORCE_XDOTOOL_KEYBOARD=1` only
+  when xdotool and `DISPLAY` are available, since keyboard input uses wtype
+  otherwise. A wtype that cannot start is detected by its errno instead of its
+  error text. A portal backend that turns out unavailable between the
+  preference check and the call no longer fails with its own message: the
+  call takes the next route, which for pointer input on Wayland is the
+  coordinate-input refusal. An untargeted scroll whose portal cannot start
+  falls back to ydotool unless `*_FORCE_PORTAL_POINTER=1` is set, and a portal
+  start failure in `press_key` or `type_text` reports standalone's message,
+  without focused-element feedback.
 - Synchronize the embedded Computer Use backend to standalone v0.7.38. On
   Sway the i3 backend scales window bounds from layout coordinates to capture
   pixels when every active output has the same scale, with edges rounded
@@ -143,6 +373,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- The v0.7.52 sync lets GNOME `type_text` insert through AT-SPI
+  EditableText when one keyboard layout group cannot type a character, such
+  as Latin text with `us` and `il` groups. The text goes into the focused
+  editable field of the verified, active target window, and the call reports
+  success only when the field reads it back. The portal route, password
+  fields, and text with a newline, tab or other control character keep the
+  refusal.
+- The v0.7.52 sync makes `get_app_state` report text selections. The AT-SPI
+  proxy called `GetNselections`, which toolkits do not implement; it now calls
+  `GetNSelections`.
+- The v0.7.51 sync moves `rustix` from 1.1.4 to 1.1.6, which fixes
+  RUSTSEC-2026-0486.
+- The v0.7.51 sync makes a pid target read every AT-SPI root its process
+  owns. A Qt Quick app can register an empty GTK root next to its populated
+  Qt root, and `get_app_state(pid=...)` used to read only the first. A pid
+  that owns no root returns an empty scoped tree with a note, not the whole
+  desktop.
+- The `include_tree` observation of `perform_action` and `set_value` reads
+  the acted-on element's app, not the focused app.
+- A window whose pid owns no AT-SPI root, such as a Flatpak app behind
+  `xdg-dbus-proxy`, gets its tree by the window title. The title is used only
+  for a window the compositor lists, and element calls check each node's
+  owner.
+- Synchronize the embedded Computer Use backend to standalone v0.7.49: its
+  `rmcp` goes from 3.5.1 to 3.9.0, which clears RUSTSEC-2026-0457, -0461 and
+  -0462 for the backend. Tool output schemas now list nullable fields as
+  required, as `rmcp` 3.9.0 generates them. The backend already sent those
+  fields as `null`, so results are unchanged. The `rmcp` 1.5.0 that Read Aloud
+  and Record & Replay use is not part of this sync and is still in the range
+  of RUSTSEC-2026-0462; like the backend they build the stdio transport only,
+  not the HTTP client transports the advisory is about.
+- A successful pixelflux click, scroll or drag in a Selkies container
+  notifies the Codex avatar cursor, as the other pointer routes do. These
+  routes had skipped it since the pixelflux backend arrived.
+- A successful uinput scroll notifies the Codex avatar cursor, as every other
+  pointer route already did.
 - AppShots focuses windows from the i3 backend the way the backend does: by
   the decimal X11 id, or by `con_id` for a native Wayland window on Sway,
   through `i3-msg`, or `swaymsg` when i3 is not installed, on the same IPC
@@ -183,6 +449,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- The launcher tests no longer send real counts to the production usage
+  counter. The usage-reporting tests removed their test folder while the
+  launcher's background reporter still ran. The reporter then recreated up
+  to two `codex-launcher-test-*/state` folders in `TMPDIR`, found the test's
+  fake curl gone, and ran the curl on PATH, about two real counts per run.
+  The tests now wait for the reporter before cleanup, and kill the
+  launcher's process group if it is still running after 10 seconds.
+- The AppShots bare modifier monitor and the global dictation release watcher
+  no longer leave an empty `.tmpXXXXXX` directory in `TMPDIR` where `stdbuf`
+  is uutils coreutils. That `stdbuf` makes a temporary directory and then
+  execs `xinput`, so nothing removed it (uutils/coreutils#13939): one per
+  AppShots monitor start, and one per keyboard per global dictation hold.
+  Each monitor now gives `stdbuf` a directory of its own and removes it when it
+  exits, also on SIGHUP, SIGINT and SIGTERM. GNU `stdbuf` writes nothing there.
+- The Node tests leave nothing in `TMPDIR`, also when a test fails. Socket
+  fixtures move to `XDG_RUNTIME_DIR` when a socket path would not fit under
+  `TMPDIR`, so the suite passes with a long `TMPDIR` too; without
+  `XDG_RUNTIME_DIR` they fail with the limit and the path.
+  `scripts/ci/run-node-checks.sh all` syntax-checks every tracked `.js` file,
+  then runs every `*.test.js` and `test.js` with a fresh `TMPDIR` and fails,
+  naming the entries, when a run leaves any. CI's Node step runs it, so CI
+  runs exactly the files the guard checks; `scripts/ci-local.sh` still runs
+  its own list. The GNOME dictation and package permission tests keep their
+  scratch under `TMPDIR` too, and the shared app-server tests bind their
+  sockets inside the `try` that removes them. The host-service tests wait for
+  their detached bridge to exit and kill it if it still runs after 3 s. The
+  Dock icon lock test's holder keeps the lock only while the test holds its
+  stdin open. The runner does not pass `--test-force-exit`. That flag can drop
+  finished tests from the report and still exit 0 (nodejs/node#64833). With
+  it, 8 of 11 local runs on Node 24 and 26 reported up to 47 fewer tests than
+  ran. A file that a leaked handle holds open fails the run with status 124
+  when the runner's 300 s `timeout` watchdog ends it. CI requires `timeout`; a
+  local run without it has no limit.
+- The AppShots bare modifier monitor waits for `xinput --version` before it
+  starts its XInput 2 stream, and reports `permission-denied` when the X
+  server cannot be reached or has no XInput 2. Before, it judged the stream
+  by whether it still ran 0.1 s after the start, so under load a failing
+  `xinput` could print `ready` and then stop. SIGTERM or the app's exit
+  still ends the monitor and the check while it waits. A stream that exits
+  before the monitor reads its coprocess also gives `permission-denied`;
+  before, the monitor stopped with an unbound-variable error and no output.
+- The global dictation release watcher stops each helper subshell, signals
+  its children, then ends the subshell with SIGKILL. A child that a subshell
+  forked between `pkill -P` and its own end, such as the watchdog's `sleep`,
+  no longer outlives the watcher. A second SIGINT, SIGTERM or SIGHUP during
+  cleanup no longer cuts it short, which left the helpers running.
+- The embedded Computer Use crate's
+  `editable_text_normalization_mismatch_is_not_verified` test accepts
+  `ReadbackTimedOut` as well as `MismatchAfterDeadline`, like the two other
+  mismatch tests (agent-sh/computer-use-linux#431). Its last poll can start
+  just before the one-second deadline and still be reading when it passes.
+  Both outcomes leave the write unverified, and neither allows a replay.
 - Desktop entries no longer offer a "New Window" action. It relied on the
   retired multi-instance launcher (`--new-instance`, `CODEX_MULTI_LAUNCH`),
   which the official app ignores, so it did nothing while the app was running

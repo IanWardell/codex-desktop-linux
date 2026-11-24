@@ -669,6 +669,8 @@ test("signed General settings chunk composes every Linux settings insertion in b
   const appDir = process.env.CODEX_SIGNED_EXTRACTED_APP;
   const [name] = findWebviewAssetsContaining(appDir, GENERAL_SETTINGS_NEEDLES);
   const original = fs.readFileSync(path.join(appDir, "webview", "assets", name), "utf8");
+  const nativeContract = settingsContract(original);
+  assert.ok(nativeContract);
   const featuresRoot = path.resolve(__dirname, "..");
   const uiTweaks = { feature: { manifest: require("../ui-tweaks/feature.json"), settings: { tweaks: {
     appearance: { customFontInput: { enabled: true }, dockIcon: { enabled: true } }, home: { suggestedPrompts: { enabled: true } } } } } };
@@ -691,7 +693,8 @@ test("signed General settings chunk composes every Linux settings insertion in b
       enabledFeatureIds: ["community-features-in-gui-settings"] }),
   ];
   const markers = [`function ${UI}(`, "function codexLinuxStartMinimizedSetting(", "function codexLinuxReasoningVisibilitySetting(",
-    "codex-linux-read-aloud-settings-mount", "codexLinuxManualFontInput", "codexLinuxUiTweaksSuggestedPromptsEnabled"];
+    "codex-linux-read-aloud-settings-mount", "codexLinuxManualFontInput",
+    "codexLinuxUiTweaksSuggestedPromptsSettingsEligible"];
   for (const order of [steps, [...steps].reverse()]) {
     // Only the settings chunk is copied; one synthetic locale catalog satisfies
     // the translation steps of the start-minimized and reasoning rows.
@@ -711,7 +714,7 @@ test("signed General settings chunk composes every Linux settings insertion in b
       assert.equal(fs.readFileSync(path.join(app, "webview", "assets", name), "utf8"), patched);
       for (const marker of markers) assert.ok(patched.includes(marker), marker);
       assert.match(patched, /return"macOS"!==([\w$]+)&&"linux"!==\1/);
-      assert.equal(patched.split(`(0,n.jsx)(${UI},{})`).length, 2);
+      assert.equal(patched.split(`(0,${nativeContract.jsx}.jsx)(${UI},{})`).length, 2);
       const check = spawnSync(process.execPath, ["--input-type=module", "--check"], { input: patched, encoding: "utf8" });
       assert.equal(check.status, 0, check.stderr);
     } finally {

@@ -6,11 +6,9 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const vm = require("node:vm");
 const { spawn, execFileSync } = require("node:child_process");
 const { createAccountSwitcher } = require("./runtime");
 const { loadLinuxFeaturePatchDescriptors, enabledLinuxFeaturePackagePlan } = require("../../scripts/lib/linux-features");
-const { findWebviewAssetsContaining } = require("../../scripts/patches/lib/assets.js");
 
 function credentials(name) {
   const token = claims => `e30.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.signature`;
@@ -41,7 +39,7 @@ function fixture(t, options = {}) {
     },
   };
   const dialogs = [], menus = [], choices = [], calls = [];
-  let reloaded = 0, notification, active = "first", restartFails = false;
+  let notification, active = "first", restartFails = false;
   let ready = options.lazyConnection !== true;
   const dialog = { showMessageBox: async settings => {
     dialogs.push(settings);
@@ -59,9 +57,9 @@ function fixture(t, options = {}) {
   const client = {
     hostConfig: { id: "local", kind: "local" },
     ensureReady: async () => { ready = true; calls.push("ensureReady"); },
-    getPendingRequestCount: () => options.pending ?? 0,
+    getConnectionState: () => ready ? "connected" : "disconnected",
+    getPendingRequestCount: async () => options.pending ?? 0,
     getAuthenticatedPrincipal: async () => ({ accountId: `account-${active}`, userId: `user-${active}` }),
-    clearAuthTokenCache: () => calls.push("clearCache"),
     restart: async () => {
       calls.push("restart");
       const name = JSON.parse(fs.readFileSync(authPath)).tokens.account_id.slice(8);
@@ -112,7 +110,7 @@ function fixture(t, options = {}) {
     return { code: savedKey ? 0 : 1, stdout: options.malformedKey ? "invalid" : savedKey ?? "" };
   };
   const clients = [client];
-  const runtime = createAccountSwitcher({ electron, clients: () => clients, home, reload: () => { reloaded++; }, runSecretTool });
+  const runtime = createAccountSwitcher({ electron, clients: () => clients, home, runSecretTool });
   return {
     home, authPath, vault, cipher, keyringCalls, dialogs, menus, choices, calls, runtime, client, clients,
     open: async response => { choices.push(response); await runtime.open(client); },
@@ -124,7 +122,6 @@ function fixture(t, options = {}) {
       fs.writeFileSync(vault, JSON.stringify(stored));
     },
     failSecondRestart: () => { restartFails = true; },
-    reloaded: () => reloaded,
   };
 }
 
@@ -147,7 +144,6 @@ for (const options of [{ keyringUnavailable: true }, { keyInitiallyMissing: true
     await f.open(1);
     assert.equal(fs.existsSync(f.vault), false);
     assert.equal(fs.readFileSync(f.authPath, "utf8"), credentials("first"));
-    assert.equal(f.reloaded(), 0);
     assert.match(f.dialogs.at(-1).detail, /keyring/);
   });
 }
@@ -155,7 +151,6 @@ for (const options of [{ keyringUnavailable: true }, { keyInitiallyMissing: true
 test("cancel stores only encrypted tokens, with private permissions", async t => {
   const f = fixture(t);
   await f.open(3);
-  assert.equal(f.reloaded(), 0);
   assert.equal(fs.readFileSync(f.authPath, "utf8"), credentials("first"));
   const stored = fs.readFileSync(f.vault, "utf8");
   assert.ok(!stored.includes("private-refresh-first"));
@@ -211,7 +206,7 @@ test("missing key never replaces an existing vault; corrupted ciphertext is reje
 test("missing secret-tool reports the dependency without touching login credentials", t => {
   const f = fixture(t);
   const program = `const {createAccountSwitcher}=require(${JSON.stringify(path.join(__dirname, "runtime.js"))});
-    const dialogs=[];const runtime=createAccountSwitcher({home:process.argv[1],clients:()=>[],reload(){},
+    const dialogs=[];const runtime=createAccountSwitcher({home:process.argv[1],clients:()=>[],
       electron:{dialog:{showMessageBox:async o=>dialogs.push(o.detail)},Menu:{},shell:{}}});
     runtime.open({}).then(()=>process.stdout.write(JSON.stringify(dialogs)));`;
   const result = execFileSync(process.execPath, ["-e", program, f.home], { env: { ...process.env, PATH: "" }, timeout: 5_000 });
@@ -240,10 +235,23 @@ test("switches to a saved account and restores refreshed current credentials lat
   fs.writeFileSync(f.authPath, refreshed);
   await f.open(1);
   assert.equal(fs.readFileSync(f.authPath, "utf8"), credentials("second"));
-  assert.equal(f.reloaded(), 1);
   await f.open(0);
   assert.equal(fs.readFileSync(f.authPath, "utf8"), refreshed);
-  assert.equal(f.reloaded(), 2);
+});
+
+test("switching waits for the principal invalidated by the reconnect", async t => {
+  const f = fixture(t);
+  await f.open(3); f.seedSecond();
+  const settled = f.client.getAuthenticatedPrincipal;
+  let lookupsAfterRestart = 0;
+  f.client.getAuthenticatedPrincipal = async () => {
+    if (!f.calls.includes("restart")) return settled();
+    return ++lookupsAfterRestart < 3 ? null : settled();
+  };
+  await f.open(1);
+  assert.equal(fs.readFileSync(f.authPath, "utf8"), credentials("second"));
+  assert.equal(f.calls.filter(c => c === "restart").length, 1);
+  assert.equal(lookupsAfterRestart, 3);
 });
 
 test("failed selected-account restart rolls back without exposing upstream errors", async t => {
@@ -251,7 +259,6 @@ test("failed selected-account restart rolls back without exposing upstream error
   await f.open(3); f.seedSecond(); f.failSecondRestart();
   await f.open(1);
   assert.equal(fs.readFileSync(f.authPath, "utf8"), credentials("first"));
-  assert.equal(f.reloaded(), 0);
   assert.equal(f.calls.filter(c => c === "restart").length, 2);
   assert.match(f.dialogs.at(-1).detail, /previous account was restored/);
   assert.ok(!f.dialogs.at(-1).detail.includes("secret"));
@@ -264,7 +271,6 @@ for (const options of [{ activeTask: true }, { pending: 1 }, { rpcFails: true }]
     await f.open(1);
     assert.equal(fs.readFileSync(f.authPath, "utf8"), credentials("first"));
     assert.equal(f.calls.includes("restart"), false);
-    assert.equal(f.reloaded(), 0);
     assert.equal(f.dialogs.at(-1).type, "error");
   });
 }
@@ -274,7 +280,6 @@ test("cancelled browser login returns to the remembered account", async t => {
   await f.open(1);
   assert.equal(fs.readFileSync(f.authPath, "utf8"), credentials("first"));
   assert.ok(f.calls.includes("account/login/cancel"));
-  assert.equal(f.reloaded(), 0);
 });
 
 test("successful official login remembers the new account without logging out the old one", async t => {
@@ -282,8 +287,20 @@ test("successful official login remembers the new account without logging out th
   await f.open(1);
   assert.equal(fs.readFileSync(f.authPath, "utf8"), credentials("second"));
   assert.equal(JSON.parse(fs.readFileSync(f.vault)).accounts.length, 2);
-  assert.equal(f.reloaded(), 1);
   assert.ok(!f.calls.includes("account/logout"));
+});
+
+test("login completion waits for the principal invalidated by upstream account notifications", async t => {
+  const f = fixture(t, { login: "second" });
+  const settled = f.client.getAuthenticatedPrincipal;
+  let lookupsAfterLogin = 0;
+  f.client.getAuthenticatedPrincipal = async () => {
+    if (!fs.readFileSync(f.authPath, "utf8").includes("account-second")) return settled();
+    return ++lookupsAfterLogin < 3 ? null : settled();
+  };
+  await f.open(1);
+  assert.equal(fs.readFileSync(f.authPath, "utf8"), credentials("second"));
+  assert.equal(JSON.parse(fs.readFileSync(f.vault)).accounts.length, 2);
 });
 
 test("adding an account initializes a lazy backend before checking tasks and starting OAuth", async t => {
@@ -302,7 +319,9 @@ for (const action of ["add", "switch"]) {
       const f = fixture(t);
       const reads = [];
       f.clients.push({
-        hostConfig: { id: "durable", kind: "local" }, getPendingRequestCount: () => pending,
+        hostConfig: { id: "durable", kind: "local" },
+        getConnectionState: () => "connected",
+        getPendingRequestCount: async () => pending,
         sendAppServerRequest: async method => {
           reads.push(method);
           // A catalog would contain a permanently active task from another
@@ -317,17 +336,33 @@ for (const action of ["add", "switch"]) {
       if (pending === 0) {
         assert.equal(f.dialogs.filter(dialog => dialog.type === "error").length, 0);
         if (action === "add") assert.ok(f.calls.includes("account/login/start"));
-        else assert.equal(f.reloaded(), 1);
+        else assert.equal(fs.readFileSync(f.authPath, "utf8"), credentials("second"));
       } else {
         assert.equal(f.calls.includes("account/login/start"), false);
         assert.equal(f.calls.includes("restart"), false);
-        assert.equal(f.reloaded(), 0);
         assert.equal(fs.readFileSync(f.authPath, "utf8"), credentials("first"));
         assert.match(f.dialogs.at(-1).detail, /pending requests/);
       }
     });
   }
 }
+
+test("disconnected durable host is not opened during idle checks", async t => {
+  for (const action of ["switch", "add"]) {
+    const f = fixture(t, action === "add" ? { login: "second" } : {});
+    let durableOpened = false;
+    f.clients.push({
+      hostConfig: { id: "durable", kind: "local" },
+      getConnectionState: () => "disconnected",
+      getPendingRequestCount: async () => { durableOpened = true; return 0; },
+    });
+    if (action === "switch") { await f.open(3); f.seedSecond(); }
+    await f.open(1);
+    assert.equal(durableOpened, false, `disconnected durable host must not be opened during ${action}`);
+    assert.equal(f.dialogs.filter(dialog => dialog.type === "error").length, 0);
+    assert.equal(fs.readFileSync(f.authPath, "utf8"), credentials("second"));
+  }
+});
 
 test("login setup errors name the phase without exposing upstream error details", async t => {
   const f = fixture(t);
@@ -392,3 +427,61 @@ test("identity uses the current desktop user_id authority ahead of chatgpt_user_
   assert.equal(f.dialogs.length, 0);
 });
 
+test("native account menu follows the app locale and marks the current account", async t => {
+  const f = fixture(t);
+  f.choices.push(3);
+  await f.runtime.open(f.client, undefined, "pl-PL");
+  assert.equal(f.menus[0][0].label, "Przełącz konto ChatGPT");
+  assert.equal(f.menus[0].filter(item => item.checked).length, 1);
+  assert.ok(f.menus[0].some(item => item.label === "Dodaj konto…"));
+});
+
+test("latest bundled CLI decodes the isolated OAuth file and supports the idle-check protocol", {
+  skip: !process.env.CODEX_ACCOUNT_SWITCHER_CLI,
+  timeout: 20_000,
+}, async t => {
+  const f = fixture(t);
+  const env = { ...process.env, CODEX_HOME: f.home };
+  // login status parses the synthetic file locally. A real server login cannot
+  // be simulated: initialization discovers workspace routing on OpenAI's API.
+  execFileSync(process.env.CODEX_ACCOUNT_SWITCHER_CLI, ["login", "status"], { env, stdio: "pipe", timeout: 5_000 });
+  fs.rmSync(f.authPath);
+  const child = spawn(process.env.CODEX_ACCOUNT_SWITCHER_CLI, ["app-server", "-c", 'cli_auth_credentials_store="file"', "-c", "features.secret_auth_storage=false"], {
+    env, stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => child.kill()); // Only this disposable test's child process.
+  let buffer = "", id = 0;
+  const pending = new Map();
+  child.stdout.on("data", bytes => {
+    buffer += bytes;
+    for (;;) {
+      const end = buffer.indexOf("\n");
+      if (end < 0) break;
+      const message = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1);
+      const response = pending.get(message.id);
+      if (response) { pending.delete(message.id); response(message); }
+    }
+  });
+  child.stderr.resume();
+  const request = (method, params) => new Promise(resolve => {
+    const requestId = ++id; pending.set(requestId, resolve);
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params }) + "\n");
+  });
+  const initialized = await request("initialize", { clientInfo: { name: "community_account_switcher_test", version: "1" }, capabilities: { experimentalApi: true } });
+  assert.equal(initialized.error, undefined);
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "initialized" }) + "\n");
+  const loaded = await request("thread/loaded/list", { cursor: null, limit: 100 });
+  assert.equal(loaded.error, undefined);
+  assert.deepEqual(loaded.result.data, []);
+  const account = await request("account/read", { refreshToken: false });
+  assert.equal(account.error, undefined);
+  assert.equal(account.result.account, null);
+  // Generate and immediately cancel only this disposable server's OAuth flow.
+  // Never launch a browser or send real account credentials in this test.
+  const login = await request("account/login/start", { type: "chatgpt", appBrand: "chatgpt", useHostedLoginSuccessPage: true });
+  assert.ok(!login.error, "The bundled server must accept the browser-login parameters");
+  assert.equal(login.result.type, "chatgpt");
+  assert.equal(new URL(login.result.authUrl).hostname, "auth.openai.com");
+  const cancelled = await request("account/login/cancel", { loginId: login.result.loginId });
+  assert.ok(!cancelled.error, "The disposable login flow must cancel successfully");
+});

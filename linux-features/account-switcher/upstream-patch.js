@@ -14,7 +14,9 @@ function applyMain(source) {
   const bridge = unique(source, new RegExp(
     `(case"mcp-request":\\{)${IDENT}\\(\\)\\.debug\\("app_server\\.bridge_received",\\{safe:\\{messageType:"mcp-request",requestId:String\\((${IDENT})\\.request\\.id\\),method:\\2\\.request\\.method,originWebcontentsId:(${IDENT})\\.id,originHostId:\\2\\.hostId`, "g"));
   const config = unique(source, new RegExp(
-    `\\[\\.\\.\\.\\(0,${IDENT}\\.${IDENT}\\)\\((${IDENT})\\.globalState,\\1\\.hostConfig\\),\\.\\.\\.await \\1\\.secretAuthStorageConfigOverrides,\\.\\.\\.await ${IDENT}\\(\\1\\)\\]`, "g"));
+    `\\[\\.\\.\\.\\(0,${IDENT}\\.${IDENT}\\)\\((${IDENT})\\.globalState,\\1\\.hostConfig\\),` +
+      `\\.\\.\\.await \\1\\.secretAuthStorageConfigOverrides,\\.\\.\\.await ` +
+      `(?:${IDENT}\\(\\1\\)|async function\\(\\1\\)\\{(?=[\\s\\S]{0,1200}?plugins\\.codex-app-tools@openai-bundled\\.mcp_servers\\.codex_app\\.enabled=)[\\s\\S]{1,1200}?\\}\\(\\1\\))\\]`, "g"));
   if (!bridge || !config || !source.includes("sendAppServerResponseToView") || !source.includes("getAllHostIds")) {
     console.warn("WARN: Account switcher main-process contract drifted - skipping patch");
     return source;
@@ -27,8 +29,7 @@ function applyMain(source) {
     `let client=this.getAppServerConnection(${request}.hostId);if(client.hostConfig.kind!==\`local\`)throw Error(\`Account switching is only available on this computer.\`);` +
     `this.codexLinuxAccountSwitcher??=(${createAccountSwitcher.toString()})({` +
     `electron:require(\`electron\`),home:await client.codexHome(),` +
-    `clients:()=>this.appServerConnectionRegistry.getAllHostIds().map(id=>this.getAppServerConnection(id)),` +
-    `reload:()=>{for(let window of require(\`electron\`).BrowserWindow.getAllWindows())if(!window.isDestroyed())window.webContents.reload()}});` +
+    `clients:()=>this.appServerConnectionRegistry.getAllHostIds().map(id=>this.getAppServerConnection(id))});` +
     `await this.codexLinuxAccountSwitcher.open(client,require(\`electron\`).BrowserWindow.fromWebContents(${view}),${request}.request.params?.locale);response={id:${request}.request.id,result:{}}` +
     `}catch{response={id:${request}.request.id,error:{code:-32000,message:\`Account switching is unavailable.\`}}}finally{globalThis.codexLinuxUpstreamAccountSwitcherBusy=()=>this.codexLinuxAccountSwitcher?.isBusy()===true}` +
     `this.sendAppServerResponseToView(${view},${request}.hostId,${request}.request.method,response,${request}.request.trace,${request}.priority);break}`;

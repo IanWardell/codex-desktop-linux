@@ -7,6 +7,7 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { makeSocketTempDir } = require("../scripts/lib/unix-socket-dir.test-helpers.js");
 
 const templatePath = path.join(__dirname, "start.sh.template");
 const bashPath = childProcess.execFileSync("bash", ["-c", "command -v bash"], { encoding: "utf8" }).trim();
@@ -25,6 +26,10 @@ for (const name of Object.keys(process.env)) {
 // Launcher tests must never contact the production usage counter. Individual
 // reporting tests opt back in with an isolated fake curl executable.
 process.env.CODEX_LINUX_DISABLE_USAGE_REPORTING = "1";
+
+// Socket fixtures may fall back to the host's runtime dir, which the loop
+// below hides from the launcher.
+const hostRuntimeDir = process.env.XDG_RUNTIME_DIR;
 
 // Ozone backend selection reads the session environment. Tests must not inherit
 // the developer's compositor; the Wayland cases below set these explicitly.
@@ -54,12 +59,7 @@ function createApp(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }));
   const launcher = fs.readFileSync(templatePath, "utf8")
     .replaceAll("__CODEX_LINUX_APP_ID__", "codex-desktop")
-    .replaceAll("__CODEX_LINUX_APP_DISPLAY_NAME__", "ChatGPT Community")
-    .replace(
-      "report_daily_usage() {\n    (\n",
-      "report_daily_usage() {\n    (\n        trap '[ -z \"${CODEX_LINUX_TEST_USAGE_REPORT_DONE:-}\" ] || printf done > \"$CODEX_LINUX_TEST_USAGE_REPORT_DONE\"' EXIT\n",
-    );
-  assert.match(launcher, /CODEX_LINUX_TEST_USAGE_REPORT_DONE/);
+    .replaceAll("__CODEX_LINUX_APP_DISPLAY_NAME__", "ChatGPT Community");
   writeExecutable(path.join(root, "start.sh"), launcher);
   for (const relative of ["resources/app.asar", "resources/codex", "resources/rg", "resources/codex-code-mode-host"]) {
     const target = path.join(root, relative);
@@ -73,6 +73,33 @@ printf '%s\n' "$@" > "$TEST_ROOT/arguments"
 exit 7
 `);
   return root;
+}
+
+// The launcher reports usage from a background subshell that outlives
+// start.sh. A reporter still running when the test removed its root recreated
+// XDG_STATE_HOME/codex-desktop/usage-reporting under the removed root, found
+// the test's fake curl gone, and ran the curl on PATH, which sent a real count
+// to the production usage counter. The subshell inherits a spare pipe on
+// fd 3, and spawnSync returns only once every holder has closed it, so the
+// reporter is done before cleanup. A holder still open after 10 seconds fails
+// the test with ETIMEDOUT. The launcher runs in its own process group, and the
+// whole group is killed then, so nothing it started outlives the test.
+function runLauncherWithReporting(root, args, options) {
+  const result = childProcess.spawnSync(path.join(root, "start.sh"), args, {
+    ...options,
+    detached: true,
+    stdio: ["pipe", "pipe", "pipe", "pipe"],
+    timeout: 10_000,
+  });
+  if (result.error && result.pid) {
+    try {
+      process.kill(-result.pid, "SIGKILL");
+    } catch {
+      // The group has already exited.
+    }
+  }
+  assert.ifError(result.error);
+  return result;
 }
 
 function waitForFile(filePath, timeoutMs = 2000) {
@@ -286,14 +313,12 @@ printf '<%s>\\n' "$@" >> "$TEST_ROOT/curl-arguments"
   };
 
   for (let launch = 0; launch < 2; launch += 1) {
-    const reportDonePath = path.join(root, `usage-report-done-${launch}`);
-    const result = childProcess.spawnSync(path.join(root, "start.sh"), [], {
-      env: { ...env, CODEX_LINUX_TEST_USAGE_REPORT_DONE: reportDonePath },
+    const result = runLauncherWithReporting(root, [], {
+      env,
       encoding: "utf8",
     });
     assert.equal(result.status, 7);
     assert.equal(result.stderr, "");
-    waitForFile(reportDonePath);
   }
 
   assert.equal(fs.readFileSync(callsPath, "utf8"), "call\n");
@@ -311,26 +336,23 @@ printf '<%s>\\n' "$@" >> "$TEST_ROOT/curl-arguments"
 test("launcher usage reporting has one opt-out and suppresses curl failures", (t) => {
   const disabledRoot = createApp(t);
   const disabledBin = path.join(disabledRoot, "bin");
-  const disabledReportDone = path.join(disabledRoot, "usage-report-done");
   writeExecutable(
     path.join(disabledBin, "curl"),
     `#!/bin/bash
 printf 'unexpected\\n' >> "$TEST_ROOT/curl-calls"
 `,
   );
-  const disabled = childProcess.spawnSync(path.join(disabledRoot, "start.sh"), [], {
+  const disabled = runLauncherWithReporting(disabledRoot, [], {
     env: {
       ...process.env,
       CODEX_HOME: path.join(disabledRoot, "codex-home"),
       CODEX_LINUX_DISABLE_USAGE_REPORTING: "1",
-      CODEX_LINUX_TEST_USAGE_REPORT_DONE: disabledReportDone,
       PATH: `${disabledBin}:${process.env.PATH}`,
       TEST_ROOT: disabledRoot,
       XDG_STATE_HOME: path.join(disabledRoot, "state"),
     },
     encoding: "utf8",
   });
-  waitForFile(disabledReportDone);
   assert.equal(disabled.status, 7);
   assert.equal(disabled.stderr, "");
   assert.equal(fs.existsSync(path.join(disabledRoot, "curl-calls")), false);
@@ -342,22 +364,19 @@ printf 'unexpected\\n' >> "$TEST_ROOT/curl-calls"
 
   const missingRoot = createApp(t);
   const missingBin = path.join(missingRoot, "bin");
-  const missingReportDone = path.join(missingRoot, "usage-report-done");
   fs.mkdirSync(missingBin, { recursive: true });
   fs.symlinkSync(dirnamePath, path.join(missingBin, "dirname"));
-  const missing = childProcess.spawnSync(path.join(missingRoot, "start.sh"), [], {
+  const missing = runLauncherWithReporting(missingRoot, [], {
     env: {
       ...process.env,
       CODEX_HOME: path.join(missingRoot, "codex-home"),
       CODEX_LINUX_DISABLE_USAGE_REPORTING: "0",
-      CODEX_LINUX_TEST_USAGE_REPORT_DONE: missingReportDone,
       PATH: missingBin,
       TEST_ROOT: missingRoot,
       XDG_STATE_HOME: path.join(missingRoot, "state"),
     },
     encoding: "utf8",
   });
-  waitForFile(missingReportDone);
   assert.equal(missing.status, 7);
   assert.equal(missing.stdout, "");
   assert.equal(missing.stderr, "");
@@ -365,7 +384,6 @@ printf 'unexpected\\n' >> "$TEST_ROOT/curl-calls"
 
   const failingRoot = createApp(t);
   const failingBin = path.join(failingRoot, "bin");
-  const failingReportDone = path.join(failingRoot, "usage-report-done");
   writeExecutable(
     path.join(failingBin, "curl"),
     `#!/bin/bash
@@ -373,22 +391,26 @@ printf 'simulated curl failure\\n' >&2
 exit 22
 `,
   );
-  const failing = childProcess.spawnSync(path.join(failingRoot, "start.sh"), [], {
+  const failing = runLauncherWithReporting(failingRoot, [], {
     env: {
       ...process.env,
       CODEX_HOME: path.join(failingRoot, "codex-home"),
       CODEX_LINUX_DISABLE_USAGE_REPORTING: "0",
-      CODEX_LINUX_TEST_USAGE_REPORT_DONE: failingReportDone,
       PATH: `${failingBin}:${process.env.PATH}`,
       TEST_ROOT: failingRoot,
       XDG_STATE_HOME: path.join(failingRoot, "state"),
     },
     encoding: "utf8",
   });
-  waitForFile(failingReportDone);
   assert.equal(failing.status, 7);
   assert.equal(failing.stdout, "");
   assert.equal(failing.stderr, "");
+  // The reporter reserved the day before the failed request, and it finished
+  // before the run returned.
+  assert.equal(
+    fs.readdirSync(path.join(failingRoot, "state/codex-desktop/usage-reporting")).length,
+    1,
+  );
 });
 
 test("launcher composes declarative hooks and forwards arguments", (t) => {
@@ -865,7 +887,7 @@ test("launcher uses the HOME config fallback and ignores non-file flag paths", (
 // XDG_RUNTIME_DIR, and a systemd user manager that exports no Sommelier
 // markers. Tests that need Crostini or GNOME layer their own markers on top.
 function createWaylandSession(t, root, { systemdEnvironment = "", listening = true } = {}) {
-  const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-launcher-wayland-"));
+  const runtimeDir = makeSocketTempDir("codex-launcher-wayland-", "wayland-0", { runtimeDir: hostRuntimeDir });
   const socketPath = path.join(runtimeDir, "wayland-0");
   const server = net.createServer();
   server.listen(socketPath);
