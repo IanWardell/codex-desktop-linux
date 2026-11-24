@@ -238,7 +238,7 @@ test("a missing preload anchor is reported as enabled-feature drift", () => {
     patchExtractedApp(root, { report, featuresConfigPath: config });
     const failure = enabledFeatureFailuresFromReport(report).find((entry) => entry.name.includes("preload-profile-bridge"));
     assert.equal(failure?.status, "skipped-optional");
-    assert.match(failure?.reason ?? "", /found 2/);
+    assert.match(failure?.reason ?? "", /found 0/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
